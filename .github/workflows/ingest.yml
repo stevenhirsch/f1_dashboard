@@ -1,0 +1,56 @@
+name: Ingest Race Data
+
+on:
+  workflow_dispatch:
+    inputs:
+      session_key:
+        description: "Session key (from OpenF1 /sessions)"
+        required: false
+        type: string
+      meeting_key:
+        description: "Meeting key — ingests all sessions for this GP"
+        required: false
+        type: string
+      year:
+        description: "Year — ingests all GPs for the season (slow)"
+        required: false
+        type: string
+      recompute:
+        description: "Recompute derived metrics only (skip raw fetch)"
+        required: false
+        default: "false"
+        type: choice
+        options: ["false", "true"]
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    env:
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: prefix-dev/setup-pixi@v0.8.1
+        with:
+          pixi-version: latest
+          environments: pipeline
+
+      - name: Run ingestion
+        run: |
+          FLAGS=""
+          if [ "${{ inputs.recompute }}" = "true" ]; then
+            FLAGS="--recompute"
+          fi
+
+          if [ -n "${{ inputs.session_key }}" ]; then
+            pixi run -e pipeline python pipeline/ingest.py --session ${{ inputs.session_key }} $FLAGS
+          elif [ -n "${{ inputs.meeting_key }}" ]; then
+            pixi run -e pipeline python pipeline/ingest.py --meeting ${{ inputs.meeting_key }} $FLAGS
+          elif [ -n "${{ inputs.year }}" ]; then
+            pixi run -e pipeline python pipeline/ingest.py --year ${{ inputs.year }} $FLAGS
+          else
+            echo "Error: provide session_key, meeting_key, or year"
+            exit 1
+          fi

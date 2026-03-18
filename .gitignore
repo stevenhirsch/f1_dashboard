@@ -1,3 +1,13 @@
 # pixi environments
 .pixi/*
 !.pixi/config.toml
+
+# React / Node
+dashboard/node_modules/
+dashboard/dist/
+dashboard/.env.local
+
+# Python
+__pycache__/
+*.pyc
+.env
