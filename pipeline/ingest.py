@@ -344,13 +344,20 @@ def process_session(client: Client, session_key: int, recompute: bool = False) -
     """Ingest all data for a single session."""
     print(f"\n→ Processing session {session_key}")
 
+    # Fetch session metadata first to get meeting_key, but don't upsert yet —
+    # sessions has a FK to races(meeting_key), so the meeting must exist first.
+    sessions_raw = openf1.get_session(session_key)
+    if not sessions_raw:
+        print(f"  [warn] no session found for session_key={session_key}")
+        return
+    meeting_key = sessions_raw[0].get("meeting_key")
+    if meeting_key:
+        ingest_meeting(client, meeting_key)
+
+    # Now safe to upsert session (meeting row exists)
     session = ingest_session(client, session_key)
     if session is None:
         return
-
-    meeting_key = session.get("meeting_key")
-    if meeting_key:
-        ingest_meeting(client, meeting_key)
 
     session_type = (session.get("session_type") or "").lower()
 
