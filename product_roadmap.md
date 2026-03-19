@@ -30,6 +30,7 @@ A post-race Formula 1 analytics dashboard built as a static React web app, displ
 ├── pipeline/
 │   ├── api/               # OpenF1 API wrappers (ported from Marimo project)
 │   ├── compute/           # Derived metric calculations
+│   ├── tests/             # pytest unit and integration tests for the pipeline
 │   └── ingest.py          # Main entry point, supports --recompute flag
 ├── dashboard/
 │   ├── src/
@@ -41,7 +42,8 @@ A post-race Formula 1 analytics dashboard built as a static React web app, displ
 └── .github/
     └── workflows/
         ├── ingest.yml     # Post-race pipeline, manual trigger
-        └── deploy.yml     # Builds React app, publishes to GitHub Pages
+        ├── deploy.yml     # Builds React app, publishes to GitHub Pages
+        └── test.yml       # Runs pipeline test suite on every push
 ```
 
 ---
@@ -59,7 +61,7 @@ A post-race Formula 1 analytics dashboard built as a static React web app, displ
 ### Supabase Schema
 
 ```
-races                — meeting metadata, circuit, year
+races                — meeting metadata, circuit, year, circuit_type
 sessions             — session key, type (Race/Qualifying/Sprint), date
 drivers              — driver number, name, acronym, team, per session
 laps                 — core OpenF1 lap data (times, sector splits, compounds, pit flags)
@@ -74,7 +76,9 @@ overtakes            — overtaking/overtaken driver, position, lap number, date
 
 -- Added in Phase 1 --
 intervals            — gap_to_leader and interval per driver per timestamp (race/sprint only)
-starting_grid        — grid position per driver per session
+starting_grid        — grid position + qualifying lap_duration per driver per session
+championship_drivers — driver championship points/position before and after each race (Beta)
+championship_teams   — constructor championship points/position before and after each race (Beta)
 
 -- Added in Phase 3 --
 position             — driver position over time throughout session
@@ -117,6 +121,35 @@ team_radio           — radio recording URLs per driver per timestamp
 
 ---
 
+### Pipeline Testing — Complete (2026-03-19)
+*Covers all ingestion logic before Phase 2 begins.*
+
+119 tests across two files, run via `pixi run -e pipeline test`. All tests are pure unit/integration tests using `unittest.mock` — no live API or database calls.
+
+**`pipeline/tests/test_openf1.py`** — 54 tests covering the OpenF1 API client:
+- `_get` cache lifecycle: hit returns cached result, miss calls API and caches, 404 cached as empty list
+- HTTP error handling: 500/503 raise immediately, 429 triggers exponential backoff and retry, exhausting retries raises
+- Param formats: dict params and list-of-tuple range operators both work correctly
+- Stats tracking: `real_calls`, `cache_hits`, `rate_limit_waits`, `call_times` all increment correctly; `get_stats` returns an independent copy; `current_rate` rolling window logic
+- `clear_cache` forces a fresh API call on next request
+- API wrapper spot-checks: correct endpoint and params for `get_meetings`, `get_laps` (with/without driver filter), `get_car_data` and `get_location` (range operator tuples), `get_championship_drivers`, and others
+
+**`pipeline/tests/test_ingest.py`** — 65 tests covering all ingest functions:
+- `_parse_gap`: 13 cases — None, numeric float/string, "+N LAP/LAPS", missing plus sign, arbitrary non-numeric, zero, negative
+- `_pick`: key selection, missing keys silently excluded, empty result
+- `_upsert`: empty rows no-op, 1001-row batch produces 3 chunks of 500/500/1, `ReadError`/`ConnectError` retry with exponential backoff, raises after 4 failed attempts
+- Per-table ingest functions: field mapping, all filter conditions (missing session_key/driver_number/lap_number), empty API response behaviour
+- `ingest_race_control`: the same-timestamp test explicitly verifies the PK fix — two different messages at identical timestamps both survive
+- `ingest_race_results`: pit count aggregation, gap_to_leader stringification, dnf/dns/dsq defaulting
+- `ingest_qualifying_results`: fastest lap selection, zero/None/non-numeric/negative duration all excluded
+- `ingest_intervals`: `_parse_gap` integration, lapped driver handling, leader null gap
+- `process_session` routing: all 5 session types (Race, Qualifying, Sprint, Sprint Qualifying, Sprint Shootout) route to the correct ingest functions; early return on missing session
+- `process_meeting`: allowed session filtering, practice sessions skipped
+
+**CI:** `test.yml` runs the suite on every push and pull request via `prefix-dev/setup-pixi`. Verified locally with `act push --job test` using the medium Docker image.
+
+---
+
 ### Phase 1 — Race Tab
 - Status: In progress — data ingestion complete, frontend not yet started
 
@@ -126,7 +159,11 @@ team_radio           — radio recording URLs per driver per timestamp
 - ✅ `pit_stops.lane_duration`
 - ✅ `race_results.number_of_laps`
 - ✅ `overtakes.date` — PK updated to `(session_key, date, driver_number_overtaking, driver_number_overtaken)` since `lap_number` is not in the API response
-- ✅ `race_control.qualifying_phase`
+- ✅ `starting_grid.lap_duration` — qualifying lap time that set the grid position
+- ✅ `races.circuit_type` — "Permanent", "Temporary - Street", or "Temporary - Road"
+- ✅ `championship_drivers` table — driver points/position before and after each race (Beta endpoint, race/sprint only)
+- ✅ `championship_teams` table — constructor points/position before and after each race (Beta endpoint, race/sprint only)
+- ✅ `race_control.qualifying_phase` — PK updated to `(session_key, date, category, message)` to correctly handle multiple messages at the same timestamp
 
 **Race Results Table**
 - Position, Driver, Team, Laps

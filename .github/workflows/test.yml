@@ -1,0 +1,21 @@
+name: Test Pipeline
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: prefix-dev/setup-pixi@v0.8.1
+        with:
+          pixi-version: latest
+          environments: pipeline
+          cache: true
+
+      - name: Run tests
+        run: pixi run -e pipeline test

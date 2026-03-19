@@ -1,6 +1,18 @@
 -- F1 Dashboard — Supabase Schema
 -- Run this in the Supabase SQL editor to set up all tables and RLS.
 -- All upserts are keyed on natural identifiers so running the pipeline twice is safe.
+--
+-- Migration notes for existing deployments:
+--   race_control PK was (session_key, date) — changed to (session_key, date, category, message).
+--   Run the following on your live Supabase instance if upgrading from the original schema:
+--
+--     ALTER TABLE race_control DROP CONSTRAINT race_control_pkey;
+--     ALTER TABLE race_control ADD PRIMARY KEY (session_key, date, category, message);
+--     ALTER TABLE races ADD COLUMN IF NOT EXISTS circuit_type text;
+--     ALTER TABLE starting_grid ADD COLUMN IF NOT EXISTS lap_duration numeric;
+--
+--   The championship_drivers and championship_teams tables are new — just run their CREATE
+--   statements below (they include IF NOT EXISTS so the full file is safe to re-run).
 
 -- ---------------------------------------------------------------------------
 -- races  (meeting metadata)
@@ -15,7 +27,8 @@ create table if not exists races (
     country_code            text,
     location                text,
     year                    integer,
-    date_start              timestamptz
+    date_start              timestamptz,
+    circuit_type            text        -- "Permanent", "Temporary - Street", or "Temporary - Road"
 );
 
 alter table races enable row level security;
@@ -184,14 +197,14 @@ create table if not exists race_control (
     session_key         integer references sessions(session_key),
     date                timestamptz,
     lap_number          integer,
-    category            text,
+    category            text not null,
     flag                text,
-    message             text,
+    message             text not null,
     driver_number       integer,
     scope               text,
     sector              integer,
     qualifying_phase    text,   -- e.g. "Q1", "Q2", "Q3" — populated during qualifying sessions
-    primary key (session_key, date)
+    primary key (session_key, date, category, message)
 );
 
 alter table race_control enable row level security;
@@ -281,8 +294,43 @@ create table if not exists starting_grid (
     session_key     integer references sessions(session_key),
     driver_number   integer,
     position        integer,
+    lap_duration    numeric,    -- qualifying lap time that set the grid position
     primary key (session_key, driver_number)
 );
 
 alter table starting_grid enable row level security;
 create policy "anon read" on starting_grid for select to anon using (true);
+
+
+-- ---------------------------------------------------------------------------
+-- championship_drivers  (Beta endpoint — race sessions only)
+-- ---------------------------------------------------------------------------
+create table if not exists championship_drivers (
+    session_key         integer references sessions(session_key),
+    driver_number       integer,
+    points_start        numeric,    -- points before race
+    points_current      numeric,    -- points during/after race
+    position_start      integer,    -- championship position before race
+    position_current    integer,    -- championship position during/after race
+    primary key (session_key, driver_number)
+);
+
+alter table championship_drivers enable row level security;
+create policy "anon read" on championship_drivers for select to anon using (true);
+
+
+-- ---------------------------------------------------------------------------
+-- championship_teams  (Beta endpoint — race sessions only)
+-- ---------------------------------------------------------------------------
+create table if not exists championship_teams (
+    session_key         integer references sessions(session_key),
+    team_name           text,
+    points_start        numeric,
+    points_current      numeric,
+    position_start      integer,
+    position_current    integer,
+    primary key (session_key, team_name)
+);
+
+alter table championship_teams enable row level security;
+create policy "anon read" on championship_teams for select to anon using (true);

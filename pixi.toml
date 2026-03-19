@@ -8,6 +8,9 @@ version = "0.1.0"
 [tasks]
 notebook = "marimo edit dashboard.py"
 
+[feature.pipeline.tasks]
+test = "pytest pipeline/tests/ -v"
+
 [dependencies]
 marimo = ">=0.20.4,<0.21"
 requests = ">=2.32.5,<3"
@@ -16,6 +19,7 @@ plotly = ">=6.6.0,<7"
 altair = ">=6.0.0,<7"
 pandas = ">=2.2,<3"
 numpy = ">=2.0,<3"
+pytest = ">=9.0.2,<10"
 
 [feature.pipeline.dependencies]
 requests = ">=2.32.5,<3"

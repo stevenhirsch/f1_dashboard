@@ -88,6 +88,7 @@ def ingest_meeting(client: Client, meeting_key: int) -> dict | None:
         "location":           m.get("location"),
         "year":               m.get("year"),
         "date_start":         m.get("date_start"),
+        "circuit_type":       m.get("circuit_type"),
     }
     _upsert(client, "races", [row])
     return m
@@ -246,14 +247,9 @@ def ingest_race_control(client: Client, session_key: int) -> list[dict]:
     ]
     # Deduplicate within the batch — OpenF1 can emit multiple messages at
     # the same timestamp, which would cause Postgres to reject the upsert.
-    seen: set = set()
-    deduped = []
-    for row in rows:
-        key = (row.get("session_key"), row.get("date"), row.get("category"), row.get("message"))
-        if key not in seen:
-            seen.add(key)
-            deduped.append(row)
-    _upsert(client, "race_control", deduped)
+    # Filter to rows where category and message are non-null — required by the PK.
+    rows = [r for r in rows if r.get("category") and r.get("message")]
+    _upsert(client, "race_control", rows)
     return rc
 
 
@@ -397,11 +393,48 @@ def ingest_starting_grid(client: Client, session_key: int) -> None:
             "session_key":   g.get("session_key"),
             "driver_number": g.get("driver_number"),
             "position":      g.get("position"),
+            "lap_duration":  g.get("lap_duration"),
         }
         for g in grid
         if g.get("session_key") and g.get("driver_number") is not None
     ]
     _upsert(client, "starting_grid", rows)
+
+
+def ingest_championship_drivers(client: Client, session_key: int) -> None:
+    """Upsert driver championship standings into `championship_drivers` (race/sprint only)."""
+    standings = openf1.get_championship_drivers(session_key)
+    rows = [
+        {
+            "session_key":      s.get("session_key"),
+            "driver_number":    s.get("driver_number"),
+            "points_start":     s.get("points_start"),
+            "points_current":   s.get("points_current"),
+            "position_start":   s.get("position_start"),
+            "position_current": s.get("position_current"),
+        }
+        for s in standings
+        if s.get("session_key") and s.get("driver_number") is not None
+    ]
+    _upsert(client, "championship_drivers", rows)
+
+
+def ingest_championship_teams(client: Client, session_key: int) -> None:
+    """Upsert constructor championship standings into `championship_teams` (race/sprint only)."""
+    standings = openf1.get_championship_teams(session_key)
+    rows = [
+        {
+            "session_key":      s.get("session_key"),
+            "team_name":        s.get("team_name"),
+            "points_start":     s.get("points_start"),
+            "points_current":   s.get("points_current"),
+            "position_start":   s.get("position_start"),
+            "position_current": s.get("position_current"),
+        }
+        for s in standings
+        if s.get("session_key") and s.get("team_name")
+    ]
+    _upsert(client, "championship_teams", rows)
 
 
 # ---------------------------------------------------------------------------
@@ -425,7 +458,8 @@ def recompute_lap_metrics(client: Client, session_key: int) -> None:
 
 def process_session(client: Client, session_key: int, recompute: bool = False) -> None:
     """Ingest all data for a single session."""
-    print(f"\n→ Processing session {session_key}")
+    openf1.reset_stats()
+    t0 = time.time()
 
     # Fetch session metadata first to get meeting_key, but don't upsert yet —
     # sessions has a FK to races(meeting_key), so the meeting must exist first.
@@ -433,7 +467,13 @@ def process_session(client: Client, session_key: int, recompute: bool = False) -
     if not sessions_raw:
         print(f"  [warn] no session found for session_key={session_key}")
         return
-    meeting_key = sessions_raw[0].get("meeting_key")
+    s0 = sessions_raw[0]
+    session_name = s0.get("session_name") or "Unknown"
+    session_type_raw = s0.get("session_type") or ""
+    date_str = (s0.get("date_start") or "")[:10]  # YYYY-MM-DD
+    print(f"\n  → Session {session_key} — {session_name} [{date_str}]")
+
+    meeting_key = s0.get("meeting_key")
     if meeting_key:
         ingest_meeting(client, meeting_key)
 
@@ -442,7 +482,7 @@ def process_session(client: Client, session_key: int, recompute: bool = False) -
     if session is None:
         return
 
-    session_type = (session.get("session_type") or "").lower()
+    session_type = session_type_raw.lower()
 
     ingest_drivers(client, session_key)
     laps = ingest_laps(client, session_key)
@@ -455,6 +495,8 @@ def process_session(client: Client, session_key: int, recompute: bool = False) -
         ingest_race_results(client, session_key, pit)
         ingest_overtakes(client, session_key)
         ingest_intervals(client, session_key)
+        ingest_championship_drivers(client, session_key)
+        ingest_championship_teams(client, session_key)
     elif session_type in ("qualifying", "sprint qualifying", "sprint shootout"):
         ingest_qualifying_results(client, session_key, laps)
         ingest_starting_grid(client, session_key)
@@ -462,29 +504,52 @@ def process_session(client: Client, session_key: int, recompute: bool = False) -
     if recompute:
         recompute_lap_metrics(client, session_key)
 
-    print(f"✓ Session {session_key} done")
+    elapsed = time.time() - t0
+    stats = openf1.get_stats()
+    rate = openf1.current_rate()
+    rate_str = f" @ {rate:.1f} req/s" if rate > 0 else ""
+    rl_str = f" | ⚠ {stats['rate_limit_waits']} rate-limit waits" if stats["rate_limit_waits"] else ""
+    print(f"  ✓ done in {elapsed:.1f}s | "
+          f"{stats['real_calls']} API calls, {stats['cache_hits']} cached{rate_str}{rl_str}")
 
 
 def process_meeting(client: Client, meeting_key: int, recompute: bool = False) -> None:
     """Ingest all sessions for a meeting."""
-    print(f"\n→ Processing meeting {meeting_key}")
+    meeting_info = openf1.get_meeting(meeting_key)
+    if meeting_info:
+        m = meeting_info[0]
+        name = m.get("meeting_name") or "Unknown"
+        location = m.get("location") or m.get("circuit_short_name") or ""
+        year = m.get("year") or ""
+        print(f"\n→ Meeting {meeting_key} — {name} · {location} · {year}")
+    else:
+        print(f"\n→ Meeting {meeting_key}")
+
     sessions = openf1.get_sessions(meeting_key)
     allowed = {"Race", "Qualifying", "Sprint", "Sprint Qualifying", "Sprint Shootout"}
-    for s in sessions:
-        if s.get("session_name") in allowed:
-            process_session(client, s["session_key"], recompute=recompute)
+    eligible = [s for s in sessions if s.get("session_name") in allowed]
+    print(f"  {len(eligible)} session(s) to ingest: "
+          f"{', '.join(s.get('session_name', '?') for s in eligible)}")
+
+    for s in eligible:
+        process_session(client, s["session_key"], recompute=recompute)
+
+    print(f"\n✓ Meeting {meeting_key} complete")
 
 
 def process_year(client: Client, year: int, recompute: bool = False) -> None:
     """Ingest all race weekends for a year."""
-    print(f"\n→ Processing year {year}")
     meetings = openf1.get_meetings(year)
-    for m in meetings:
-        name = (m.get("meeting_name") or "").lower()
-        if "pre-season" in name or "testing" in name:
-            continue
+    eligible = [m for m in meetings
+                if "pre-season" not in (m.get("meeting_name") or "").lower()
+                and "testing" not in (m.get("meeting_name") or "").lower()]
+    print(f"\n→ Year {year} — {len(eligible)} meeting(s) to ingest")
+    t0 = time.time()
+    for m in eligible:
         process_meeting(client, m["meeting_key"], recompute=recompute)
         time.sleep(1)  # brief pause between meetings
+    elapsed = time.time() - t0
+    print(f"\n✓ Year {year} complete — {len(eligible)} meetings in {elapsed/60:.1f}min")
 
 
 # ---------------------------------------------------------------------------

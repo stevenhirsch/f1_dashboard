@@ -9,6 +9,39 @@ _cache: dict = {}
 # Minimum delay between requests to stay within free tier limits (3 req/s, 30 req/min).
 _REQUEST_DELAY = 0.35
 
+# ---------------------------------------------------------------------------
+# Request stats — reset per session, read at session end for logging
+# ---------------------------------------------------------------------------
+
+_stats: dict = {
+    "real_calls": 0,        # actual HTTP requests sent (excluding cache hits, including retries)
+    "cache_hits": 0,        # requests served from in-memory cache
+    "rate_limit_waits": 0,  # number of 429 responses received
+    "call_times": [],       # wall-clock time of each real call (for rate calculation)
+}
+
+
+def reset_stats() -> None:
+    _stats["real_calls"] = 0
+    _stats["cache_hits"] = 0
+    _stats["rate_limit_waits"] = 0
+    _stats["call_times"] = []
+
+
+def get_stats() -> dict:
+    """Return a copy of current request stats."""
+    return dict(_stats)
+
+
+def current_rate() -> float:
+    """Requests per second over the last 30 real calls (rolling window)."""
+    times = _stats["call_times"]
+    if len(times) < 2:
+        return 0.0
+    window = times[-1] - times[max(0, len(times) - 30)]
+    count = min(len(times), 30) - 1
+    return count / window if window > 0 else 0.0
+
 
 def _get(endpoint: str, params) -> list[dict]:
     """
@@ -25,19 +58,25 @@ def _get(endpoint: str, params) -> list[dict]:
 
     key = endpoint + "?" + "&".join(f"{k}={v}" for k, v in params_list)
     if key in _cache:
+        _stats["cache_hits"] += 1
         return _cache[key]
 
     time.sleep(_REQUEST_DELAY)
+    _stats["real_calls"] += 1
+    _stats["call_times"].append(time.time())
 
     for attempt in range(6):
         resp = requests.get(f"{BASE_URL}/{endpoint}", params=params_list, timeout=30)
         if resp.status_code == 404:
+            _cache[key] = []
             return []
         if resp.status_code != 429:
             resp.raise_for_status()
             break
+        _stats["rate_limit_waits"] += 1
         wait = 2 ** attempt
-        print(f"  [rate limit] 429 on {endpoint}, waiting {wait}s")
+        print(f"  [rate limit] 429 on /{endpoint}, waiting {wait}s "
+              f"(total waits this session: {_stats['rate_limit_waits']})")
         time.sleep(wait)
     else:
         resp.raise_for_status()
@@ -128,6 +167,16 @@ def get_starting_grid(session_key: int) -> list[dict]:
 def get_team_radio(session_key: int) -> list[dict]:
     """Team radio recording metadata for the session."""
     return _get("team_radio", {"session_key": session_key})
+
+
+def get_championship_drivers(session_key: int) -> list[dict]:
+    """Driver championship standings for a race session (Beta endpoint)."""
+    return _get("championship_drivers", {"session_key": session_key})
+
+
+def get_championship_teams(session_key: int) -> list[dict]:
+    """Constructor championship standings for a race session (Beta endpoint)."""
+    return _get("championship_teams", {"session_key": session_key})
 
 
 # --- Telemetry — filtered by date range, not lap_number ---
