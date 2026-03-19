@@ -147,7 +147,8 @@ create table if not exists pit_stops (
     driver_number   integer,
     lap_number      integer,
     pit_duration    numeric,
-    stop_duration   numeric,    -- available from 2024 US GP onwards
+    lane_duration   numeric,    -- time spent in pit lane (entry to exit)
+    stop_duration   numeric,    -- stationary time only, available from 2024 US GP onwards
     date            timestamptz,
     primary key (session_key, driver_number, lap_number)
 );
@@ -180,15 +181,16 @@ create policy "anon read" on weather for select to anon using (true);
 -- race_control
 -- ---------------------------------------------------------------------------
 create table if not exists race_control (
-    session_key     integer references sessions(session_key),
-    date            timestamptz,
-    lap_number      integer,
-    category        text,
-    flag            text,
-    message         text,
-    driver_number   integer,
-    scope           text,
-    sector          integer,
+    session_key         integer references sessions(session_key),
+    date                timestamptz,
+    lap_number          integer,
+    category            text,
+    flag                text,
+    message             text,
+    driver_number       integer,
+    scope               text,
+    sector              integer,
+    qualifying_phase    text,   -- e.g. "Q1", "Q2", "Q3" — populated during qualifying sessions
     primary key (session_key, date)
 );
 
@@ -206,6 +208,7 @@ create table if not exists race_results (
     points          numeric,
     gap_to_leader   text,       -- can be "+N LAP" strings
     duration        numeric,    -- total race seconds for race winner
+    number_of_laps  integer,
     dnf             boolean default false,
     dns             boolean default false,
     dsq             boolean default false,
@@ -243,12 +246,43 @@ create policy "anon read" on qualifying_results for select to anon using (true);
 -- ---------------------------------------------------------------------------
 create table if not exists overtakes (
     session_key                 integer references sessions(session_key),
-    lap_number                  integer,
     driver_number_overtaking    integer,
     driver_number_overtaken     integer,
     position                    integer,
-    primary key (session_key, lap_number, driver_number_overtaking, driver_number_overtaken)
+    date                        timestamptz,
+    primary key (session_key, date, driver_number_overtaking, driver_number_overtaken)
 );
 
 alter table overtakes enable row level security;
 create policy "anon read" on overtakes for select to anon using (true);
+
+
+-- ---------------------------------------------------------------------------
+-- intervals  (gap to leader per driver per timestamp — race/sprint only)
+-- ---------------------------------------------------------------------------
+create table if not exists intervals (
+    session_key     integer references sessions(session_key),
+    driver_number   integer,
+    date            timestamptz,
+    gap_to_leader   numeric,    -- null when driver IS the leader or is lapped
+    interval        numeric,    -- gap to the car directly ahead, null when leading or lapped
+    laps_down       integer,    -- number of laps behind leader (1 for "+1 LAP", etc.), null when on lead lap
+    primary key (session_key, driver_number, date)
+);
+
+alter table intervals enable row level security;
+create policy "anon read" on intervals for select to anon using (true);
+
+
+-- ---------------------------------------------------------------------------
+-- starting_grid
+-- ---------------------------------------------------------------------------
+create table if not exists starting_grid (
+    session_key     integer references sessions(session_key),
+    driver_number   integer,
+    position        integer,
+    primary key (session_key, driver_number)
+);
+
+alter table starting_grid enable row level security;
+create policy "anon read" on starting_grid for select to anon using (true);

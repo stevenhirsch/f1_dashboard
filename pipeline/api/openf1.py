@@ -31,6 +31,8 @@ def _get(endpoint: str, params) -> list[dict]:
 
     for attempt in range(6):
         resp = requests.get(f"{BASE_URL}/{endpoint}", params=params_list, timeout=30)
+        if resp.status_code == 404:
+            return []
         if resp.status_code != 429:
             resp.raise_for_status()
             break
@@ -116,6 +118,11 @@ def get_intervals(session_key: int) -> list[dict]:
 def get_overtakes(session_key: int) -> list[dict]:
     """Overtake events for the session."""
     return _get("overtakes", {"session_key": session_key})
+
+
+def get_starting_grid(session_key: int) -> list[dict]:
+    """Starting grid positions for the session."""
+    return _get("starting_grid", {"session_key": session_key})
 
 
 def get_team_radio(session_key: int) -> list[dict]:

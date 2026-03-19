@@ -28,6 +28,8 @@ import sys
 import time
 from typing import Any
 
+import httpx
+
 from supabase import create_client, Client
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -41,12 +43,21 @@ _CHUNK_SIZE = 500
 
 
 def _upsert(client: Client, table: str, rows: list[dict]) -> None:
-    """Upsert rows into a Supabase table in chunks."""
+    """Upsert rows into a Supabase table in chunks, with retries on transient errors."""
     if not rows:
         return
     for i in range(0, len(rows), _CHUNK_SIZE):
         chunk = rows[i : i + _CHUNK_SIZE]
-        client.table(table).upsert(chunk).execute()
+        for attempt in range(4):
+            try:
+                client.table(table).upsert(chunk).execute()
+                break
+            except (httpx.ReadError, httpx.ConnectError) as e:
+                if attempt == 3:
+                    raise
+                wait = 2 ** attempt
+                print(f"  [network error] {e.__class__.__name__} on {table}, retrying in {wait}s")
+                time.sleep(wait)
     print(f"  upserted {len(rows)} rows → {table}")
 
 
@@ -182,6 +193,7 @@ def ingest_pit_stops(client: Client, session_key: int) -> list[dict]:
             "driver_number":  p.get("driver_number"),
             "lap_number":     p.get("lap_number"),
             "pit_duration":   p.get("pit_duration"),
+            "lane_duration":  p.get("lane_duration"),
             "stop_duration":  p.get("stop_duration"),  # available from 2024 US GP onwards
             "date":           p.get("date"),
         }
@@ -225,13 +237,23 @@ def ingest_race_control(client: Client, session_key: int) -> list[dict]:
             "flag":          r.get("flag"),
             "message":       r.get("message"),
             "driver_number": r.get("driver_number"),
-            "scope":         r.get("scope"),
-            "sector":        r.get("sector"),
+            "scope":             r.get("scope"),
+            "sector":            r.get("sector"),
+            "qualifying_phase":  r.get("qualifying_phase"),
         }
         for r in rc
         if r.get("session_key") and r.get("date")
     ]
-    _upsert(client, "race_control", rows)
+    # Deduplicate within the batch — OpenF1 can emit multiple messages at
+    # the same timestamp, which would cause Postgres to reject the upsert.
+    seen: set = set()
+    deduped = []
+    for row in rows:
+        key = (row.get("session_key"), row.get("date"), row.get("category"), row.get("message"))
+        if key not in seen:
+            seen.add(key)
+            deduped.append(row)
+    _upsert(client, "race_control", deduped)
     return rc
 
 
@@ -252,6 +274,7 @@ def ingest_race_results(client: Client, session_key: int, pit_stops: list[dict])
             "points":         r.get("points"),
             "gap_to_leader":  str(r.get("gap_to_leader")) if r.get("gap_to_leader") is not None else None,
             "duration":       r.get("duration"),
+            "number_of_laps": r.get("number_of_laps"),
             "dnf":            bool(r.get("dnf", False)),
             "dns":            bool(r.get("dns", False)),
             "dsq":            bool(r.get("dsq", False)),
@@ -310,15 +333,75 @@ def ingest_overtakes(client: Client, session_key: int) -> None:
     rows = [
         {
             "session_key":              o.get("session_key"),
-            "lap_number":               o.get("lap_number"),
-            "driver_number_overtaking": o.get("driver_number_overtaking"),
-            "driver_number_overtaken":  o.get("driver_number_overtaken"),
+            "driver_number_overtaking": o.get("overtaking_driver_number"),
+            "driver_number_overtaken":  o.get("overtaken_driver_number"),
             "position":                 o.get("position"),
+            "date":                     o.get("date"),
         }
         for o in overtakes
         if o.get("session_key")
+        and o.get("date")
+        and o.get("overtaking_driver_number") is not None
+        and o.get("overtaken_driver_number") is not None
     ]
     _upsert(client, "overtakes", rows)
+
+
+def _parse_gap(value) -> tuple[float | None, int | None]:
+    """
+    Parse an OpenF1 gap value into (numeric_gap, laps_down).
+
+    Returns (float, None) for normal gaps like 2.345.
+    Returns (None, N) for lapped drivers like "+1 LAP" or "+2 LAPS".
+    Returns (None, None) for null/missing values (leader or no data).
+    """
+    if value is None:
+        return None, None
+    try:
+        return float(value), None
+    except (TypeError, ValueError):
+        s = str(value).strip()
+        if "LAP" in s.upper():
+            try:
+                return None, int(s.split()[0].lstrip("+"))
+            except (ValueError, IndexError):
+                pass
+        return None, None
+
+
+def ingest_intervals(client: Client, session_key: int) -> None:
+    """Upsert gap-to-leader and interval data into `intervals` (race/sprint only)."""
+    intervals = openf1.get_intervals(session_key)
+    rows = []
+    for i in intervals:
+        if not (i.get("session_key") and i.get("driver_number") is not None and i.get("date")):
+            continue
+        gap, laps_down = _parse_gap(i.get("gap_to_leader"))
+        interval, _ = _parse_gap(i.get("interval"))
+        rows.append({
+            "session_key":   i.get("session_key"),
+            "driver_number": i.get("driver_number"),
+            "date":          i.get("date"),
+            "gap_to_leader": gap,
+            "interval":      interval,
+            "laps_down":     laps_down,
+        })
+    _upsert(client, "intervals", rows)
+
+
+def ingest_starting_grid(client: Client, session_key: int) -> None:
+    """Upsert starting grid positions into `starting_grid` (race/sprint only)."""
+    grid = openf1.get_starting_grid(session_key)
+    rows = [
+        {
+            "session_key":   g.get("session_key"),
+            "driver_number": g.get("driver_number"),
+            "position":      g.get("position"),
+        }
+        for g in grid
+        if g.get("session_key") and g.get("driver_number") is not None
+    ]
+    _upsert(client, "starting_grid", rows)
 
 
 # ---------------------------------------------------------------------------
@@ -368,12 +451,13 @@ def process_session(client: Client, session_key: int, recompute: bool = False) -
     ingest_weather(client, session_key)
     ingest_race_control(client, session_key)
 
-    if session_type == "race":
+    if session_type in ("race", "sprint"):
         ingest_race_results(client, session_key, pit)
+        ingest_overtakes(client, session_key)
+        ingest_intervals(client, session_key)
     elif session_type in ("qualifying", "sprint qualifying", "sprint shootout"):
         ingest_qualifying_results(client, session_key, laps)
-
-    ingest_overtakes(client, session_key)
+        ingest_starting_grid(client, session_key)
 
     if recompute:
         recompute_lap_metrics(client, session_key)

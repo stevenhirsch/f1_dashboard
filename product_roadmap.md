@@ -70,7 +70,15 @@ pit_stops            — lane duration, stop duration (2024 US GP+), lap number
 weather              — track temp, air temp, humidity, rainfall per session
 race_results         — position, gap, DNF/DSQ with reason, pit count, fastest lap flag
 qualifying_results   — Q1/Q2/Q3 best times, compounds, lap counts, delta to pole
-overtakes            — overtaking/overtaken driver, position, lap number
+overtakes            — overtaking/overtaken driver, position, lap number, date
+
+-- Added in Phase 1 --
+intervals            — gap_to_leader and interval per driver per timestamp (race/sprint only)
+starting_grid        — grid position per driver per session
+
+-- Added in Phase 3 --
+position             — driver position over time throughout session
+team_radio           — radio recording URLs per driver per timestamp
 ```
 
 ### Ingestion Principles
@@ -93,22 +101,32 @@ overtakes            — overtaking/overtaken driver, position, lap number
 ---
 
 ### Phase 0 — Infrastructure Setup
-- Status: Incomplete
+- Status: **Complete**
 *Prerequisite for everything.*
 
-- Supabase project + full schema, RLS enabled from day one
-- Port `api/openf1.py` from Marimo project into `pipeline/api/`
-- Write `ingest.py` with upsert logic and `--recompute` flag
-- `ingest.yml` GitHub Actions workflow with secrets
-- Scaffold React + Vite in `dashboard/`, Supabase JS client configured
-- `deploy.yml` workflow, GitHub Pages confirmed working end to end
+- ✅ Supabase project + full schema, RLS enabled from day one
+- ✅ Port `api/openf1.py` from Marimo project into `pipeline/api/`
+- ✅ Write `ingest.py` with upsert logic and `--recompute` flag
+- ✅ `ingest.yml` GitHub Actions workflow with secrets
+- ✅ Scaffold React + Vite in `dashboard/`, Supabase JS client configured
+- ✅ `deploy.yml` workflow, GitHub Pages confirmed working end to end
 
 **Exit criteria:** manually triggering the workflow populates Supabase for a full race weekend, and a barebones React page on GitHub Pages reads that data.
+
+**Completed 2026-03-18.** First successful ingest was the 2026 Chinese GP Sprint Race (session 11240, meeting 1280). Dashboard live at https://stevenhirsch.github.io/f1_dashboard/.
 
 ---
 
 ### Phase 1 — Race Tab
-- Status: Incomplete
+- Status: In progress — data ingestion complete, frontend not yet started
+
+**Data ingestion additions — Complete (2026-03-18)**
+- ✅ `intervals` table — `gap_to_leader` (numeric seconds) + `laps_down` integer for lapped drivers; "+1 LAP" strings parsed out
+- ✅ `starting_grid` table — keyed to qualifying session (not race session — that's how OpenF1 structures it)
+- ✅ `pit_stops.lane_duration`
+- ✅ `race_results.number_of_laps`
+- ✅ `overtakes.date` — PK updated to `(session_key, date, driver_number_overtaking, driver_number_overtaken)` since `lap_number` is not in the API response
+- ✅ `race_control.qualifying_phase`
 
 **Race Results Table**
 - Position, Driver, Team, Laps
@@ -121,7 +139,7 @@ overtakes            — overtaking/overtaken driver, position, lap number
 - Strategy-corrected race pace per driver (clean air laps only)
 
 **Race Visualizations**
-- Gap / interval evolution chart — driver gaps to leader over lap number, SC/VSC overlay
+- Gap / interval evolution chart — driver gaps to leader over lap number, SC/VSC overlay — requires `intervals` table
 - Tyre strategy plot — per driver ordered by finish position, SC/VSC overlay
 - Weather strip — track temp, air temp, rainfall as shared timeline context
 
@@ -134,6 +152,10 @@ overtakes            — overtaking/overtaken driver, position, lap number
 
 ### Phase 2 — Qualifying Tab
 - Status: Incomplete
+
+**Data ingestion additions (required before UI)**
+- Compute Q1/Q2/Q3 splits in `qualifying_results` using `qualifying_phase` from `race_control` to detect session boundaries
+- Add compound per qualifying phase (from `stints` joined to lap timestamps)
 
 **Qualifying Results Table**
 - Position, Driver, Team
@@ -153,6 +175,10 @@ overtakes            — overtaking/overtaken driver, position, lap number
 ### Phase 3 — Driver Tab, Part A
 - Status: Incomplete
 *Direct API data only.*
+
+**Data ingestion additions (required before UI)**
+- Add `position` table — `(session_key, driver_number, date, position)` — race position over time, needed for position change chart. API wrapper `get_all_positions()` already exists in `openf1.py`.
+- Add `team_radio` table — `(session_key, driver_number, date, recording_url)` — API wrapper `get_team_radio()` already exists in `openf1.py`.
 
 **Driver Summary Card**
 - Best lap time + lap number
