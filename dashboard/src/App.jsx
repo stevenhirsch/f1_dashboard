@@ -1,21 +1,78 @@
 import { useState } from 'react'
 import { useSessionSelector } from './hooks/useSessionSelector'
+import RacePage from './pages/RacePage'
 
 const TABS = ['Race', 'Qualifying', 'Driver']
+
+const THEME = {
+  bg: '#09090b',
+  surface: '#18181b',
+  border: 'rgba(255,255,255,0.08)',
+  text: '#fafafa',
+  muted: '#a1a1aa',
+  red: '#e10600',
+  inputBg: '#27272a',
+}
+
+const selectStyle = {
+  background: THEME.inputBg,
+  color: THEME.text,
+  border: `1px solid ${THEME.border}`,
+  borderRadius: '6px',
+  padding: '0.3rem 0.5rem',
+  fontSize: '0.875rem',
+  cursor: 'pointer',
+  outline: 'none',
+}
+
+const labelStyle = {
+  color: THEME.muted,
+  fontSize: '0.75rem',
+  letterSpacing: '0.05em',
+  textTransform: 'uppercase',
+  display: 'flex',
+  flexDirection: 'column',
+  gap: '0.25rem',
+}
 
 export default function App() {
   const [activeTab, setActiveTab] = useState('Race')
   const selector = useSessionSelector()
 
   return (
-    <div style={{ fontFamily: 'monospace', padding: '1rem' }}>
-      <h1 style={{ marginBottom: '1rem' }}>F1 Strategy Dashboard</h1>
+    <div style={{ fontFamily: 'monospace', background: THEME.bg, minHeight: '100vh', color: THEME.text }}>
+
+      {/* Header */}
+      <div style={{
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'space-between',
+        padding: '1rem 1.5rem 0.75rem',
+        borderBottom: `1px solid ${THEME.border}`,
+      }}>
+        <h1 style={{ margin: 0, fontSize: '1.25rem', fontWeight: 'bold', letterSpacing: '0.02em' }}>
+          F1 Strategy Dashboard
+        </h1>
+        <img
+          src="F1.png"
+          alt="F1"
+          style={{ height: '36px', objectFit: 'contain' }}
+        />
+      </div>
 
       {/* Session selector */}
-      <div style={{ display: 'flex', gap: '1rem', marginBottom: '1rem', flexWrap: 'wrap' }}>
-        <label>
-          Year{' '}
+      <div style={{
+        display: 'flex',
+        gap: '1.5rem',
+        padding: '0.75rem 1.5rem',
+        borderBottom: `1px solid ${THEME.border}`,
+        flexWrap: 'wrap',
+        background: THEME.surface,
+      }}>
+        <label style={labelStyle}>
+          <span>Year</span>
           <select
+            style={selectStyle}
             value={selector.selectedYear ?? ''}
             onChange={e => selector.setSelectedYear(Number(e.target.value))}
           >
@@ -25,9 +82,10 @@ export default function App() {
           </select>
         </label>
 
-        <label>
-          Grand Prix{' '}
+        <label style={labelStyle}>
+          <span>Grand Prix</span>
           <select
+            style={selectStyle}
             value={selector.selectedMeetingKey ?? ''}
             onChange={e => selector.setSelectedMeetingKey(Number(e.target.value))}
           >
@@ -37,9 +95,10 @@ export default function App() {
           </select>
         </label>
 
-        <label>
-          Session{' '}
+        <label style={labelStyle}>
+          <span>Session</span>
           <select
+            style={selectStyle}
             value={selector.selectedSessionKey ?? ''}
             onChange={e => selector.setSelectedSessionKey(Number(e.target.value))}
           >
@@ -51,18 +110,28 @@ export default function App() {
       </div>
 
       {/* Tab bar */}
-      <div style={{ display: 'flex', gap: '0.5rem', marginBottom: '1rem', borderBottom: '1px solid #ccc' }}>
+      <div style={{
+        display: 'flex',
+        gap: '0',
+        padding: '0 1.5rem',
+        borderBottom: `1px solid ${THEME.border}`,
+        background: THEME.surface,
+      }}>
         {TABS.map(tab => (
           <button
             key={tab}
             onClick={() => setActiveTab(tab)}
             style={{
-              padding: '0.4rem 1rem',
+              padding: '0.6rem 1.25rem',
               cursor: 'pointer',
               background: 'none',
               border: 'none',
-              borderBottom: activeTab === tab ? '2px solid #e10600' : '2px solid transparent',
+              borderBottom: activeTab === tab ? `2px solid ${THEME.red}` : '2px solid transparent',
+              color: activeTab === tab ? THEME.text : THEME.muted,
               fontWeight: activeTab === tab ? 'bold' : 'normal',
+              fontFamily: 'monospace',
+              fontSize: '0.875rem',
+              letterSpacing: '0.03em',
             }}
           >
             {tab}
@@ -70,14 +139,16 @@ export default function App() {
         ))}
       </div>
 
-      {/* Tab content — pages built in Phase 1-3 */}
-      <div>
-        {!selector.selectedSessionKey ? (
-          <p>Select a session above to load data.</p>
-        ) : (
-          <p style={{ color: '#666' }}>
-            [{activeTab} tab] session_key={selector.selectedSessionKey} — content coming in Phase {activeTab === 'Race' ? 1 : activeTab === 'Qualifying' ? 2 : 3}
-          </p>
+      {/* Tab content */}
+      <div style={{ padding: '1.25rem 1.5rem' }}>
+        {activeTab === 'Race' && (
+          <RacePage sessionKey={selector.selectedSessionKey} />
+        )}
+        {activeTab === 'Qualifying' && (
+          <p style={{ color: THEME.muted }}>Qualifying tab — Phase 2</p>
+        )}
+        {activeTab === 'Driver' && (
+          <p style={{ color: THEME.muted }}>Driver tab — Phase 3</p>
         )}
       </div>
     </div>
