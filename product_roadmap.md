@@ -4,7 +4,7 @@
 
 ## Project Overview
 
-A post-race Formula 1 analytics dashboard built as a static React web app, displaying race results, qualifying analysis, and deep driver telemetry metrics. Data is ingested from the OpenF1 API after each race weekend and stored in Supabase. The Marimo notebook is a parallel experimentation environment only and is not part of the production path.
+A post-race Formula 1 analytics platform built as a static React web app. The Dashboard mode displays race results, qualifying analysis, and deep driver telemetry metrics. A future Chat mode will allow natural language queries across any race, season, or driver. Data is ingested from the OpenF1 API after each race weekend and stored in Supabase. The Marimo notebook is a parallel experimentation environment only and is not part of the production path.
 
 ---
 
@@ -246,16 +246,20 @@ team_radio           — radio recording URLs per driver per timestamp
 ---
 
 ### Phase 4 — Polish and Public Release
-- Status: Incomplete
+- Status: In progress
+
 *No new data features. Full UX pass before derived metrics.*
 
-- Custom F1-inspired theme — dark background, team colour accents, clean typography
-- Responsive layout for mobile and tablet
-- Session / GP / year selector refinement
-- Shareable URLs with session state encoded in query params
-- Loading states and empty state handling throughout
-- Performance audit — lazy loading, query optimisation
-- Backfill ingestion for all available race weekends from 2023 onwards
+- ✅ Custom F1-inspired theme — dark background, team colour accents, clean typography
+- ✅ Session / GP / year selector refinement — restructured to Year + Weekend + Event; Event dropdown only shown on sprint weekends; tabs (Race / Qualifying / Driver) are now the view selector, not session selector
+- ✅ Shareable URLs with session state encoded in query params (`year`, `weekend`, `event`)
+- ✅ Footer — GitHub repo link, dynamic copyright year, OpenF1 attribution
+- ✅ App branding — title removed, F1 logo stands alone top-left; Dashboard / Chat top-level nav top-right
+- ✅ `races.gmt_offset` — weather chart x-axis now shows local race timezone, not UTC
+- Responsive layout for mobile and tablet — partially addressed (Event dropdown hidden on non-sprint weekends reduces clutter; legend moved off sidebar in tyre plot); full mobile pass still pending
+- Loading states and empty state handling throughout — pending
+- Performance audit — lazy loading, query optimisation — pending
+- Backfill ingestion for all available race weekends from 2023 onwards — pending
 
 **Exit criteria:** a clean shareable link working on desktop and mobile, covering all races from 2023 onwards across all three tabs.
 

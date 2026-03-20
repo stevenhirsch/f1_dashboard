@@ -92,6 +92,8 @@ function Footer() {
       textAlign: 'center',
       color: THEME.muted,
       fontSize: '0.72rem',
+      WebkitTextSizeAdjust: '100%',
+      textSizeAdjust: '100%',
     }}>
       <div style={{ display: 'flex', alignItems: 'center', gap: '1.25rem' }}>
         <a

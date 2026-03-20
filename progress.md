@@ -1,7 +1,7 @@
 # F1 Dashboard — Progress Log
 
 ## Current Status
-**Phase 1 Race Tab frontend complete. Next: Phase 2 Qualifying Tab (requires Q1/Q2/Q3 split computation in pipeline first).**
+**Phase 1 complete including UI/UX polish pass. Next: Phase 2 Qualifying Tab (requires Q1/Q2/Q3 split computation in pipeline first).**
 
 ---
 
@@ -66,6 +66,17 @@ All tables populated correctly for meeting 1280 (2026 Chinese GP).
 **CI:** `.github/workflows/test.yml` runs the suite on every push and pull request. Verified locally with `act push --job test`.
 
 ### Phase 1 Frontend — Complete (2026-03-19)
+### UI/UX Polish — Complete (2026-03-20)
+
+**UI/UX polish changes (2026-03-20):**
+- Navigation restructured: top-level Dashboard / Chat mode switcher (Chat is a future page, placeholder in place); session selector replaced with Year + Weekend + Event dropdowns (Event only shown on sprint weekends, defaults to Grand Prix); tabs are now Race / Qualifying / Driver scoped to the selected event — Race and Driver tabs share `raceSessionKey`, Qualifying tab uses `qualifyingSessionKey`
+- `useSessionSelector` refactored: no longer exposes raw `selectedSessionKey`; derives `raceSessionKey` and `qualifyingSessionKey` from `selectedEvent`; `isSprintWeekend` and `events` array exposed for conditional Event dropdown rendering; URL params updated from `session` to `weekend` + `event`
+- Weather tile: summary stats row added above chart — Avg Air Temp (blue), Avg Track Temp (red), Total Rainfall
+- Weather tile: timestamps converted from UTC to local race timezone using `races.gmt_offset`; x-axis label shows e.g. `Time (UTC+08:00)`; `gmt_offset text` column added to `races` table and populated by `ingest_meeting()`; regex handles OpenF1's `"HH:MM:SS"` format (no leading `+`)
+- Tyre strategy plot: plot title removed (section heading is sufficient); legend moved from right sidebar to top (`orientation: 'h'`, `y: 1.08`); right margin reduced from 160 → 20; x-axis label formalised as `"Lap Number"`
+- F1 logo moved to top-left of header; app title ("Strategy Dashboard") removed — logo stands alone as brand mark
+- Footer added: GitHub icon + repo link (`stevenhirsch/f1_dashboard`), dynamic copyright year (`new Date().getFullYear()`), OpenF1 API attribution with link to `openf1.org`; legal disclaimer kept in README only
+- `dashboard/public/github.svg` added — GitHub mark SVG, rendered with `filter: invert(0.6)` to match muted theme color
 
 **New files created:**
 - `dashboard/src/hooks/useRaceResults.js` — fetches `race_results` + `drivers` separately and merges (no Supabase FK join — `drivers` has composite PK `(session_key, driver_number)` with no FK from `race_results`)
