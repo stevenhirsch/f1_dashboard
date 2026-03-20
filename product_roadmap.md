@@ -151,7 +151,7 @@ team_radio           — radio recording URLs per driver per timestamp
 ---
 
 ### Phase 1 — Race Tab
-- Status: In progress — data ingestion complete, frontend not yet started
+- Status: **Complete (2026-03-19)**
 
 **Data ingestion additions — Complete (2026-03-18)**
 - ✅ `intervals` table — `gap_to_leader` (numeric seconds) + `laps_down` integer for lapped drivers; "+1 LAP" strings parsed out
@@ -165,30 +165,32 @@ team_radio           — radio recording URLs per driver per timestamp
 - ✅ `championship_teams` table — constructor points/position before and after each race (Beta endpoint, race/sprint only)
 - ✅ `race_control.qualifying_phase` — PK updated to `(session_key, date, category, message)` to correctly handle multiple messages at the same timestamp
 
-**Race Results Table**
-- Position, Driver, Team, Laps
-- Final time / gap to winner
-- DNF / DSQ status with reason (parsed from race control messages)
-- Pit count
-- Best lap time + lap number, fastest lap designation
-- Max speed
-- P90 acceleration G, P90 deceleration G, P90 lateral G
-- Strategy-corrected race pace per driver (clean air laps only)
+**Race Results Table — Complete**
+- ✅ Position, Driver (coloured by team), Team, Laps, Time/Gap, Pit count
+- ✅ DNF/DNS/DSQ shown in Pos column in red
+- Deferred: status_detail reason (needs race_control parsing), fastest_lap_flag (no API source yet), max speed, G-load metrics, clean air pace (Phase 5)
 
-**Race Visualizations**
-- Gap / interval evolution chart — driver gaps to leader over lap number, SC/VSC overlay — requires `intervals` table
-- Tyre strategy plot — per driver ordered by finish position, SC/VSC overlay
-- Weather strip — track temp, air temp, rainfall as shared timeline context
+**Race Visualizations — Complete**
+- ✅ Tyre strategy plot — per driver ordered by finish position, SC/VSC overlay, fresh/used hatching, gray placeholder for missing stints
+- ✅ Weather strip — dual-axis: track/air temp (left) + rainfall (right)
+- Gap evolution chart — removed (interval timestamps have no reliable lap-number mapping; may revisit in Phase 3)
 
-**Year-on-Year Comparison Table**
-- Average clean lap time and fastest lap per year for the same circuit
-- Annotated with regulation era, average track temp, wet/dry condition
-- SC/VSC laps excluded from averages
+**Known issues:**
+- OpenF1 sprint stints data gap (session 11240): `/stints` only returns `stint_number=2` for pitters. First stints (laps 1–13) completely absent from the API. Dashboard renders gray placeholder bars. Candidate for OpenF1 GitHub issue.
+
+**Year-on-Year Comparison Table — Deferred to Phase 4**
+- Requires multi-season backfill (`python pipeline/ingest.py --year 2025` etc.)
+
+**Frontend implementation details:**
+- All data hooks fetch multiple tables via `Promise.all` and merge in JS — Supabase `select('*, drivers(...)')` join syntax does not work for `drivers` (composite PK, no FK defined in referencing tables)
+- SC/VSC detection uses `row.category === 'SafetyCar'` (OpenF1 field), not `row.flag`
+- Fresh/used tyre determination: solely `tyre_age_at_start === 0`
+- Plotly pattern: when `pattern.shape` is set, `marker.color` = pattern line color; `marker.pattern.bgcolor` = bar fill
 
 ---
 
 ### Phase 2 — Qualifying Tab
-- Status: Incomplete
+- Status: **Not started — next phase**
 
 **Data ingestion additions (required before UI)**
 - Compute Q1/Q2/Q3 splits in `qualifying_results` using `qualifying_phase` from `race_control` to detect session boundaries
