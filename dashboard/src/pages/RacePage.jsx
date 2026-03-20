@@ -92,7 +92,7 @@ function ResultsTable({ sessionKey }) {
   )
 }
 
-export default function RacePage({ sessionKey }) {
+export default function RacePage({ sessionKey, gmtOffset }) {
   if (!sessionKey) return <p style={{ color: '#a1a1aa' }}>Select a session above.</p>
 
   const sectionStyle = { marginBottom: '2rem' }
@@ -126,7 +126,7 @@ export default function RacePage({ sessionKey }) {
       <div style={sectionStyle}>
         <h2 style={headingStyle}>Weather</h2>
         <div style={{ background: THEME.surface, borderRadius: '8px', border: `1px solid ${THEME.border}`, padding: '0.5rem' }}>
-          <WeatherStrip sessionKey={sessionKey} />
+          <WeatherStrip sessionKey={sessionKey} gmtOffset={gmtOffset} />
         </div>
       </div>
     </div>

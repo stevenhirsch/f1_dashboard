@@ -13,6 +13,9 @@
 --
 --   The championship_drivers and championship_teams tables are new — just run their CREATE
 --   statements below (they include IF NOT EXISTS so the full file is safe to re-run).
+--
+--   gmt_offset added to races (2026-03-20):
+--     ALTER TABLE races ADD COLUMN IF NOT EXISTS gmt_offset text;
 
 -- ---------------------------------------------------------------------------
 -- races  (meeting metadata)
@@ -28,7 +31,8 @@ create table if not exists races (
     location                text,
     year                    integer,
     date_start              timestamptz,
-    circuit_type            text        -- "Permanent", "Temporary - Street", or "Temporary - Road"
+    circuit_type            text,       -- "Permanent", "Temporary - Street", or "Temporary - Road"
+    gmt_offset              text        -- e.g. "+08:00", "-05:00" — from OpenF1 meetings endpoint
 );
 
 alter table races enable row level security;

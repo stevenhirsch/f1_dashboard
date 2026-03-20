@@ -89,6 +89,7 @@ def ingest_meeting(client: Client, meeting_key: int) -> dict | None:
         "year":               m.get("year"),
         "date_start":         m.get("date_start"),
         "circuit_type":       m.get("circuit_type"),
+        "gmt_offset":         m.get("gmt_offset"),
     }
     _upsert(client, "races", [row])
     return m
