@@ -551,6 +551,38 @@ def ingest_championship_drivers(client: Client, session_key: int) -> None:
     _upsert(client, "championship_drivers", rows)
 
 
+def ingest_position(client: Client, session_key: int) -> None:
+    """Upsert race position over time into `position` (race/sprint only)."""
+    positions = openf1.get_all_positions(session_key)
+    rows = [
+        {
+            "session_key":   p.get("session_key"),
+            "driver_number": p.get("driver_number"),
+            "date":          p.get("date"),
+            "position":      p.get("position"),
+        }
+        for p in positions
+        if p.get("session_key") and p.get("driver_number") is not None and p.get("date")
+    ]
+    _upsert(client, "position", rows)
+
+
+def ingest_team_radio(client: Client, session_key: int) -> None:
+    """Upsert team radio recording metadata into `team_radio`."""
+    radio = openf1.get_team_radio(session_key)
+    rows = [
+        {
+            "session_key":   r.get("session_key"),
+            "driver_number": r.get("driver_number"),
+            "date":          r.get("date"),
+            "recording_url": r.get("recording_url"),
+        }
+        for r in radio
+        if r.get("session_key") and r.get("driver_number") is not None and r.get("date")
+    ]
+    _upsert(client, "team_radio", rows)
+
+
 def ingest_championship_teams(client: Client, session_key: int) -> None:
     """Upsert constructor championship standings into `championship_teams` (race/sprint only)."""
     standings = openf1.get_championship_teams(session_key)
@@ -627,6 +659,8 @@ def process_session(client: Client, session_key: int, recompute: bool = False) -
         ingest_race_results(client, session_key, pit)
         ingest_overtakes(client, session_key)
         ingest_intervals(client, session_key)
+        ingest_position(client, session_key)
+        ingest_team_radio(client, session_key)
         ingest_championship_drivers(client, session_key)
         ingest_championship_teams(client, session_key)
     elif session_type in ("qualifying", "sprint qualifying", "sprint shootout"):

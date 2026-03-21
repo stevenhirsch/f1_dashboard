@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { useSessionSelector } from './hooks/useSessionSelector'
 import RacePage from './pages/RacePage'
 import QualifyingPage from './pages/QualifyingPage'
+import DriverPage from './pages/DriverPage'
 
 const THEME = {
   bg: '#09090b',
@@ -226,7 +227,7 @@ export default function App() {
               <QualifyingPage sessionKey={selector.qualifyingSessionKey} gmtOffset={selector.gmtOffset} />
             )}
             {activeTab === 'Driver' && (
-              <p style={{ color: THEME.muted }}>Driver tab — Phase 3</p>
+              <DriverPage raceSessionKey={selector.raceSessionKey} qualifyingSessionKey={selector.qualifyingSessionKey} gmtOffset={selector.gmtOffset} />
             )}
           </div>
         </>

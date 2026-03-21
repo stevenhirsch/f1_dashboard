@@ -24,6 +24,8 @@
 --     ALTER TABLE qualifying_results ADD COLUMN IF NOT EXISTS q1_laps integer;
 --     ALTER TABLE qualifying_results ADD COLUMN IF NOT EXISTS q2_laps integer;
 --     ALTER TABLE qualifying_results ADD COLUMN IF NOT EXISTS q3_laps integer;
+--
+--   position and team_radio tables added (Phase 3) — just run their CREATE statements below.
 
 -- ---------------------------------------------------------------------------
 -- races  (meeting metadata)
@@ -335,6 +337,36 @@ create table if not exists championship_drivers (
 
 alter table championship_drivers enable row level security;
 create policy "anon read" on championship_drivers for select to anon using (true);
+
+
+-- ---------------------------------------------------------------------------
+-- position  (race position over time — race/sprint only; Added in Phase 3)
+-- ---------------------------------------------------------------------------
+create table if not exists position (
+    session_key     integer references sessions(session_key),
+    driver_number   integer,
+    date            timestamptz,
+    position        integer,
+    primary key (session_key, driver_number, date)
+);
+
+alter table position enable row level security;
+create policy "anon read" on position for select to anon using (true);
+
+
+-- ---------------------------------------------------------------------------
+-- team_radio  (radio recording URLs — Added in Phase 3)
+-- ---------------------------------------------------------------------------
+create table if not exists team_radio (
+    session_key     integer references sessions(session_key),
+    driver_number   integer,
+    date            timestamptz,
+    recording_url   text,
+    primary key (session_key, driver_number, date)
+);
+
+alter table team_radio enable row level security;
+create policy "anon read" on team_radio for select to anon using (true);
 
 
 -- ---------------------------------------------------------------------------
