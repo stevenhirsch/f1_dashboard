@@ -121,10 +121,10 @@ team_radio           — radio recording URLs per driver per timestamp
 
 ---
 
-### Pipeline Testing — Complete (2026-03-19)
-*Covers all ingestion logic before Phase 2 begins.*
+### Pipeline Testing — Complete (updated through Phase 2)
+*Covers all ingestion logic including qualifying phase assignment.*
 
-119 tests across two files, run via `pixi run -e pipeline test`. All tests are pure unit/integration tests using `unittest.mock` — no live API or database calls.
+144 tests across two files, run via `pixi run -e pipeline test`. All tests are pure unit/integration tests using `unittest.mock` — no live API or database calls.
 
 **`pipeline/tests/test_openf1.py`** — 54 tests covering the OpenF1 API client:
 - `_get` cache lifecycle: hit returns cached result, miss calls API and caches, 404 cached as empty list
@@ -190,24 +190,32 @@ team_radio           — radio recording URLs per driver per timestamp
 ---
 
 ### Phase 2 — Qualifying Tab
-- Status: **Not started — next phase**
+- Status: **Complete (2026-03-21)**
 
-**Data ingestion additions (required before UI)**
-- Compute Q1/Q2/Q3 splits in `qualifying_results` using `qualifying_phase` from `race_control` to detect session boundaries
-- Add compound per qualifying phase (from `stints` joined to lap timestamps)
+**Data ingestion additions — Complete**
+- ✅ `_normalize_phase(v)` — handles OpenF1 integer qualifying_phase (1/2/3) and string ("Q1"/"Q2"/"Q3") forms
+- ✅ `_assign_qualifying_phases(laps, race_control)` — injects `_phase` into each lap via sorted race_control events
+- ✅ `_get_compound_for_lap(driver_number, lap_number, stints)` — compound lookup for a driver's specific lap
+- ✅ `qualifying_results` — 6 new columns: `q1_compound`, `q2_compound`, `q3_compound`, `q1_laps`, `q2_laps`, `q3_laps`; per-phase best times computed correctly
 
-**Qualifying Results Table**
-- Position, Driver, Team
-- Q1 / Q2 / Q3 best times
-- Tyre compound used for each session best lap
-- Delta to pole per session
-- Q1 / Q2 elimination cutoff markers
-- Laps completed per session per driver
+**Qualifying Results Table — Complete**
+- ✅ Position ordered by `starting_grid.position` (official classification, avoids raw `best_lap_time` sort misranking Q1-only drivers above Q2/Q3 drivers)
+- ✅ Driver (team-coloured), Team, Q1 / Q2 / Q3 best times, Laps
+- ✅ Dynamic elimination separators ("eliminated after Q1" / "eliminated after Q2") using client-side phase detection as fallback when DB times are null
 
-**Qualifying Visualizations**
-- **Sector delta heatmap** — all drivers × S1/S2/S3, coloured by delta to pole per sector. Immediately reveals where each team gains and loses time relative to the benchmark lap
-- Track evolution chart — lap number vs. lap time scatter per session, all drivers
-- Tyre strategy per session — compound and stint structure per driver
+**Phase Analysis tabs (Q1 / Q2 / Q3) — Complete**
+- ✅ Per-driver stint table: compound badges + fresh/used indicator, best phase time, gap to leader
+- ✅ Elimination separators within each phase tab — advanced drivers shown first, eliminated drivers below divider
+- ✅ Phase-filtered weather strip — shows only weather during the active phase's time window
+- ✅ Phase-filtered sector delta heatmap — S1/S2/S3 deltas computed within the active phase only
+
+**Qualifying Visualizations — Complete**
+- ✅ Sector delta heatmap (`SectorDeltaHeatmap.jsx`) — Plotly heatmap, green = matched fastest, red = slower; per-phase when viewed in tabs
+- Track evolution chart — removed (per-driver lap numbers restart from 1, making cross-driver comparison on a shared x-axis misleading)
+- Tyre strategy per session — removed (same lap number issue; tyre data partially missing from OpenF1 for qualifying)
+
+**Race tab enhancement — Complete**
+- ✅ Grid position change indicator (▲N / ▼N / —) inline in Pos cell, sourced from `starting_grid` keyed to qualifying session
 
 ---
 

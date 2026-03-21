@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react'
 import { supabase } from '../supabaseClient'
 
-export function useRaceResults(sessionKey) {
+export function useRaceResults(sessionKey, qualifyingSessionKey) {
   const [data, setData] = useState(null)
   const [loading, setLoading] = useState(true)
 
@@ -18,19 +18,29 @@ export function useRaceResults(sessionKey) {
         .from('drivers')
         .select('driver_number, name_acronym, team_name, team_colour')
         .eq('session_key', sessionKey),
-    ]).then(([resultsRes, driversRes]) => {
+      qualifyingSessionKey
+        ? supabase
+            .from('starting_grid')
+            .select('driver_number, position')
+            .eq('session_key', qualifyingSessionKey)
+        : Promise.resolve({ data: [] }),
+    ]).then(([resultsRes, driversRes, gridRes]) => {
       const results = resultsRes.data ?? []
       const driverMap = Object.fromEntries(
         (driversRes.data ?? []).map(d => [d.driver_number, d])
       )
+      const gridMap = Object.fromEntries(
+        (gridRes.data ?? []).map(g => [g.driver_number, g.position])
+      )
       const merged = results.map(r => ({
         ...r,
         drivers: driverMap[r.driver_number] ?? null,
+        grid_position: gridMap[r.driver_number] ?? null,
       }))
       setData(merged)
       setLoading(false)
     })
-  }, [sessionKey])
+  }, [sessionKey, qualifyingSessionKey])
 
   return { data, loading }
 }

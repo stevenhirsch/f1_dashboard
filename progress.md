@@ -1,7 +1,7 @@
 # F1 Dashboard — Progress Log
 
 ## Current Status
-**Phase 1 complete including UI/UX polish pass. Next: Phase 2 Qualifying Tab (requires Q1/Q2/Q3 split computation in pipeline first).**
+**Phase 2 complete. Race tab enhanced with grid position change indicators. Next: Phase 3 Driver Tab.**
 
 ---
 
@@ -41,8 +41,50 @@ All tables populated correctly for meeting 1280 (2026 Chinese GP).
 - Overtakes field names corrected: API returns `overtaking_driver_number` / `overtaken_driver_number`
 - Enriched logging: meeting name/city/year header, per-session name and date, upfront list of sessions to ingest, end-of-session summary with elapsed time, API call count, cache hit count, rolling req/s rate, and rate-limit wait count
 
+### Phase 2 — Qualifying Tab — Complete (2026-03-21)
+
+**Pipeline changes:**
+- Added `_normalize_phase(v)` — maps OpenF1 integer qualifying_phase values (1/2/3) and strings ("Q1"/"Q2"/"Q3") to canonical strings. Critical fix: OpenF1 returns integers, not strings, so old ingestion left q1/q2/q3 times all null.
+- Added `_assign_qualifying_phases(laps, race_control)` — injects `_phase` field into each lap using sorted race_control events with lexicographic ISO 8601 date comparison.
+- Added `_get_compound_for_lap(driver_number, lap_number, stints)` — returns compound uppercased, "UNKNOWN" for null compound, None if no matching stint.
+- Rewrote `ingest_qualifying_results` — computes per-phase best times, compounds, and lap counts; upserts 6 new columns (`q1_compound`, `q2_compound`, `q3_compound`, `q1_laps`, `q2_laps`, `q3_laps`).
+- `process_session` now captures `stints_rows` and `rc_rows` return values and passes them to `ingest_qualifying_results`.
+- Schema: added 6 columns to `qualifying_results` with `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`.
+
+**Pipeline testing additions (total now 144 tests):**
+- `TestAssignQualifyingPhases` — 10 tests including integer normalization, boundary conditions, unsorted RC rows, null qualifying_phase ignored
+- `TestGetCompoundForLap` — 6 tests including open-ended stints, uppercasing, null compound → "UNKNOWN"
+- 8 new tests in `TestIngestQualifyingResults` — per-phase times, compounds, lap counts, unphased lap exclusion, empty stints fallback
+- `TestProcessSessionQualifying` — verifies `ingest_qualifying_results` receives `rc_rows` and `stints_rows` as args 4 and 5
+
+**Frontend — new files:**
+- `dashboard/src/utils/compounds.js` — extracted `COMPOUND_COLOURS`, `COMPOUND_ORDER`, `compoundColour()` from `TyreStrategyPlot.jsx` for sharing
+- `dashboard/src/utils/qualifying.js` — `normalizePhase`, `assignPhases`, `formatQualTime`, `formatDelta`, `computeSectorDeltas`, `computePhaseStints`
+- `dashboard/src/hooks/useQualifyingData.js` — parallel fetch of `qualifying_results`, `laps`, `race_control`, `drivers`, `stints`, `weather`; results ordered by `starting_grid.position`
+- `dashboard/src/pages/QualifyingPage.jsx` — Qualifying Results table + Phase Analysis tabs
+- `dashboard/src/plots/SectorDeltaHeatmap.jsx` — Plotly heatmap, rows = drivers, columns = S1/S2/S3, colour scale green→red
+
+**Qualifying Results table:**
+- Ordered by `starting_grid.position` (official qualifying classification) — avoids raw `best_lap_time` sort which incorrectly placed Q1 times above Q2/Q3 drivers
+- Columns: Pos, Driver (team-coloured), Team, Q1, Q2, Q3 (times only), Laps
+- Dynamic elimination separators ("eliminated after Q1" / "eliminated after Q2") using `resolvePhase()` which prefers DB q-times, falls back to client-side `assignPhases` from laps
+
+**Phase Analysis tabs (Q1 / Q2 / Q3):**
+- Tabs default to Q1 (most inclusive), progressing right to most selective
+- Per-driver stint table: Pos, Driver, Team, Tyres (all compound badges + F/U freshness per run), Best, Gap
+- Elimination separators: drivers who advanced to the next phase shown first, then eliminated drivers, with "eliminated after Q1/Q2" divider
+- Out/in-lap filter: laps > 180s excluded from best-time computation (note: may need revisiting for Monaco)
+- `best_time` tracked independently of stint matching — if OpenF1 stint data is missing for a phase, drivers still show a time
+- Phase-filtered weather strip: weather rows filtered to the active phase's time window (start of phase → start of next); falls back to full session weather if filter yields nothing
+- Phase-filtered sector delta heatmap: each tab shows sector deltas within that phase only
+
+**Race tab enhancement:**
+- `useRaceResults` now accepts `qualifyingSessionKey`, fetches `starting_grid` in parallel, merges `grid_position` onto each result row
+- `PositionChange` component: ▲N green (positions gained), ▼N red (positions lost), — (same), blank for DNF/DNS/DSQ
+- Indicator rendered inline in the Pos cell for compact layout
+
 ### Pipeline Testing — Complete (2026-03-19)
-119 tests across two files. Run with `pixi run -e pipeline test`. All use `unittest.mock` — no live API or database calls.
+144 tests across two files. Run with `pixi run -e pipeline test`. All use `unittest.mock` — no live API or database calls.
 
 **`pipeline/tests/test_openf1.py`** — 54 tests:
 - `_get` cache lifecycle, 404 handling, 500/503 raising immediately, 429 exponential backoff, retry exhaustion
@@ -51,7 +93,7 @@ All tables populated correctly for meeting 1280 (2026 Chinese GP).
 - `clear_cache` behaviour
 - API wrapper spot-checks: correct endpoint and params for 8 wrappers including range-operator endpoints (`get_car_data`, `get_location`)
 
-**`pipeline/tests/test_ingest.py`** — 65 tests:
+**`pipeline/tests/test_ingest.py`** — originally 65 tests, now 119 after Phase 2 additions:
 - `_parse_gap`: 13 cases covering all gap value formats including lapped driver strings
 - `_pick`: key selection edge cases
 - `_upsert`: chunking at 500 rows, `ReadError`/`ConnectError` retry with exponential backoff, failure after 4 attempts
@@ -113,29 +155,21 @@ All tables populated correctly for meeting 1280 (2026 Chinese GP).
 ## Known Issues / Decisions Made
 - `race_results.status_detail` is always null — DNF/DSQ reasons need to be parsed from `race_control` messages; deferred
 - `race_results.fastest_lap_flag` is always null — not yet sourced from the API
-- `qualifying_results` Q1/Q2/Q3 splits are not yet computed — deferred to Phase 2
 - `lap_metrics` table exists in schema but is empty — populated in Phase 5
 - `--recompute` flag is wired up but no-ops until Phase 5
 - `overtakes` table is empty for session 11245 (Race) — OpenF1 may not have this data populated yet for the 2026 Chinese GP race session; sprint overtakes (11240) are present
 - **OpenF1 sprint stints data gap (session 11240):** The OpenF1 `/stints` endpoint only returns `stint_number=2` for drivers who pitted during the sprint (all pitted around lap 13 under SC). Their first stints (laps 1–13) are completely absent from the OpenF1 API — confirmed by direct API query. The dashboard renders a gray "Unknown compound" placeholder bar for the missing laps. This may be a permanent OpenF1 data gap or a delayed population issue. Candidate for a GitHub issue against OpenF1. Affected drivers: 1, 3, 6, 11, 12, 16, 18, 23, 43, 44, 63, 81 (session 11240).
+- **OpenF1 qualifying stint data incomplete:** Many drivers show no stint match for Q1/Q2 laps even though they participated. `computePhaseStints` falls back to `overallBest` (best lap duration regardless of stint match) so times always display; compound badges just show empty for unmatched phases.
+- **Out-lap filter for qualifying (Monaco caveat):** Laps > 180s are excluded as out/in-laps in `computePhaseStints` and `computeSectorDeltas`. This threshold works for all current circuits but may incorrectly exclude valid flying laps at Monaco or other slow street circuits. Revisit when Monaco data is added.
+- **OpenF1 `qualifying_phase` integers:** OpenF1 returns `qualifying_phase` as integers (1/2/3), not strings. Both pipeline (`_normalize_phase`) and frontend (`normalizePhase` in `qualifying.js`) handle this. Re-ingestion required after this fix was applied to populate q1/q2/q3 times.
 
 ---
 
 ## Where to Pick Up Next
 
-### Phase 2 — Qualifying Tab
-
-**Step 1 — Pipeline work first:**
-Compute Q1/Q2/Q3 splits in `qualifying_results`. The `qualifying_phase` column in `race_control` identifies session boundaries (e.g. "Q1", "Q2", "Q3"). Cross-reference lap timestamps from `laps.date_start` against `race_control` session-start/end events to assign each lap to a qualifying phase, then pick the best lap per driver per phase.
-
-**Step 2 — Frontend:**
-- Qualifying Results Table — Pos, Driver, Team, Q1/Q2/Q3 best times, delta to pole, compound per phase
-- Sector delta heatmap — all drivers × S1/S2/S3, coloured by delta to pole
-- Track evolution chart — lap time vs. lap number scatter per Q phase
-
 ### Phase 3 — Driver Tab
 
-Add `position` and `team_radio` tables to schema and pipeline, then build the Driver tab UI.
+Add `position` and `team_radio` tables to schema and pipeline, then build the Driver tab UI. See the product roadmap for the full spec.
 
 ### Option — Backfill Data (any time)
 

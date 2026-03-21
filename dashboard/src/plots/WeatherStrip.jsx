@@ -21,10 +21,12 @@ function formatOffsetLabel(gmtOffset) {
   return `UTC${sign}${match[2]}:${match[3]}`
 }
 
-export default function WeatherStrip({ sessionKey, gmtOffset }) {
-  const { data, loading } = useWeather(sessionKey)
+export default function WeatherStrip({ sessionKey, gmtOffset, weatherData: propData }) {
+  const { data: fetchedData, loading } = useWeather(propData != null ? null : sessionKey)
+  const data = propData ?? fetchedData
+  const loading_ = propData != null ? false : loading
 
-  if (loading) return <p style={{ color: '#a1a1aa' }}>Loading weather…</p>
+  if (loading_) return <p style={{ color: '#a1a1aa' }}>Loading weather…</p>
   if (!data || data.length === 0) return <p style={{ color: '#a1a1aa' }}>No weather data.</p>
 
   const timestamps = data.map(r => shiftToLocal(r.date, gmtOffset))

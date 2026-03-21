@@ -7,6 +7,9 @@ import httpx
 
 import ingest
 from ingest import (
+    _assign_qualifying_phases,
+    _get_compound_for_lap,
+    _normalize_phase,
     _parse_gap,
     _pick,
     _upsert,
@@ -550,17 +553,172 @@ class TestIngestRaceResults(unittest.TestCase):
 
 
 # ===========================================================================
+# _assign_qualifying_phases
+# ===========================================================================
+
+class TestAssignQualifyingPhases(unittest.TestCase):
+
+    def _rc(self, qualifying_phase, date):
+        return {"qualifying_phase": qualifying_phase, "date": date}
+
+    def _lap(self, date_start):
+        return {"date_start": date_start, "driver_number": 44, "lap_number": 1}
+
+    def test_lap_after_q1_event_gets_q1(self):
+        laps = [self._lap("2024-03-01T10:00:00")]
+        rc = [self._rc("Q1", "2024-03-01T09:00:00")]
+        result = _assign_qualifying_phases(laps, rc)
+        self.assertEqual(result[0]["_phase"], "Q1")
+
+    def test_lap_after_q2_event_gets_q2(self):
+        laps = [self._lap("2024-03-01T12:00:00")]
+        rc = [
+            self._rc("Q1", "2024-03-01T09:00:00"),
+            self._rc("Q2", "2024-03-01T11:00:00"),
+        ]
+        result = _assign_qualifying_phases(laps, rc)
+        self.assertEqual(result[0]["_phase"], "Q2")
+
+    def test_lap_before_any_event_gets_none(self):
+        laps = [self._lap("2024-03-01T08:00:00")]
+        rc = [self._rc("Q1", "2024-03-01T09:00:00")]
+        result = _assign_qualifying_phases(laps, rc)
+        self.assertIsNone(result[0]["_phase"])
+
+    def test_lap_exactly_at_event_date_gets_that_phase(self):
+        laps = [self._lap("2024-03-01T09:00:00")]
+        rc = [self._rc("Q1", "2024-03-01T09:00:00")]
+        result = _assign_qualifying_phases(laps, rc)
+        self.assertEqual(result[0]["_phase"], "Q1")
+
+    def test_empty_race_control_all_laps_get_none(self):
+        laps = [self._lap("2024-03-01T10:00:00"), self._lap("2024-03-01T11:00:00")]
+        result = _assign_qualifying_phases(laps, [])
+        for lap in result:
+            self.assertIsNone(lap["_phase"])
+
+    def test_lap_with_no_date_start_gets_none(self):
+        laps = [{"date_start": None, "driver_number": 44, "lap_number": 1}]
+        rc = [self._rc("Q1", "2024-03-01T09:00:00")]
+        result = _assign_qualifying_phases(laps, rc)
+        self.assertIsNone(result[0]["_phase"])
+
+    def test_full_q1_q2_q3_scenario(self):
+        laps = [
+            {"date_start": "2024-03-01T10:00:00", "driver_number": 44, "lap_number": 1},
+            {"date_start": "2024-03-01T12:00:00", "driver_number": 44, "lap_number": 2},
+            {"date_start": "2024-03-01T14:00:00", "driver_number": 44, "lap_number": 3},
+        ]
+        rc = [
+            self._rc("Q1", "2024-03-01T09:00:00"),
+            self._rc("Q2", "2024-03-01T11:00:00"),
+            self._rc("Q3", "2024-03-01T13:00:00"),
+        ]
+        result = _assign_qualifying_phases(laps, rc)
+        self.assertEqual(result[0]["_phase"], "Q1")
+        self.assertEqual(result[1]["_phase"], "Q2")
+        self.assertEqual(result[2]["_phase"], "Q3")
+
+    def test_rc_rows_with_null_qualifying_phase_ignored(self):
+        laps = [self._lap("2024-03-01T10:00:00")]
+        rc = [
+            {"qualifying_phase": None, "date": "2024-03-01T09:00:00"},
+            self._rc("Q1", "2024-03-01T09:30:00"),
+        ]
+        result = _assign_qualifying_phases(laps, rc)
+        self.assertEqual(result[0]["_phase"], "Q1")
+
+    def test_unsorted_rc_rows_produce_correct_assignment(self):
+        laps = [self._lap("2024-03-01T12:00:00")]
+        rc = [
+            self._rc("Q2", "2024-03-01T11:00:00"),  # out of order
+            self._rc("Q1", "2024-03-01T09:00:00"),
+        ]
+        result = _assign_qualifying_phases(laps, rc)
+        self.assertEqual(result[0]["_phase"], "Q2")
+
+    def test_integer_qualifying_phase_normalized_to_q_string(self):
+        """OpenF1 returns qualifying_phase as integer 1/2/3 in many sessions."""
+        laps = [
+            self._lap("2024-03-01T10:00:00"),
+            self._lap("2024-03-01T12:00:00"),
+            self._lap("2024-03-01T14:00:00"),
+        ]
+        rc = [
+            {"qualifying_phase": 1, "date": "2024-03-01T09:00:00"},
+            {"qualifying_phase": 2, "date": "2024-03-01T11:00:00"},
+            {"qualifying_phase": 3, "date": "2024-03-01T13:00:00"},
+        ]
+        result = _assign_qualifying_phases(laps, rc)
+        self.assertEqual(result[0]["_phase"], "Q1")
+        self.assertEqual(result[1]["_phase"], "Q2")
+        self.assertEqual(result[2]["_phase"], "Q3")
+
+
+# ===========================================================================
+# _get_compound_for_lap
+# ===========================================================================
+
+class TestGetCompoundForLap(unittest.TestCase):
+
+    def _stint(self, driver_number, lap_start, lap_end, compound):
+        return {
+            "driver_number": driver_number,
+            "lap_start": lap_start,
+            "lap_end": lap_end,
+            "compound": compound,
+        }
+
+    def test_lap_within_range_returns_compound(self):
+        stints = [self._stint(44, 1, 5, "SOFT")]
+        self.assertEqual(_get_compound_for_lap(44, 3, stints), "SOFT")
+
+    def test_wrong_driver_returns_none(self):
+        stints = [self._stint(44, 1, 5, "SOFT")]
+        self.assertIsNone(_get_compound_for_lap(33, 3, stints))
+
+    def test_lap_outside_all_ranges_returns_none(self):
+        stints = [self._stint(44, 1, 3, "SOFT")]
+        self.assertIsNone(_get_compound_for_lap(44, 5, stints))
+
+    def test_open_ended_stint_matches_any_lap_gte_start(self):
+        stints = [self._stint(44, 3, None, "MEDIUM")]
+        self.assertEqual(_get_compound_for_lap(44, 10, stints), "MEDIUM")
+
+    def test_compound_returned_uppercased(self):
+        stints = [self._stint(44, 1, 5, "soft")]
+        self.assertEqual(_get_compound_for_lap(44, 3, stints), "SOFT")
+
+    def test_none_compound_returns_unknown(self):
+        stints = [self._stint(44, 1, 5, None)]
+        self.assertEqual(_get_compound_for_lap(44, 3, stints), "UNKNOWN")
+
+
+# ===========================================================================
 # ingest_qualifying_results
 # ===========================================================================
 
 class TestIngestQualifyingResults(unittest.TestCase):
 
-    def _lap(self, driver_number, lap_number, lap_duration):
+    def _lap(self, driver_number, lap_number, lap_duration,
+             date_start="2024-03-01T10:00:00"):
         return {
             "session_key": 9000,
             "driver_number": driver_number,
             "lap_number": lap_number,
             "lap_duration": lap_duration,
+            "date_start": date_start,
+        }
+
+    def _rc(self, qualifying_phase, date):
+        return {"qualifying_phase": qualifying_phase, "date": date, "session_key": 9000}
+
+    def _stint(self, driver_number, lap_start, lap_end, compound):
+        return {
+            "driver_number": driver_number,
+            "lap_start": lap_start,
+            "lap_end": lap_end,
+            "compound": compound,
         }
 
     def test_fastest_lap_selected_when_driver_has_multiple(self):
@@ -570,8 +728,9 @@ class TestIngestQualifyingResults(unittest.TestCase):
             self._lap(44, 2, 88.5),  # fastest
             self._lap(44, 3, 89.0),
         ]
+        rc = [self._rc("Q1", "2024-03-01T09:00:00")]
 
-        ingest_qualifying_results(client, 9000, laps)
+        ingest_qualifying_results(client, 9000, laps, rc, [])
 
         upserted = client.table.return_value.upsert.call_args.args[0]
         self.assertEqual(len(upserted), 1)
@@ -625,13 +784,146 @@ class TestIngestQualifyingResults(unittest.TestCase):
             self._lap(33, 1, 89.0),
             self._lap(33, 2, 91.0),
         ]
+        rc = [self._rc("Q1", "2024-03-01T09:00:00")]
 
-        ingest_qualifying_results(client, 9000, laps)
+        ingest_qualifying_results(client, 9000, laps, rc, [])
 
         upserted = client.table.return_value.upsert.call_args.args[0]
         by_driver = {r["driver_number"]: r for r in upserted}
         self.assertAlmostEqual(by_driver[44]["best_lap_time"], 88.5)
         self.assertAlmostEqual(by_driver[33]["best_lap_time"], 89.0)
+
+    def test_q1_q2_q3_times_computed_correctly(self):
+        client = _mock_client()
+        laps = [
+            self._lap(44, 1, 90.0, "2024-03-01T10:00:00"),  # Q1
+            self._lap(44, 2, 88.0, "2024-03-01T12:00:00"),  # Q2
+            self._lap(44, 3, 86.0, "2024-03-01T14:00:00"),  # Q3
+        ]
+        rc = [
+            self._rc("Q1", "2024-03-01T09:00:00"),
+            self._rc("Q2", "2024-03-01T11:00:00"),
+            self._rc("Q3", "2024-03-01T13:00:00"),
+        ]
+
+        ingest_qualifying_results(client, 9000, laps, rc, [])
+
+        upserted = client.table.return_value.upsert.call_args.args[0]
+        row = upserted[0]
+        self.assertAlmostEqual(row["q1_time"], 90.0)
+        self.assertAlmostEqual(row["q2_time"], 88.0)
+        self.assertAlmostEqual(row["q3_time"], 86.0)
+
+    def test_driver_eliminated_in_q1_has_null_q2_q3(self):
+        client = _mock_client()
+        laps = [self._lap(44, 1, 90.0, "2024-03-01T10:00:00")]
+        rc = [
+            self._rc("Q1", "2024-03-01T09:00:00"),
+            self._rc("Q2", "2024-03-01T11:00:00"),
+        ]
+
+        ingest_qualifying_results(client, 9000, laps, rc, [])
+
+        upserted = client.table.return_value.upsert.call_args.args[0]
+        row = upserted[0]
+        self.assertAlmostEqual(row["q1_time"], 90.0)
+        self.assertIsNone(row["q2_time"])
+        self.assertIsNone(row["q3_time"])
+
+    def test_compound_attached_correctly_to_phase_best_lap(self):
+        client = _mock_client()
+        laps = [self._lap(44, 2, 90.0, "2024-03-01T10:00:00")]
+        rc = [self._rc("Q1", "2024-03-01T09:00:00")]
+        stints = [self._stint(44, 1, 5, "SOFT")]
+
+        ingest_qualifying_results(client, 9000, laps, rc, stints)
+
+        upserted = client.table.return_value.upsert.call_args.args[0]
+        self.assertEqual(upserted[0]["q1_compound"], "SOFT")
+
+    def test_lap_counts_per_phase_stored_correctly(self):
+        client = _mock_client()
+        laps = [
+            self._lap(44, 1, 90.0, "2024-03-01T10:00:00"),  # Q1
+            self._lap(44, 2, 89.0, "2024-03-01T10:30:00"),  # Q1
+            self._lap(44, 3, 88.0, "2024-03-01T12:00:00"),  # Q2
+        ]
+        rc = [
+            self._rc("Q1", "2024-03-01T09:00:00"),
+            self._rc("Q2", "2024-03-01T11:00:00"),
+        ]
+
+        ingest_qualifying_results(client, 9000, laps, rc, [])
+
+        upserted = client.table.return_value.upsert.call_args.args[0]
+        row = upserted[0]
+        self.assertEqual(row["q1_laps"], 2)
+        self.assertEqual(row["q2_laps"], 1)
+
+    def test_unphased_laps_excluded_from_phase_times(self):
+        client = _mock_client()
+        laps = [
+            # Precedes all events — should be excluded
+            self._lap(44, 1, 50.0, "2024-03-01T08:00:00"),
+            self._lap(44, 2, 90.0, "2024-03-01T10:00:00"),  # Q1
+        ]
+        rc = [self._rc("Q1", "2024-03-01T09:00:00")]
+
+        ingest_qualifying_results(client, 9000, laps, rc, [])
+
+        upserted = client.table.return_value.upsert.call_args.args[0]
+        row = upserted[0]
+        self.assertAlmostEqual(row["q1_time"], 90.0)
+        # The 50-second unphased lap must not influence the overall best
+        self.assertAlmostEqual(row["best_lap_time"], 90.0)
+
+    def test_overall_best_is_min_across_all_phases(self):
+        client = _mock_client()
+        laps = [
+            self._lap(44, 1, 90.0, "2024-03-01T10:00:00"),  # Q1
+            self._lap(44, 2, 88.0, "2024-03-01T12:00:00"),  # Q2
+            self._lap(44, 3, 86.0, "2024-03-01T14:00:00"),  # Q3 — fastest
+        ]
+        rc = [
+            self._rc("Q1", "2024-03-01T09:00:00"),
+            self._rc("Q2", "2024-03-01T11:00:00"),
+            self._rc("Q3", "2024-03-01T13:00:00"),
+        ]
+
+        ingest_qualifying_results(client, 9000, laps, rc, [])
+
+        upserted = client.table.return_value.upsert.call_args.args[0]
+        row = upserted[0]
+        self.assertAlmostEqual(row["best_lap_time"], 86.0)
+        self.assertEqual(row["best_lap_number"], 3)
+
+    def test_empty_stints_compound_fields_all_none(self):
+        client = _mock_client()
+        laps = [self._lap(44, 1, 90.0, "2024-03-01T10:00:00")]
+        rc = [self._rc("Q1", "2024-03-01T09:00:00")]
+
+        ingest_qualifying_results(client, 9000, laps, rc, [])
+
+        upserted = client.table.return_value.upsert.call_args.args[0]
+        row = upserted[0]
+        self.assertIsNone(row["q1_compound"])
+        self.assertIsNone(row["q2_compound"])
+        self.assertIsNone(row["q3_compound"])
+
+    def test_driver_with_only_null_duration_laps_has_none_time_but_count(self):
+        client = _mock_client()
+        laps = [
+            self._lap(44, 1, None, "2024-03-01T10:00:00"),
+            self._lap(44, 2, None, "2024-03-01T10:30:00"),
+        ]
+        rc = [self._rc("Q1", "2024-03-01T09:00:00")]
+
+        ingest_qualifying_results(client, 9000, laps, rc, [])
+
+        upserted = client.table.return_value.upsert.call_args.args[0]
+        row = upserted[0]
+        self.assertIsNone(row["q1_time"])
+        self.assertEqual(row["q1_laps"], 2)
 
 
 # ===========================================================================
@@ -1060,6 +1352,40 @@ class TestProcessSessionQualifying(unittest.TestCase):
         mock_intervals.assert_not_called()
         mock_champ_drivers.assert_not_called()
         mock_champ_teams.assert_not_called()
+
+    @patch("ingest.openf1.reset_stats")
+    @patch("ingest.openf1.get_session", return_value=[QUALIFYING_SESSION])
+    @patch("ingest.ingest_meeting")
+    @patch("ingest.ingest_session", return_value=QUALIFYING_SESSION)
+    @patch("ingest.ingest_drivers")
+    @patch("ingest.ingest_laps", return_value=[])
+    @patch("ingest.ingest_stints", return_value=[{"compound": "SOFT"}])
+    @patch("ingest.ingest_pit_stops", return_value=[])
+    @patch("ingest.ingest_weather")
+    @patch("ingest.ingest_race_control", return_value=[{"qualifying_phase": "Q1"}])
+    @patch("ingest.ingest_race_results")
+    @patch("ingest.ingest_overtakes")
+    @patch("ingest.ingest_intervals")
+    @patch("ingest.ingest_championship_drivers")
+    @patch("ingest.ingest_championship_teams")
+    @patch("ingest.ingest_qualifying_results")
+    @patch("ingest.ingest_starting_grid")
+    def test_qualifying_passes_rc_and_stints_to_qualifying_results(
+        self, mock_starting_grid, mock_qual_results, mock_champ_teams,
+        mock_champ_drivers, mock_intervals, mock_overtakes, mock_race_results,
+        mock_race_control, mock_weather, mock_pit_stops, mock_stints,
+        mock_laps, mock_drivers, mock_session, mock_meeting, mock_get_session,
+        mock_reset_stats,
+    ):
+        client = _mock_client()
+
+        process_session(client, 9001)
+
+        call_args = mock_qual_results.call_args
+        # args[3] = rc_rows (return value of ingest_race_control)
+        self.assertEqual(call_args.args[3], [{"qualifying_phase": "Q1"}])
+        # args[4] = stints_rows (return value of ingest_stints)
+        self.assertEqual(call_args.args[4], [{"compound": "SOFT"}])
 
 
 class TestProcessSessionSprint(unittest.TestCase):

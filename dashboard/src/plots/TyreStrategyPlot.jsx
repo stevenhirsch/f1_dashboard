@@ -1,20 +1,7 @@
 import Plot from 'react-plotly.js'
 import { useStints } from '../hooks/useStints'
 import { useRaceControl } from '../hooks/useRaceControl'
-
-const COMPOUND_COLOURS = {
-  SOFT: '#e8002d',
-  MEDIUM: '#ffd800',
-  HARD: '#afafaf',
-  INTERMEDIATE: '#39b54a',
-  WET: '#0067ff',
-  UNKNOWN: '#888888',
-}
-const COMPOUND_ORDER = ['SOFT', 'MEDIUM', 'HARD', 'INTERMEDIATE', 'WET', 'UNKNOWN']
-
-function compoundColour(compound) {
-  return COMPOUND_COLOURS[(compound ?? '').toUpperCase()] ?? COMPOUND_COLOURS.UNKNOWN
-}
+import { COMPOUND_COLOURS, COMPOUND_ORDER, compoundColour } from '../utils/compounds'
 
 function capitalize(s) {
   return s ? s[0] + s.slice(1).toLowerCase() : s

@@ -28,8 +28,16 @@ function posLabel(row) {
   return row.position ?? '—'
 }
 
-function ResultsTable({ sessionKey }) {
-  const { data, loading } = useRaceResults(sessionKey)
+function PositionChange({ racePos, gridPos, isDNF }) {
+  if (isDNF || racePos == null || gridPos == null) return <span />
+  const change = gridPos - racePos
+  if (change > 0) return <span style={{ color: '#22c55e', fontWeight: 'bold' }}>▲{change}</span>
+  if (change < 0) return <span style={{ color: '#e10600', fontWeight: 'bold' }}>▼{Math.abs(change)}</span>
+  return <span style={{ color: '#a1a1aa' }}>—</span>
+}
+
+function ResultsTable({ sessionKey, qualifyingSessionKey }) {
+  const { data, loading } = useRaceResults(sessionKey, qualifyingSessionKey)
 
   if (loading) return <p style={{ color: '#a1a1aa' }}>Loading results…</p>
   if (!data || data.length === 0) return <p style={{ color: '#a1a1aa' }}>No results data.</p>
@@ -74,8 +82,11 @@ function ResultsTable({ sessionKey }) {
                 background: i % 2 === 0 ? 'transparent' : THEME.tableAlt,
               }}
             >
-              <td style={{ padding: '0.45rem 0.75rem', fontWeight: 'bold', color: isDNF ? '#ef4444' : THEME.muted }}>
+              <td style={{ padding: '0.45rem 0.75rem', fontWeight: 'bold', color: isDNF ? '#ef4444' : THEME.muted, whiteSpace: 'nowrap' }}>
                 {pos}
+                <span style={{ marginLeft: '0.35rem', fontSize: '0.75rem' }}>
+                  <PositionChange racePos={row.position} gridPos={row.grid_position} isDNF={isDNF} />
+                </span>
               </td>
               <td style={{ padding: '0.45rem 0.75rem', color: colour, fontWeight: 'bold' }}>
                 {driver.name_acronym ?? row.driver_number}
@@ -92,7 +103,7 @@ function ResultsTable({ sessionKey }) {
   )
 }
 
-export default function RacePage({ sessionKey, gmtOffset }) {
+export default function RacePage({ sessionKey, qualifyingSessionKey, gmtOffset }) {
   if (!sessionKey) return <p style={{ color: '#a1a1aa' }}>Select a session above.</p>
 
   const sectionStyle = { marginBottom: '2rem' }
@@ -112,7 +123,7 @@ export default function RacePage({ sessionKey, gmtOffset }) {
       <div style={sectionStyle}>
         <h2 style={headingStyle}>Race Results</h2>
         <div style={{ background: THEME.surface, borderRadius: '8px', border: `1px solid ${THEME.border}`, overflow: 'hidden' }}>
-          <ResultsTable sessionKey={sessionKey} />
+          <ResultsTable sessionKey={sessionKey} qualifyingSessionKey={qualifyingSessionKey} />
         </div>
       </div>
 

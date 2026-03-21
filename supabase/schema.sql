@@ -16,6 +16,14 @@
 --
 --   gmt_offset added to races (2026-03-20):
 --     ALTER TABLE races ADD COLUMN IF NOT EXISTS gmt_offset text;
+--
+--   qualifying_results phase columns added (2026-03-21):
+--     ALTER TABLE qualifying_results ADD COLUMN IF NOT EXISTS q1_compound text;
+--     ALTER TABLE qualifying_results ADD COLUMN IF NOT EXISTS q2_compound text;
+--     ALTER TABLE qualifying_results ADD COLUMN IF NOT EXISTS q3_compound text;
+--     ALTER TABLE qualifying_results ADD COLUMN IF NOT EXISTS q1_laps integer;
+--     ALTER TABLE qualifying_results ADD COLUMN IF NOT EXISTS q2_laps integer;
+--     ALTER TABLE qualifying_results ADD COLUMN IF NOT EXISTS q3_laps integer;
 
 -- ---------------------------------------------------------------------------
 -- races  (meeting metadata)
@@ -251,6 +259,12 @@ create table if not exists qualifying_results (
     q1_time         numeric,
     q2_time         numeric,
     q3_time         numeric,
+    q1_compound     text,
+    q2_compound     text,
+    q3_compound     text,
+    q1_laps         integer,
+    q2_laps         integer,
+    q3_laps         integer,
     primary key (session_key, driver_number)
 );
 
