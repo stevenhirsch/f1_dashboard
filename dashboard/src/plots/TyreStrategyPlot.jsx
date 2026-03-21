@@ -77,7 +77,6 @@ export default function TyreStrategyPlot({ sessionKey }) {
     for (let i = 0; i < stints.length; i++) {
       const stint = stints[i]
       const compound = (stint.compound ?? 'UNKNOWN').toUpperCase()
-      // Fresh = brand new set (tyre_age_at_start = 0); Used = pre-used (> 0 laps already on it)
       const isFresh = (stint.tyre_age_at_start ?? 0) === 0
 
       const lapStart = stint.lap_start ?? 1
@@ -93,7 +92,7 @@ export default function TyreStrategyPlot({ sessionKey }) {
         traceMap[key] = {
           type: 'bar',
           orientation: 'h',
-          name: `${capitalize(compound)} (${isFresh ? 'Fresh' : 'Used'})`,
+          name: `${compound === 'UNKNOWN' ? '?' : capitalize(compound)} (${isFresh ? 'Fresh' : 'Used'})`,
           legendgroup: key,
           marker: makeMarker(colour, isFresh),
           x: [],

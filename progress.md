@@ -1,7 +1,7 @@
 # F1 Dashboard — Progress Log
 
 ## Current Status
-**Phase 2 complete. Race tab enhanced with grid position change indicators. Next: Phase 3 Driver Tab.**
+**Phase 3 Driver Tab complete. Next: Phase 4 polish (mobile layout, loading/empty states, backfill ingestion).**
 
 ---
 
@@ -165,12 +165,45 @@ All tables populated correctly for meeting 1280 (2026 Chinese GP).
 
 ---
 
+### Phase 3 — Driver Tab — Complete (2026-03-21)
+
+**New files:**
+- `dashboard/src/api/openf1.js` — direct browser fetch of OpenF1 `/car_data` and `/location` endpoints (no URL-encoding of `>=`/`<=` operators)
+- `dashboard/src/utils/telemetry.js` — `computeTelemetry()` (speed integration → cumulative distance, nearest-timestamp location merge), `coastingIntervals()` (throttle < 1% AND brake = 0, min 20m filter)
+- `dashboard/src/hooks/useLapTelemetry.js` — `useRef`-based cache keyed by `${sessionKey}-${driverNumber}-${lapNum}`; fetches only uncached laps; cleans up deselected laps from state
+- `dashboard/src/plots/TrackMapPlot.jsx` — 2D track map; single lap = speed-gradient markers (red→yellow→green); multi-lap = one coloured line per lap; `scaleanchor` preserves aspect ratio
+- `dashboard/src/plots/TelemetryChart.jsx` — 8-panel subplot chart sharing a single distance x-axis: Speed, Power (%), Brake, Gear, Lift & Coast, Thr/Brk overlap, RPM, DRS; binary panels use filled step traces
+- `dashboard/src/plots/CoastingChart.jsx` — Gantt-style coasting interval chart (created, superseded by TelemetryChart panel)
+- `dashboard/src/components/InfoTooltip.jsx` — hoverable/tappable `?` circle; `placement` prop (`'top'`/`'bottom'`), `width` prop; closes on outside click
+
+**Driver tab features:**
+- Race sub-tab: finish position, best lap, pit summary, overtakes made/suffered, FL Speed (st_speed on fastest lap), Top Speed (session max incl. tow); lap-by-lap table with compound badges, sector splits, trap speed; position chart; gap-to-leader chart; lap times bar chart (S1/S2/S3 stacked)
+- Qualifying sub-tab: Q1/Q2/Q3 times, FL Speed, Top Speed; same stacked bar lap times chart with Q1/Q2/Q3 boundary lines; lap-by-lap table with phase, delta-to-best, compound
+- Lap detail panel: click any row to load telemetry; multi-select overlays laps in colour; track map (single lap only, hidden for multi-lap); 8-panel TelemetryChart at 740px (820px multi-lap)
+- InfoTooltip wired into Lap Detail panel (explains Lift & Coast and trail-braking) and Tyre Strategy heading (explains solid vs. scrubbed tyres)
+- `key={selectedDriverNumber}` on sub-tabs resets lap selection on driver change
+
+**Race/Qualifying tab enhancements:**
+- Top speed columns added to Race Results table and Qualifying phase analysis and overall qualifying table; gold highlight for session maximum
+- Overtakes columns added to Race Results table
+- Qualifying lap times chart replaced with same stacked sector bar chart as race; Q1/Q2/Q3 boundaries shown as neutral grey dotted lines
+- Unknown compound bars: `?` badge instead of `U` in tables; hatched grey placeholder bars in compound strip for lap ranges with no stint data (fixes sprint race and qualifying Q1 gaps)
+- Tyre strategy InfoTooltip condensed to two sentences
+
+**Key decisions:**
+- 3D track map removed — no good angle to show elevation without confusion
+- Coasting integrated as TelemetryChart panel 7, not a separate chart — keeps x-axis alignment
+- Throttle/brake split into separate panels (throttle = continuous %, brake = binary filled step)
+- `useRef` cache in `useLapTelemetry` ensures re-selecting a lap is instant (no re-fetch)
+- Sprint race missing stint data → hatched `?` placeholder bars via gap-fill logic after stint loop
+
+---
+
 ## Where to Pick Up Next
 
-### Phase 3 — Driver Tab
+### Phase 4 — Polish and Public Release
 
-Add `position` and `team_radio` tables to schema and pipeline, then build the Driver tab UI. See the product roadmap for the full spec.
-
-### Option — Backfill Data (any time)
-
-Run `python pipeline/ingest.py --year 2025` (and 2023, 2024) to populate historical race weekends. Required before the year-on-year comparison table in the Race tab can be built.
+- Mobile responsive layout pass
+- Loading states and empty state handling throughout
+- Performance audit (lazy loading, query optimisation)
+- Backfill ingestion: `python pipeline/ingest.py --year 2025` (and 2023, 2024) — required for year-on-year comparison table

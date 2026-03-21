@@ -1,12 +1,22 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useMemo } from 'react'
 import Plot from 'react-plotly.js'
 import { supabase } from '../supabaseClient'
 import { useDriverRaceData } from '../hooks/useDriverRaceData'
 import { useDriverQualifyingData } from '../hooks/useDriverQualifyingData'
+import { useLapTelemetry } from '../hooks/useLapTelemetry'
 import { compoundColour, COMPOUND_COLOURS } from '../utils/compounds'
 import { formatQualTime, assignPhases, normalizePhase } from '../utils/qualifying'
 import LapTimesChart from '../plots/LapTimesChart'
+import TrackMapPlot from '../plots/TrackMapPlot'
+import TelemetryChart from '../plots/TelemetryChart'
+import CoastingChart from '../plots/CoastingChart'
 import { useRaceControl } from '../hooks/useRaceControl'
+import InfoTooltip from '../components/InfoTooltip'
+
+const LAP_COLOURS = [
+  '#e10600', '#3b82f6', '#22c55e', '#f59e0b',
+  '#8b5cf6', '#06b6d4', '#f97316', '#ec4899',
+]
 
 const THEME = {
   bg: '#09090b',
@@ -93,7 +103,7 @@ function CompoundBadge({ compound, fresh }) {
         padding: '0 4px',
         lineHeight: '1.5',
       }}>
-        {(compound ?? '?').slice(0, 1)}
+        {(compound ?? 'UNKNOWN').toUpperCase() === 'UNKNOWN' ? '?' : compound.slice(0, 1)}
       </span>
       {fresh != null && (
         <span style={{ fontSize: '0.65rem', color: THEME.muted }}>
@@ -159,7 +169,7 @@ const tdStyle = {
 // Race sub-tab
 // ---------------------------------------------------------------------------
 
-function RaceSummaryCard({ result, laps, pitStops, driver }) {
+function RaceSummaryCard({ result, laps, pitStops, driver, overtakes, driverNumber }) {
   if (!result && laps.length === 0) return null
 
   const validLaps = laps.filter(l => l.lap_duration && l.lap_duration > 0 && !l.is_pit_out_lap)
@@ -170,8 +180,11 @@ function RaceSummaryCard({ result, laps, pitStops, driver }) {
 
   const pitLaps = pitStops.map(p => `L${p.lap_number}`).join(', ')
 
-  const overtakesMade = 0   // overtakes data available via useDriverRaceData but not passed here — shown in table
-  const teamColour = driver?.team_colour ? `#${driver.team_colour.replace('#', '')}` : THEME.muted
+  const overtakesMade = overtakes.filter(o => o.driver_number_overtaking === driverNumber).length
+  const overtakesSuffered = overtakes.filter(o => o.driver_number_overtaken === driverNumber).length
+
+  const maxSpeed = laps.reduce((max, l) => (l.st_speed != null && l.st_speed > max ? l.st_speed : max), 0) || null
+  const fastestLapSpeed = bestLap?.st_speed ?? null
 
   return (
     <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.75rem', marginBottom: '1.5rem' }}>
@@ -194,20 +207,30 @@ function RaceSummaryCard({ result, laps, pitStops, driver }) {
       {result?.points != null && (
         <StatCard label="Points" value={result.points} />
       )}
+      <StatCard label="Overtakes" value={overtakesMade} sub={overtakesSuffered > 0 ? `Lost ${overtakesSuffered}` : null} />
+      {fastestLapSpeed != null && (
+        <StatCard label="FL Speed" value={`${fastestLapSpeed} km/h`} sub="fastest lap" />
+      )}
+      {maxSpeed != null && (
+        <StatCard label="Top Speed" value={`${maxSpeed} km/h`} sub="incl. tow" />
+      )}
     </div>
   )
 }
 
-function RaceLapTable({ laps, stints, pitStops }) {
+function RaceLapTable({ laps, stints, pitStops, selectedLapNums, onLapToggle, lapColourMap }) {
   if (!laps || laps.length === 0) return <p style={{ color: THEME.muted }}>No lap data.</p>
   const pitLapSet = new Set(pitStops.map(p => p.lap_number))
 
   return (
     <div style={{ overflowX: 'auto' }}>
+      <p style={{ fontSize: '0.7rem', color: THEME.muted, margin: '0 0 0.5rem 0' }}>
+        Click a row to load lap telemetry. Select multiple laps to overlay.
+      </p>
       <table style={{ borderCollapse: 'collapse', width: '100%', fontSize: '0.82rem', color: THEME.text }}>
         <thead>
           <tr>
-            {['Lap', 'Time', 'S1', 'S2', 'S3', 'Tyre', 'Pit', 'Trap'].map(h => (
+            {['', 'Lap', 'Time', 'S1', 'S2', 'S3', 'Tyre', 'Pit', 'Trap'].map(h => (
               <th key={h} style={thStyle}>{h}</th>
             ))}
           </tr>
@@ -221,17 +244,34 @@ function RaceLapTable({ laps, stints, pitStops }) {
             const isPit = pitLapSet.has(lap.lap_number)
             const isPitOut = lap.is_pit_out_lap
             const noTime = !lap.lap_duration || lap.lap_duration <= 0
-            const dimStyle = isPitOut || noTime ? { opacity: 0.45 } : {}
+            const isSelected = selectedLapNums.includes(lap.lap_number)
+            const lapColour = lapColourMap[lap.lap_number]
+            const canSelect = !!lap.date_start && !noTime
+            const dimStyle = (isPitOut || noTime) && !isSelected ? { opacity: 0.45 } : {}
 
             return (
               <tr
                 key={lap.lap_number}
+                onClick={() => canSelect && onLapToggle(lap.lap_number)}
                 style={{
                   borderBottom: `1px solid ${THEME.border}`,
-                  background: i % 2 === 0 ? 'transparent' : THEME.tableAlt,
+                  background: isSelected
+                    ? `${lapColour}18`
+                    : i % 2 === 0 ? 'transparent' : THEME.tableAlt,
+                  cursor: canSelect ? 'pointer' : 'default',
                   ...dimStyle,
                 }}
               >
+                <td style={{ ...tdStyle, width: '18px', padding: '0.35rem 0.3rem' }}>
+                  <span style={{
+                    display: 'inline-block',
+                    width: '10px', height: '10px',
+                    borderRadius: '50%',
+                    background: lapColour ?? 'transparent',
+                    border: `1px solid ${lapColour ?? THEME.border}`,
+                    opacity: isSelected ? 1 : 0.25,
+                  }} />
+                </td>
                 <td style={{ ...tdStyle, color: THEME.muted }}>{lap.lap_number}</td>
                 <td style={{ ...tdStyle, fontVariantNumeric: 'tabular-nums' }}>
                   {noTime ? '—' : formatQualTime(lap.lap_duration)}
@@ -362,19 +402,110 @@ function PositionChart({ positions, teamColour }) {
   )
 }
 
+function LapDetailPanel({ sessionKey, driverNumber, selectedLapNums, laps, lapColourMap, onClear }) {
+  const selectedLaps = useMemo(
+    () => selectedLapNums
+      .map(n => laps.find(l => l.lap_number === n))
+      .filter(Boolean)
+      .map(l => ({ lap_number: l.lap_number, date_start: l.date_start, lap_duration: l.lap_duration })),
+    [selectedLapNums, laps],
+  )
+
+  const { data: telemetryData, loading } = useLapTelemetry(sessionKey, driverNumber, selectedLaps)
+
+  // lapColours keyed by lap_number as string (Plotly uses string keys from Object.keys)
+  const lapColours = {}
+  for (const n of selectedLapNums) lapColours[String(n)] = lapColourMap[n]
+
+  return (
+    <div style={{ marginBottom: '2rem' }}>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '0.75rem' }}>
+        <h3 style={{ ...sectionHeading, margin: 0, borderBottom: 'none', display: 'flex', alignItems: 'center' }}>
+          Lap Detail — {selectedLapNums.map(n => `Lap ${n}`).join(', ')}
+          <InfoTooltip content={
+            <div>
+              <div style={{ fontWeight: 'bold', marginBottom: 6 }}>Driving style panels</div>
+              <div style={{ marginBottom: 6 }}>
+                <span style={{ color: '#22c55e', fontWeight: 'bold' }}>Lift &amp; Coast</span> — both throttle &lt;1% <em>and</em> brake = 0.
+                The driver is neither accelerating nor braking, allowing the car to coast.
+                In modern F1 (post-2022), this zone is critical for regenerating the battery (MGU-K harvesting).
+                More coasting generally means more ERS deployment available later in the lap.
+              </div>
+              <div>
+                <span style={{ color: '#f59e0b', fontWeight: 'bold' }}>Thr/Brk overlap</span> — brake applied while throttle ≥10%.
+                Known as <em>trail-braking</em>, this rotates the car into a corner by keeping some rear grip
+                while braking. It is a hallmark of aggressive, high-confidence driving styles.
+              </div>
+            </div>
+          } />
+        </h3>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
+          {loading && <span style={{ fontSize: '0.72rem', color: THEME.muted }}>Loading telemetry…</span>}
+          <button
+            onClick={onClear}
+            style={{
+              background: 'none', border: `1px solid ${THEME.border}`, color: THEME.muted,
+              borderRadius: '4px', padding: '0.2rem 0.6rem', fontSize: '0.72rem',
+              fontFamily: 'monospace', cursor: 'pointer',
+            }}
+          >
+            Clear selection
+          </button>
+        </div>
+      </div>
+
+      <div style={{ background: THEME.surface, borderRadius: '8px', border: `1px solid ${THEME.border}`, padding: '0.75rem' }}>
+        {/* Track map only shown for a single selected lap — multi-lap XY overlay adds no value */}
+        <div style={{ display: 'flex', gap: '1rem', flexWrap: 'wrap' }}>
+          {selectedLapNums.length === 1 && (
+            <div style={{ flex: '0 0 360px', minWidth: '280px' }}>
+              <TrackMapPlot data={telemetryData} lapColours={lapColours} height={360} />
+            </div>
+          )}
+          <div style={{ flex: '1 1 320px', minWidth: '280px' }}>
+            <TelemetryChart data={telemetryData} lapColours={lapColours} height={selectedLapNums.length === 1 ? 740 : 820} />
+          </div>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 function RaceSubTab({ raceSessionKey, driverNumber }) {
   const { data, loading } = useDriverRaceData(raceSessionKey, driverNumber)
   const { safetyCarPeriods } = useRaceControl(raceSessionKey)
+  const [selectedLapNums, setSelectedLapNums] = useState([])
+
+  const toggleLap = lapNum => setSelectedLapNums(prev =>
+    prev.includes(lapNum) ? prev.filter(n => n !== lapNum) : [...prev, lapNum]
+  )
+
+  const lapColourMap = useMemo(() => {
+    const map = {}
+    selectedLapNums.forEach((n, i) => { map[n] = LAP_COLOURS[i % LAP_COLOURS.length] })
+    // Pre-assign colours to all laps for the swatch display
+    return map
+  }, [selectedLapNums])
+
+  // Pre-assign a stable colour for each lap number (for dot preview before selection)
+  const allLapColourMap = useMemo(() => {
+    if (!data?.laps) return {}
+    const map = {}
+    data.laps.forEach((l, i) => { map[l.lap_number] = LAP_COLOURS[i % LAP_COLOURS.length] })
+    return map
+  }, [data?.laps])
 
   if (loading) return <p style={{ color: THEME.muted }}>Loading race data…</p>
   if (!data) return <p style={{ color: THEME.muted }}>No data.</p>
 
-  const { laps, stints, pitStops, result, intervals, positions, driver } = data
+  const { laps, stints, pitStops, result, intervals, overtakes, positions, driver } = data
   const teamColour = driver?.team_colour ? `#${driver.team_colour.replace('#', '')}` : null
+
+  const colourMap = selectedLapNums.length > 0 ? lapColourMap : allLapColourMap
 
   return (
     <div>
-      <RaceSummaryCard result={result} laps={laps} pitStops={pitStops} driver={driver} />
+      <RaceSummaryCard result={result} laps={laps} pitStops={pitStops} driver={driver} overtakes={overtakes} driverNumber={driverNumber} />
 
       <div style={{ marginBottom: '2rem' }}>
         <h3 style={sectionHeading}>Lap Times</h3>
@@ -407,12 +538,30 @@ function RaceSubTab({ raceSessionKey, driverNumber }) {
         </div>
       )}
 
-      <div style={{ marginBottom: '2rem' }}>
+      <div style={{ marginBottom: selectedLapNums.length > 0 ? '1rem' : '2rem' }}>
         <h3 style={sectionHeading}>Lap by Lap</h3>
         <div style={{ background: THEME.surface, borderRadius: '8px', border: `1px solid ${THEME.border}`, overflow: 'hidden' }}>
-          <RaceLapTable laps={laps} stints={stints} pitStops={pitStops} />
+          <RaceLapTable
+            laps={laps}
+            stints={stints}
+            pitStops={pitStops}
+            selectedLapNums={selectedLapNums}
+            onLapToggle={toggleLap}
+            lapColourMap={colourMap}
+          />
         </div>
       </div>
+
+      {selectedLapNums.length > 0 && (
+        <LapDetailPanel
+          sessionKey={raceSessionKey}
+          driverNumber={driverNumber}
+          selectedLapNums={selectedLapNums}
+          laps={laps}
+          lapColourMap={lapColourMap}
+          onClear={() => setSelectedLapNums([])}
+        />
+      )}
     </div>
   )
 }
@@ -421,8 +570,15 @@ function RaceSubTab({ raceSessionKey, driverNumber }) {
 // Qualifying sub-tab
 // ---------------------------------------------------------------------------
 
-function QualSummaryCard({ qualResult, gridPosition }) {
+function QualSummaryCard({ qualResult, gridPosition, laps }) {
   if (!qualResult) return <p style={{ color: THEME.muted }}>No qualifying result.</p>
+
+  const timedLaps = (laps ?? [])
+    .filter(l => l.lap_duration && l.lap_duration > 0 && l.lap_duration <= 180)
+    .sort((a, b) => a.lap_duration - b.lap_duration)
+  const fastestQualLap = timedLaps[0] ?? null
+  const fastestLapSpeed = fastestQualLap?.st_speed ?? null
+  const maxSpeed = (laps ?? []).reduce((max, l) => (l.st_speed != null && l.st_speed > max ? l.st_speed : max), 0) || null
 
   return (
     <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.75rem', marginBottom: '1.5rem' }}>
@@ -448,11 +604,17 @@ function QualSummaryCard({ qualResult, gridPosition }) {
           sub={qualResult.q3_compound ?? null}
         />
       )}
+      {fastestLapSpeed != null && (
+        <StatCard label="FL Speed" value={`${fastestLapSpeed} km/h`} sub="fastest lap" />
+      )}
+      {maxSpeed != null && (
+        <StatCard label="Top Speed" value={`${maxSpeed} km/h`} sub="session max" />
+      )}
     </div>
   )
 }
 
-function QualLapTable({ laps, stints, phaseEvents }) {
+function QualLapTable({ laps, stints, phaseEvents, selectedLapNums, onLapToggle, lapColourMap }) {
   if (!laps || laps.length === 0) return <p style={{ color: THEME.muted }}>No lap data.</p>
 
   const phasedLaps = assignPhases(laps, phaseEvents)
@@ -468,10 +630,13 @@ function QualLapTable({ laps, stints, phaseEvents }) {
 
   return (
     <div style={{ overflowX: 'auto' }}>
+      <p style={{ fontSize: '0.7rem', color: THEME.muted, margin: '0 0 0.5rem 0' }}>
+        Click a timed lap row to load telemetry. Select multiple laps to overlay.
+      </p>
       <table style={{ borderCollapse: 'collapse', width: '100%', fontSize: '0.82rem', color: THEME.text }}>
         <thead>
           <tr>
-            {['Lap', 'Phase', 'Time', 'Delta', 'S1', 'S2', 'S3', 'Tyre'].map(h => (
+            {['', 'Lap', 'Phase', 'Time', 'Delta', 'S1', 'S2', 'S3', 'Tyre'].map(h => (
               <th key={h} style={thStyle}>{h}</th>
             ))}
           </tr>
@@ -483,23 +648,41 @@ function QualLapTable({ laps, stints, phaseEvents }) {
             const fresh = stint?.tyre_age_at_start === 0
             const noTime = !lap.lap_duration || lap.lap_duration <= 0
             const isOutIn = lap.lap_duration > 180
+            const isTimed = !noTime && !isOutIn
             const best = lap._phase ? phaseBest[lap._phase] : null
             const delta = best && lap.lap_duration && !isOutIn
               ? lap.lap_duration - best
               : null
             const isBest = delta === 0
+            const isSelected = selectedLapNums.includes(lap.lap_number)
+            const lapColour = lapColourMap[lap.lap_number]
+            const canSelect = isTimed && !!lap.date_start
 
-            const dimStyle = isOutIn || noTime ? { opacity: 0.4 } : {}
+            const dimStyle = (isOutIn || noTime) && !isSelected ? { opacity: 0.4 } : {}
 
             return (
               <tr
                 key={`${lap.lap_number}-${i}`}
+                onClick={() => canSelect && onLapToggle(lap.lap_number)}
                 style={{
                   borderBottom: `1px solid ${THEME.border}`,
-                  background: i % 2 === 0 ? 'transparent' : THEME.tableAlt,
+                  background: isSelected
+                    ? `${lapColour}18`
+                    : i % 2 === 0 ? 'transparent' : THEME.tableAlt,
+                  cursor: canSelect ? 'pointer' : 'default',
                   ...dimStyle,
                 }}
               >
+                <td style={{ ...tdStyle, width: '18px', padding: '0.35rem 0.3rem' }}>
+                  <span style={{
+                    display: 'inline-block',
+                    width: '10px', height: '10px',
+                    borderRadius: '50%',
+                    background: lapColour ?? 'transparent',
+                    border: `1px solid ${lapColour ?? THEME.border}`,
+                    opacity: isSelected ? 1 : canSelect ? 0.25 : 0,
+                  }} />
+                </td>
                 <td style={{ ...tdStyle, color: THEME.muted }}>{lap.lap_number}</td>
                 <td style={{ ...tdStyle, color: THEME.muted, fontSize: '0.72rem' }}>
                   {lap._phase ?? '—'}
@@ -533,29 +716,70 @@ function QualLapTable({ laps, stints, phaseEvents }) {
 
 function QualSubTab({ qualifyingSessionKey, driverNumber }) {
   const { data, loading } = useDriverQualifyingData(qualifyingSessionKey, driverNumber)
+  const [selectedLapNums, setSelectedLapNums] = useState([])
+
+  const toggleLap = lapNum => setSelectedLapNums(prev =>
+    prev.includes(lapNum) ? prev.filter(n => n !== lapNum) : [...prev, lapNum]
+  )
+
+  const timedLaps = useMemo(
+    () => (data?.laps ?? []).filter(l => l.lap_duration && l.lap_duration <= 180),
+    [data?.laps],
+  )
+
+  const lapColourMap = useMemo(() => {
+    const map = {}
+    selectedLapNums.forEach((n, i) => { map[n] = LAP_COLOURS[i % LAP_COLOURS.length] })
+    return map
+  }, [selectedLapNums])
+
+  const allLapColourMap = useMemo(() => {
+    const map = {}
+    timedLaps.forEach((l, i) => { map[l.lap_number] = LAP_COLOURS[i % LAP_COLOURS.length] })
+    return map
+  }, [timedLaps])
 
   if (loading) return <p style={{ color: THEME.muted }}>Loading qualifying data…</p>
   if (!data) return <p style={{ color: THEME.muted }}>No data.</p>
 
   const { laps, stints, qualResult, phaseEvents, gridPosition } = data
+  const colourMap = selectedLapNums.length > 0 ? lapColourMap : allLapColourMap
 
   return (
     <div>
-      <QualSummaryCard qualResult={qualResult} gridPosition={gridPosition} />
+      <QualSummaryCard qualResult={qualResult} gridPosition={gridPosition} laps={laps} />
 
       <div style={{ marginBottom: '2rem' }}>
         <h3 style={sectionHeading}>Lap Times</h3>
         <div style={{ background: THEME.surface, borderRadius: '8px', border: `1px solid ${THEME.border}`, padding: '0.5rem' }}>
-          <LapTimesChart laps={laps.filter(l => l.lap_duration && l.lap_duration <= 180)} stints={stints} mode="scatter" phaseEvents={phaseEvents} />
+          <LapTimesChart laps={timedLaps} stints={stints} mode="bars" phaseEvents={phaseEvents} />
         </div>
       </div>
 
-      <div style={{ marginBottom: '2rem' }}>
+      <div style={{ marginBottom: selectedLapNums.length > 0 ? '1rem' : '2rem' }}>
         <h3 style={sectionHeading}>Lap by Lap</h3>
         <div style={{ background: THEME.surface, borderRadius: '8px', border: `1px solid ${THEME.border}`, overflow: 'hidden' }}>
-          <QualLapTable laps={laps} stints={stints} phaseEvents={phaseEvents} />
+          <QualLapTable
+            laps={laps}
+            stints={stints}
+            phaseEvents={phaseEvents}
+            selectedLapNums={selectedLapNums}
+            onLapToggle={toggleLap}
+            lapColourMap={colourMap}
+          />
         </div>
       </div>
+
+      {selectedLapNums.length > 0 && (
+        <LapDetailPanel
+          sessionKey={qualifyingSessionKey}
+          driverNumber={driverNumber}
+          selectedLapNums={selectedLapNums}
+          laps={laps}
+          lapColourMap={lapColourMap}
+          onClear={() => setSelectedLapNums([])}
+        />
+      )}
     </div>
   )
 }
@@ -675,13 +899,13 @@ export default function DriverPage({ raceSessionKey, qualifyingSessionKey, gmtOf
       {selectedDriverNumber != null && (
         <>
           {activeSubTab === 'Race' && raceSessionKey && (
-            <RaceSubTab raceSessionKey={raceSessionKey} driverNumber={selectedDriverNumber} />
+            <RaceSubTab key={selectedDriverNumber} raceSessionKey={raceSessionKey} driverNumber={selectedDriverNumber} />
           )}
           {activeSubTab === 'Race' && !raceSessionKey && (
             <p style={{ color: THEME.muted }}>No race session for this weekend.</p>
           )}
           {activeSubTab === 'Qualifying' && qualifyingSessionKey && (
-            <QualSubTab qualifyingSessionKey={qualifyingSessionKey} driverNumber={selectedDriverNumber} />
+            <QualSubTab key={selectedDriverNumber} qualifyingSessionKey={qualifyingSessionKey} driverNumber={selectedDriverNumber} />
           )}
           {activeSubTab === 'Qualifying' && !qualifyingSessionKey && (
             <p style={{ color: THEME.muted }}>No qualifying session for this weekend.</p>

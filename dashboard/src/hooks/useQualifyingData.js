@@ -20,7 +20,7 @@ export function useQualifyingData(sessionKey) {
         .order('best_lap_time', { ascending: true, nullsFirst: false }),
       supabase
         .from('laps')
-        .select('driver_number,lap_number,lap_duration,duration_sector_1,duration_sector_2,duration_sector_3,date_start')
+        .select('driver_number,lap_number,lap_duration,duration_sector_1,duration_sector_2,duration_sector_3,date_start,st_speed')
         .eq('session_key', sessionKey),
       supabase
         .from('race_control')

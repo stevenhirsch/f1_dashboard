@@ -1,6 +1,7 @@
 import { useRaceResults } from '../hooks/useRaceResults'
 import TyreStrategyPlot from '../plots/TyreStrategyPlot'
 import WeatherStrip from '../plots/WeatherStrip'
+import InfoTooltip from '../components/InfoTooltip'
 
 const THEME = {
   bg: '#09090b',
@@ -42,6 +43,9 @@ function ResultsTable({ sessionKey, qualifyingSessionKey }) {
   if (loading) return <p style={{ color: '#a1a1aa' }}>Loading results…</p>
   if (!data || data.length === 0) return <p style={{ color: '#a1a1aa' }}>No results data.</p>
 
+  const bestFlSpeed = Math.max(...data.map(r => r.fl_speed ?? 0))
+  const bestMaxSpeed = Math.max(...data.map(r => r.max_speed ?? 0))
+
   return (
     <table style={{
       borderCollapse: 'collapse',
@@ -51,7 +55,7 @@ function ResultsTable({ sessionKey, qualifyingSessionKey }) {
     }}>
       <thead>
         <tr style={{ borderBottom: `1px solid ${THEME.border}`, textAlign: 'left' }}>
-          {['Pos', 'Driver', 'Team', 'Laps', 'Time / Gap', 'Pits'].map(h => (
+          {['Pos', 'Driver', 'Team', 'Laps', 'Time / Gap', 'Pits', 'FL Speed', 'Top Speed'].map(h => (
             <th key={h} style={{
               padding: '0.4rem 0.75rem',
               whiteSpace: 'nowrap',
@@ -74,6 +78,8 @@ function ResultsTable({ sessionKey, qualifyingSessionKey }) {
           const timeGap = row.position === 1
             ? formatDuration(row.duration)
             : (row.gap_to_leader ?? '—')
+          const isTopFl = row.fl_speed != null && row.fl_speed === bestFlSpeed
+          const isTopMax = row.max_speed != null && row.max_speed === bestMaxSpeed
           return (
             <tr
               key={row.driver_number}
@@ -95,6 +101,12 @@ function ResultsTable({ sessionKey, qualifyingSessionKey }) {
               <td style={{ padding: '0.45rem 0.75rem' }}>{row.number_of_laps ?? '—'}</td>
               <td style={{ padding: '0.45rem 0.75rem' }}>{timeGap}</td>
               <td style={{ padding: '0.45rem 0.75rem', color: THEME.muted }}>{row.pit_count ?? '—'}</td>
+              <td style={{ padding: '0.45rem 0.75rem', fontWeight: isTopFl ? 'bold' : 'normal', color: isTopFl ? '#facc15' : THEME.text }}>
+                {row.fl_speed != null ? `${row.fl_speed}` : '—'}
+              </td>
+              <td style={{ padding: '0.45rem 0.75rem', fontWeight: isTopMax ? 'bold' : 'normal', color: isTopMax ? '#facc15' : THEME.muted }}>
+                {row.max_speed != null ? `${row.max_speed}` : '—'}
+              </td>
             </tr>
           )
         })}
@@ -128,7 +140,14 @@ export default function RacePage({ sessionKey, qualifyingSessionKey, gmtOffset }
       </div>
 
       <div style={sectionStyle}>
-        <h2 style={headingStyle}>Tyre Strategy</h2>
+        <h2 style={{ ...headingStyle, display: 'flex', alignItems: 'center' }}>
+          Tyre Strategy
+          <InfoTooltip placement="top" width={260} content={
+            <div>
+              <strong>Solid</strong> = new set · <strong>Hatched</strong> = scrubbed (pre-used). Used tyres may prevent graining and produce more consistent lap times since they have gone through heat cycles. Teams only get allocated a limited number of tyres per weekend, and will try to save their new tyres for specific times.
+            </div>
+          } />
+        </h2>
         <div style={{ background: THEME.surface, borderRadius: '8px', border: `1px solid ${THEME.border}`, padding: '0.5rem' }}>
           <TyreStrategyPlot sessionKey={sessionKey} />
         </div>

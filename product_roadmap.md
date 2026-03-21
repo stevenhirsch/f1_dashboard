@@ -220,41 +220,29 @@ team_radio           — radio recording URLs per driver per timestamp
 ---
 
 ### Phase 3 — Driver Tab, Part A
-- Status: Incomplete
-*Direct API data only.*
+- Status: **Complete (2026-03-21)**
+*Direct API data only — telemetry fetched live from OpenF1 browser-side.*
 
-**Data ingestion additions (required before UI)**
-- Add `position` table — `(session_key, driver_number, date, position)` — race position over time, needed for position change chart. API wrapper `get_all_positions()` already exists in `openf1.py`.
-- Add `team_radio` table — `(session_key, driver_number, date, recording_url)` — API wrapper `get_team_radio()` already exists in `openf1.py`.
+**Delivered:**
+- ✅ Driver selector with headshot, team colour, name
+- ✅ Race sub-tab: finish position, best lap, pit summary, overtakes made/suffered, FL Speed (st_speed on fastest lap), Top Speed (session max incl. tow); position chart; gap-to-leader chart; stacked sector bar lap times chart; lap-by-lap table with compound badges, sector splits, trap speed
+- ✅ Qualifying sub-tab: Q1/Q2/Q3 summary card, FL Speed, Top Speed; stacked sector bar lap times chart with Q1/Q2/Q3 phase boundary lines; lap-by-lap table with phase, delta-to-best, compound
+- ✅ Lap telemetry: click table row to load OpenF1 car_data + location; multi-select overlays; `useRef`-based cache
+- ✅ 2D track map (single lap: speed-gradient; multi-lap: hidden — XY overlay adds no value)
+- ✅ 8-panel TelemetryChart: Speed, Power (%), Brake, Gear, Lift & Coast, Thr/Brk overlap, RPM, DRS — all sharing a single distance x-axis
+- ✅ InfoTooltip on driving style panels (Lift & Coast, Thr/Brk) and Tyre Strategy heading
 
-**Driver Summary Card**
-- Best lap time + lap number
-- Max speed
+**Deferred to Phase 6 (requires Phase 5 derived metrics):**
 - P90 accel / decel / lateral G
-- Total overtakes (overtaking and overtaken counts, via OpenF1 overtakes endpoint)
 - DRS activation percentage
-- Pit summary — count, lap numbers, lane duration, stop duration (2024 US GP+)
-
-**Lap-by-Lap Table**
-- Lap time, S1 / S2 / S3 sector times
-- Tyre compound, laps on current tyre
-- Pit status flag
-- Max speed per lap
-- Overtake events per lap (overtaking / overtaken, position affected)
-- Radio / comms flag linked to timestamp
-- P90 accel / decel / lateral G per lap
-
-**Driver Visualizations**
-- Lap times chart — lap time over lap number, coloured by compound, pit lap markers
-- Stint pace degradation chart — lap time vs. laps on tyre per stint, with degradation curve fit
-- Gap evolution chart — this driver's gap to leader over race distance
-
-*Implementation note: charts load on demand, lap table is paginated, telemetry aggregated to lap-level before reaching the browser.*
+- Stint pace degradation chart
+- Clean air pace
+- Driving style fingerprint radar chart
 
 ---
 
 ### Phase 4 — Polish and Public Release
-- Status: In progress
+- Status: **In progress (2026-03-21)**
 
 *No new data features. Full UX pass before derived metrics.*
 

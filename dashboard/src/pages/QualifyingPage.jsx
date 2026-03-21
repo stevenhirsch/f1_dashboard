@@ -32,12 +32,12 @@ function CompoundBadge({ compound }) {
       verticalAlign: 'middle',
       lineHeight: '1.5',
     }}>
-      {compound.slice(0, 1)}
+      {compound.toUpperCase() === 'UNKNOWN' ? '?' : compound.slice(0, 1)}
     </span>
   )
 }
 
-function QualifyingResultsTable({ results, driverPhaseMap }) {
+function QualifyingResultsTable({ results, driverPhaseMap, topSpeedByDriver }) {
   if (!results || results.length === 0) return <p style={{ color: THEME.muted }}>No qualifying results.</p>
 
   const totalLaps = results.reduce((sum, r) => {
@@ -45,7 +45,9 @@ function QualifyingResultsTable({ results, driverPhaseMap }) {
   }, 0)
   const showLaps = totalLaps > 0
 
-  const headers = ['Pos', 'Driver', 'Team', 'Q1', 'Q2', 'Q3', ...(showLaps ? ['Laps'] : [])]
+  const bestTopSpeed = Math.max(...results.map(r => topSpeedByDriver?.[r.driver_number] ?? 0))
+
+  const headers = ['Pos', 'Driver', 'Team', 'Q1', 'Q2', 'Q3', 'Top Speed', ...(showLaps ? ['Laps'] : [])]
 
   const thStyle = {
     padding: '0.4rem 0.6rem',
@@ -122,6 +124,16 @@ function QualifyingResultsTable({ results, driverPhaseMap }) {
         <td style={tdStyle()}>{formatQualTime(r.q2_time)}</td>
         <td style={tdStyle()}>{formatQualTime(r.q3_time)}</td>
 
+        {(() => {
+          const spd = topSpeedByDriver?.[r.driver_number] ?? null
+          const isTop = spd != null && spd === bestTopSpeed
+          return (
+            <td style={tdStyle({ fontWeight: isTop ? 'bold' : 'normal', color: isTop ? '#facc15' : THEME.text })}>
+              {spd != null ? spd : '—'}
+            </td>
+          )
+        })()}
+
         {showLaps && (
           <td style={tdStyle({ color: THEME.muted })}>{totalDriverLaps || '—'}</td>
         )}
@@ -141,7 +153,7 @@ function QualifyingResultsTable({ results, driverPhaseMap }) {
   )
 }
 
-function PhaseStintTable({ driverRows, driverMap, driverPhaseMap, activePhase }) {
+function PhaseStintTable({ driverRows, driverMap, driverPhaseMap, activePhase, topSpeedByDriver }) {
   if (!driverRows || driverRows.length === 0) return null
 
   const phaseRankMap = { Q1: 1, Q2: 2, Q3: 3 }
@@ -177,6 +189,8 @@ function PhaseStintTable({ driverRows, driverMap, driverPhaseMap, activePhase })
     ...extra,
   })
 
+  const bestTopSpeed = Math.max(...orderedRows.map(r => topSpeedByDriver?.[r.driver_number] ?? 0))
+
   return (
     <table style={{ borderCollapse: 'collapse', width: '100%', fontSize: '0.85rem', color: THEME.text }}>
       <thead>
@@ -187,6 +201,7 @@ function PhaseStintTable({ driverRows, driverMap, driverPhaseMap, activePhase })
           <th style={thStyle}>Tyres</th>
           <th style={thStyle}>Best</th>
           <th style={thStyle}>Gap</th>
+          <th style={thStyle}>Top Speed</th>
         </tr>
       </thead>
       <tbody>
@@ -195,12 +210,14 @@ function PhaseStintTable({ driverRows, driverMap, driverPhaseMap, activePhase })
           const gap = row.best_time != null && leaderTime != null ? row.best_time - leaderTime : null
           const teamName = driverMap?.[row.driver_number]?.team_name ?? '—'
           const isFirstEliminated = showSeparator && i === advanced.length
+          const topSpeed = topSpeedByDriver?.[row.driver_number] ?? null
+          const isTopSpeed = topSpeed != null && topSpeed === bestTopSpeed
           return (
             <>
               {isFirstEliminated && (
                 <tr key={`sep-${i}`} style={{ borderTop: `1px solid ${THEME.separator}` }}>
                   <td
-                    colSpan={5}
+                    colSpan={7}
                     style={{
                       padding: '0.2rem 0.6rem',
                       fontSize: '0.65rem',
@@ -239,6 +256,9 @@ function PhaseStintTable({ driverRows, driverMap, driverPhaseMap, activePhase })
                 <td style={tdStyle({ fontWeight: 'bold' })}>{formatQualTime(row.best_time)}</td>
                 <td style={tdStyle({ color: THEME.muted })}>
                   {gap === 0 ? 'LEADER' : formatDelta(gap)}
+                </td>
+                <td style={tdStyle({ fontWeight: isTopSpeed ? 'bold' : 'normal', color: isTopSpeed ? '#facc15' : THEME.text })}>
+                  {topSpeed != null ? `${topSpeed}` : '—'}
                 </td>
               </tr>
             </>
@@ -292,6 +312,17 @@ function PhaseTabView({ laps, phaseEvents, stintsByDriver, driverMap, weatherDat
   const phaseRows = computePhaseStints(laps ?? [], phaseEvents ?? [], stintsByDriver ?? {}, driverMap ?? {}, activePhase)
   const phaseDeltas = computeSectorDeltas(laps ?? [], phaseEvents ?? [], driverMap ?? {}, activePhase)
 
+  // Top speed per driver for the active phase (max st_speed across phase laps)
+  const phasedLapsAll = assignPhases(laps ?? [], phaseEvents ?? [])
+  const topSpeedByDriver = {}
+  for (const lap of phasedLapsAll) {
+    if (lap._phase !== activePhase || lap.st_speed == null) continue
+    const dn = lap.driver_number
+    if (topSpeedByDriver[dn] == null || lap.st_speed > topSpeedByDriver[dn]) {
+      topSpeedByDriver[dn] = lap.st_speed
+    }
+  }
+
   return (
     <div>
       <div style={{ display: 'flex', gap: '0.4rem', marginBottom: '1rem' }}>
@@ -316,7 +347,7 @@ function PhaseTabView({ laps, phaseEvents, stintsByDriver, driverMap, weatherDat
       </div>
 
       <div style={{ ...surfaceStyle, overflow: 'hidden', marginBottom: '1.5rem' }}>
-        <PhaseStintTable driverRows={phaseRows} driverMap={driverMap} driverPhaseMap={driverPhaseMap} activePhase={activePhase} />
+        <PhaseStintTable driverRows={phaseRows} driverMap={driverMap} driverPhaseMap={driverPhaseMap} activePhase={activePhase} topSpeedByDriver={topSpeedByDriver} />
       </div>
 
       <div style={{ ...surfaceStyle, overflow: 'hidden', marginBottom: '1.5rem' }}>
@@ -374,12 +405,22 @@ export default function QualifyingPage({ sessionKey, gmtOffset }) {
     }
   }
 
+  // Overall top speed per driver across all qualifying laps
+  const overallTopSpeedByDriver = {}
+  for (const lap of laps ?? []) {
+    if (lap.st_speed == null) continue
+    const dn = lap.driver_number
+    if (overallTopSpeedByDriver[dn] == null || lap.st_speed > overallTopSpeedByDriver[dn]) {
+      overallTopSpeedByDriver[dn] = lap.st_speed
+    }
+  }
+
   return (
     <div>
       <div style={sectionStyle}>
         <h2 style={headingStyle}>Qualifying Results</h2>
         <div style={{ ...surfaceStyle, overflow: 'hidden' }}>
-          <QualifyingResultsTable results={results} driverPhaseMap={driverPhaseMap} />
+          <QualifyingResultsTable results={results} driverPhaseMap={driverPhaseMap} topSpeedByDriver={overallTopSpeedByDriver} />
         </div>
       </div>
 

@@ -44,7 +44,7 @@ function makeStripMarker(colour, isFresh) {
   }
 }
 
-function SectorBarChart({ laps, stints, pitStops, safetyCarPeriods, height }) {
+function SectorBarChart({ laps, stints, pitStops, safetyCarPeriods, phaseEvents, height }) {
   if (!laps || laps.length === 0) return <p style={{ color: '#a1a1aa' }}>No lap data.</p>
 
   const validLaps = laps.filter(l => l.lap_duration && l.lap_duration > 0)
@@ -120,6 +120,8 @@ function SectorBarChart({ laps, stints, pitStops, safetyCarPeriods, height }) {
   // hatching for used tyres, matching TyreStrategyPlot exactly.
   const stripTraces = []
   const seenCompoundKeys = new Set()
+  const coveredRanges = []   // track which lap ranges have stint data
+
   if (stints) {
     for (let i = 0; i < stints.length; i++) {
       const stint = stints[i]
@@ -131,6 +133,8 @@ function SectorBarChart({ laps, stints, pitStops, safetyCarPeriods, height }) {
         ?? (stints[i + 1]?.lap_start != null ? stints[i + 1].lap_start - 1 : maxLap)
       if (lapEnd == null || lapEnd < lapStart) continue
 
+      coveredRanges.push({ lapStart, lapEnd })
+
       const key = compound + (isFresh ? '_fresh' : '_used')
       const isFirst = !seenCompoundKeys.has(key)
       if (isFirst) seenCompoundKeys.add(key)
@@ -140,7 +144,7 @@ function SectorBarChart({ laps, stints, pitStops, safetyCarPeriods, height }) {
 
       stripTraces.push({
         type: 'bar',
-        name: capitalize(compound) + (isFresh ? '' : ' (used)'),
+        name: (compound === 'UNKNOWN' ? '?' : capitalize(compound)) + (isFresh ? '' : ' (used)'),
         x: [midLap],
         y: [1],
         width: [width],
@@ -150,7 +154,42 @@ function SectorBarChart({ laps, stints, pitStops, safetyCarPeriods, height }) {
         yaxis: 'y2',
         legendgroup: key,
         showlegend: isFirst,
-        hovertemplate: `${capitalize(compound)}${isFresh ? '' : ' (used)'}<br>Laps ${lapStart}–${lapEnd}<extra></extra>`,
+        hovertemplate: `${compound === 'UNKNOWN' ? '?' : capitalize(compound)}${isFresh ? '' : ' (used)'}<br>Laps ${lapStart}–${lapEnd}<extra></extra>`,
+      })
+    }
+  }
+
+  // ── Fill uncovered lap ranges with a grey '?' placeholder ────────────────
+  // Handles sessions (e.g. qualifying Q1, sprint) where stint data is absent.
+  {
+    const minLap = Math.min(...validLaps.map(l => l.lap_number))
+    const sorted = [...coveredRanges].sort((a, b) => a.lapStart - b.lapStart)
+    const gaps = []
+    let cursor = minLap
+    for (const { lapStart, lapEnd } of sorted) {
+      if (lapStart > cursor) gaps.push({ lapStart: cursor, lapEnd: lapStart - 1 })
+      cursor = Math.max(cursor, lapEnd + 1)
+    }
+    if (cursor <= maxLap) gaps.push({ lapStart: cursor, lapEnd: maxLap })
+
+    for (const { lapStart, lapEnd } of gaps) {
+      stripTraces.push({
+        type: 'bar',
+        name: '?',
+        x: [(lapStart + lapEnd) / 2],
+        y: [1],
+        width: [lapEnd - lapStart + 1],
+        base: [0],
+        marker: {
+          color: 'rgba(255,255,255,0.65)',
+          pattern: { shape: '/', bgcolor: '#444444', size: 8 },
+          line: { color: 'rgba(0,0,0,0.15)', width: 0.5 },
+        },
+        xaxis: 'x2',
+        yaxis: 'y2',
+        legendgroup: 'UNKNOWN_gap',
+        showlegend: !seenCompoundKeys.has('UNKNOWN_gap') && (() => { seenCompoundKeys.add('UNKNOWN_gap'); return true })(),
+        hovertemplate: `?<br>Laps ${lapStart}–${lapEnd}<extra></extra>`,
       })
     }
   }
@@ -175,6 +214,45 @@ function SectorBarChart({ laps, stints, pitStops, safetyCarPeriods, height }) {
         text: p.type,
         showarrow: false,
         font: { size: 9, color: isSC ? '#997700' : '#777' },
+        xanchor: 'center', yanchor: 'bottom',
+      })
+    }
+  }
+
+  // ── Q1/Q2/Q3 phase boundary lines and labels ─────────────────────────────
+  if (phaseEvents && phaseEvents.length > 0) {
+    const phasedLaps = assignPhases(laps, phaseEvents)
+    const phaseStarts = {}
+    const phaseEnd = {}
+    for (const lap of phasedLaps) {
+      if (!lap._phase) continue
+      if (!(lap._phase in phaseStarts) || lap.lap_number < phaseStarts[lap._phase]) {
+        phaseStarts[lap._phase] = lap.lap_number
+      }
+      if (!(lap._phase in phaseEnd) || lap.lap_number > phaseEnd[lap._phase]) {
+        phaseEnd[lap._phase] = lap.lap_number
+      }
+    }
+    for (const [phase, lapNum] of Object.entries(phaseStarts)) {
+      if (lapNum <= Math.min(...Object.values(phaseStarts))) continue
+      shapes.push({
+        type: 'line',
+        xref: 'x', yref: 'paper',
+        x0: lapNum - 0.5, x1: lapNum - 0.5,
+        y0: MAIN_DOMAIN[0], y1: MAIN_DOMAIN[1],
+        line: { color: '#71717a', width: 1.5, dash: 'dot' },
+      })
+    }
+    for (const phase of ['Q1', 'Q2', 'Q3']) {
+      if (!(phase in phaseStarts)) continue
+      const midLap = (phaseStarts[phase] + phaseEnd[phase]) / 2
+      annotations.push({
+        x: midLap,
+        y: MAIN_DOMAIN[1] + 0.01,
+        xref: 'x', yref: 'paper',
+        text: phase,
+        showarrow: false,
+        font: { size: 10, color: '#71717a' },
         xanchor: 'center', yanchor: 'bottom',
       })
     }
@@ -209,7 +287,6 @@ function SectorBarChart({ laps, stints, pitStops, safetyCarPeriods, height }) {
       layout={{
         barmode: 'overlay',
         xaxis: {
-          title: { text: 'Lap', font: { size: 11, color: '#a1a1aa' } },
           domain: [0, 1],
           anchor: 'y',
           color: '#a1a1aa',
@@ -244,15 +321,16 @@ function SectorBarChart({ laps, stints, pitStops, safetyCarPeriods, height }) {
         },
         legend: {
           orientation: 'h',
-          y: -0.15, x: 0.5,
+          y: -0.08, x: 0.5,
           xanchor: 'center',
           yanchor: 'top',
           font: { size: 10, color: '#a1a1aa' },
           bgcolor: 'transparent',
+          entrywidth: 90,
         },
         shapes,
         annotations,
-        margin: { l: 55, r: 20, t: 40, b: 60 },
+        margin: { l: 55, r: 20, t: 40, b: 50 },
         height,
         paper_bgcolor: '#18181b',
         plot_bgcolor: '#18181b',
@@ -401,6 +479,7 @@ export default function LapTimesChart({
       stints={stints}
       pitStops={pitStops}
       safetyCarPeriods={safetyCarPeriods}
+      phaseEvents={phaseEvents}
       height={height}
     />
   )

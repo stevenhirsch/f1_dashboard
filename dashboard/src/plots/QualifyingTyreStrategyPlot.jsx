@@ -55,7 +55,7 @@ export default function QualifyingTyreStrategyPlot({ results, stintsByDriver }) 
         traceMap[key] = {
           type: 'bar',
           orientation: 'h',
-          name: `${capitalize(compound)} (${isFresh ? 'Fresh' : 'Used'})`,
+          name: `${compound === 'UNKNOWN' ? '?' : capitalize(compound)} (${isFresh ? 'Fresh' : 'Used'})`,
           legendgroup: key,
           showlegend: true,
           marker: makeMarker(colour, isFresh),
