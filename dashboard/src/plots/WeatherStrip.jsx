@@ -105,11 +105,12 @@ export default function WeatherStrip({ sessionKey, gmtOffset, weatherData: propD
     <Plot
       data={traces}
       layout={{
-        xaxis: { title: { text: `Time (${formatOffsetLabel(gmtOffset)})`, font: { color: '#a1a1aa' } }, type: 'date', ...axisBase },
+        xaxis: { title: { text: `Time (${formatOffsetLabel(gmtOffset)})`, font: { color: '#a1a1aa' } }, type: 'date', fixedrange: true, ...axisBase },
         yaxis: {
           title: { text: 'Temperature (°C)', font: { color: '#e10600' } },
           side: 'left',
           rangemode: 'tozero',
+          fixedrange: true,
           tickfont: { color: '#a1a1aa' },
           ...axisBase,
         },
@@ -120,6 +121,7 @@ export default function WeatherStrip({ sessionKey, gmtOffset, weatherData: propD
           showgrid: false,
           range: [0, maxRain * 1.3],
           rangemode: 'tozero',
+          fixedrange: true,
           tickfont: { color: '#60a5fa' },
           linecolor: 'rgba(255,255,255,0.1)',
         },
@@ -130,7 +132,7 @@ export default function WeatherStrip({ sessionKey, gmtOffset, weatherData: propD
         plot_bgcolor: '#18181b',
         font: { color: '#fafafa' },
       }}
-      config={{ responsive: true, displayModeBar: false }}
+      config={{ responsive: true, displayModeBar: false, scrollZoom: false }}
       style={{ width: '100%' }}
     />
     </div>

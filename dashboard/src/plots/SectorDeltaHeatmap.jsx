@@ -64,7 +64,7 @@ export default function SectorDeltaHeatmap({ deltas }) {
         plot_bgcolor: '#18181b',
         font: { color: '#fafafa', family: 'monospace' },
       }}
-      config={{ responsive: true, displayModeBar: false }}
+      config={{ responsive: true, displayModeBar: false, scrollZoom: false }}
       style={{ width: '100%' }}
     />
   )

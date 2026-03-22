@@ -73,8 +73,8 @@ export default function TrackMapPlot({ data, lapColours, height = 380 }) {
     <Plot
       data={traces}
       layout={{
-        xaxis: { ...AXIS_BASE, scaleanchor: 'y', scaleratio: 1 },
-        yaxis: { ...AXIS_BASE },
+        xaxis: { ...AXIS_BASE, scaleanchor: 'y', scaleratio: 1, fixedrange: true },
+        yaxis: { ...AXIS_BASE, fixedrange: true },
         legend: { font: { size: 10, color: '#a1a1aa' }, bgcolor: 'transparent' },
         margin: { l: 10, r: 10, t: 10, b: 10 },
         height,
@@ -82,7 +82,7 @@ export default function TrackMapPlot({ data, lapColours, height = 380 }) {
         plot_bgcolor:  '#18181b',
         font: { color: '#fafafa', family: 'monospace' },
       }}
-      config={{ responsive: true, displayModeBar: false }}
+      config={{ responsive: true, displayModeBar: false, scrollZoom: false }}
       style={{ width: '100%' }}
     />
   )

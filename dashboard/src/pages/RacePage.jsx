@@ -2,6 +2,7 @@ import { useRaceResults } from '../hooks/useRaceResults'
 import TyreStrategyPlot from '../plots/TyreStrategyPlot'
 import WeatherStrip from '../plots/WeatherStrip'
 import InfoTooltip from '../components/InfoTooltip'
+import LazySection from '../components/LazySection'
 
 const THEME = {
   bg: '#09090b',
@@ -47,6 +48,7 @@ function ResultsTable({ sessionKey, qualifyingSessionKey }) {
   const bestMaxSpeed = Math.max(...data.map(r => r.max_speed ?? 0))
 
   return (
+    <div style={{ overflowX: 'auto', WebkitOverflowScrolling: 'touch' }}>
     <table style={{
       borderCollapse: 'collapse',
       width: '100%',
@@ -112,6 +114,7 @@ function ResultsTable({ sessionKey, qualifyingSessionKey }) {
         })}
       </tbody>
     </table>
+    </div>
   )
 }
 
@@ -139,26 +142,30 @@ export default function RacePage({ sessionKey, qualifyingSessionKey, gmtOffset }
         </div>
       </div>
 
-      <div style={sectionStyle}>
-        <h2 style={{ ...headingStyle, display: 'flex', alignItems: 'center' }}>
-          Tyre Strategy
-          <InfoTooltip placement="top" width={260} content={
-            <div>
-              <strong>Solid</strong> = new set · <strong>Hatched</strong> = scrubbed (pre-used). Used tyres may prevent graining and produce more consistent lap times since they have gone through heat cycles. Teams only get allocated a limited number of tyres per weekend, and will try to save their new tyres for specific times.
-            </div>
-          } />
-        </h2>
-        <div style={{ background: THEME.surface, borderRadius: '8px', border: `1px solid ${THEME.border}`, padding: '0.5rem' }}>
-          <TyreStrategyPlot sessionKey={sessionKey} />
+      <LazySection minHeight={520}>
+        <div style={sectionStyle}>
+          <h2 style={{ ...headingStyle, display: 'flex', alignItems: 'center' }}>
+            Tyre Strategy
+            <InfoTooltip placement="top" width={260} content={
+              <div>
+                <strong>Solid</strong> = new set · <strong>Hatched</strong> = scrubbed (pre-used). Used tyres may prevent graining and produce more consistent lap times since they have gone through heat cycles. Teams only get allocated a limited number of tyres per weekend, and will try to save their new tyres for specific times.
+              </div>
+            } />
+          </h2>
+          <div style={{ background: THEME.surface, borderRadius: '8px', border: `1px solid ${THEME.border}`, padding: '0.5rem' }}>
+            <TyreStrategyPlot sessionKey={sessionKey} />
+          </div>
         </div>
-      </div>
+      </LazySection>
 
-      <div style={sectionStyle}>
-        <h2 style={headingStyle}>Weather</h2>
-        <div style={{ background: THEME.surface, borderRadius: '8px', border: `1px solid ${THEME.border}`, padding: '0.5rem' }}>
-          <WeatherStrip sessionKey={sessionKey} gmtOffset={gmtOffset} />
+      <LazySection minHeight={380}>
+        <div style={sectionStyle}>
+          <h2 style={headingStyle}>Weather</h2>
+          <div style={{ background: THEME.surface, borderRadius: '8px', border: `1px solid ${THEME.border}`, padding: '0.5rem' }}>
+            <WeatherStrip sessionKey={sessionKey} gmtOffset={gmtOffset} />
+          </div>
         </div>
-      </div>
+      </LazySection>
     </div>
   )
 }

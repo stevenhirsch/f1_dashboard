@@ -293,6 +293,7 @@ function SectorBarChart({ laps, stints, pitStops, safetyCarPeriods, phaseEvents,
           gridcolor: 'rgba(255,255,255,0.06)',
           tickfont: { size: 10, color: '#a1a1aa' },
           dtick: 5,
+          fixedrange: true,
         },
         yaxis: {
           title: { text: 'Lap Time (s)', font: { size: 11, color: '#a1a1aa' } },
@@ -305,6 +306,7 @@ function SectorBarChart({ laps, stints, pitStops, safetyCarPeriods, phaseEvents,
           gridcolor: 'rgba(255,255,255,0.06)',
           tickfont: { size: 10, color: '#a1a1aa' },
           tickformat: '.0f',
+          fixedrange: true,
         },
         // Secondary axes for the compound strip subplot
         xaxis2: {
@@ -336,7 +338,7 @@ function SectorBarChart({ laps, stints, pitStops, safetyCarPeriods, phaseEvents,
         plot_bgcolor: '#18181b',
         font: { color: '#fafafa', family: 'monospace' },
       }}
-      config={{ responsive: true, displayModeBar: false }}
+      config={{ responsive: true, displayModeBar: false, scrollZoom: false }}
       style={{ width: '100%' }}
     />
   )
@@ -417,6 +419,7 @@ function ScatterChart({ laps, stints, phaseEvents, height }) {
           gridcolor: 'rgba(255,255,255,0.06)',
           tickfont: { size: 10, color: '#a1a1aa' },
           dtick: 5,
+          fixedrange: true,
         },
         yaxis: {
           title: { text: 'Lap Time (s)', font: { size: 11, color: '#a1a1aa' } },
@@ -424,6 +427,7 @@ function ScatterChart({ laps, stints, phaseEvents, height }) {
           gridcolor: 'rgba(255,255,255,0.06)',
           tickfont: { size: 10, color: '#a1a1aa' },
           tickformat: '.3f',
+          fixedrange: true,
         },
         legend: {
           orientation: 'h',
@@ -439,7 +443,7 @@ function ScatterChart({ laps, stints, phaseEvents, height }) {
         plot_bgcolor: '#18181b',
         font: { color: '#fafafa', family: 'monospace' },
       }}
-      config={{ responsive: true, displayModeBar: false }}
+      config={{ responsive: true, displayModeBar: false, scrollZoom: false }}
       style={{ width: '100%' }}
     />
   )

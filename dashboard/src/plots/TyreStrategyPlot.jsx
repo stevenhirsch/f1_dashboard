@@ -160,7 +160,7 @@ export default function TyreStrategyPlot({ sessionKey }) {
       data={traces}
       layout={{
         barmode: 'overlay',
-        xaxis: { title: { text: 'Lap Number', font: { color: '#a1a1aa' } }, color: '#a1a1aa', gridcolor: 'rgba(255,255,255,0.07)', tickfont: { color: '#a1a1aa' } },
+        xaxis: { title: { text: 'Lap Number', font: { color: '#a1a1aa' } }, color: '#a1a1aa', gridcolor: 'rgba(255,255,255,0.07)', tickfont: { color: '#a1a1aa' }, fixedrange: true },
         yaxis: {
           categoryorder: 'array',
           categoryarray: [...yLabels].reverse(),
@@ -179,7 +179,7 @@ export default function TyreStrategyPlot({ sessionKey }) {
         plot_bgcolor: '#18181b',
         font: { color: '#fafafa' },
       }}
-      config={{ responsive: true, displayModeBar: false }}
+      config={{ responsive: true, displayModeBar: false, scrollZoom: false }}
       style={{ width: '100%' }}
     />
   )

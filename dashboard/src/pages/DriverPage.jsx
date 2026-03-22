@@ -12,6 +12,7 @@ import TelemetryChart from '../plots/TelemetryChart'
 import CoastingChart from '../plots/CoastingChart'
 import { useRaceControl } from '../hooks/useRaceControl'
 import InfoTooltip from '../components/InfoTooltip'
+import LazySection from '../components/LazySection'
 
 const LAP_COLOURS = [
   '#e10600', '#3b82f6', '#22c55e', '#f59e0b',
@@ -521,21 +522,25 @@ function RaceSubTab({ raceSessionKey, driverNumber }) {
       </div>
 
       {positions.length > 0 && (
-        <div style={{ marginBottom: '2rem' }}>
-          <h3 style={sectionHeading}>Race Position</h3>
-          <div style={{ background: THEME.surface, borderRadius: '8px', border: `1px solid ${THEME.border}`, padding: '0.5rem' }}>
-            <PositionChart positions={positions} teamColour={teamColour} />
+        <LazySection minHeight={360}>
+          <div style={{ marginBottom: '2rem' }}>
+            <h3 style={sectionHeading}>Race Position</h3>
+            <div style={{ background: THEME.surface, borderRadius: '8px', border: `1px solid ${THEME.border}`, padding: '0.5rem' }}>
+              <PositionChart positions={positions} teamColour={teamColour} />
+            </div>
           </div>
-        </div>
+        </LazySection>
       )}
 
       {intervals.length > 0 && result?.position !== 1 && (
-        <div style={{ marginBottom: '2rem' }}>
-          <h3 style={sectionHeading}>Gap to Leader</h3>
-          <div style={{ background: THEME.surface, borderRadius: '8px', border: `1px solid ${THEME.border}`, padding: '0.5rem' }}>
-            <GapChart intervals={intervals} teamColour={teamColour} />
+        <LazySection minHeight={360}>
+          <div style={{ marginBottom: '2rem' }}>
+            <h3 style={sectionHeading}>Gap to Leader</h3>
+            <div style={{ background: THEME.surface, borderRadius: '8px', border: `1px solid ${THEME.border}`, padding: '0.5rem' }}>
+              <GapChart intervals={intervals} teamColour={teamColour} />
+            </div>
           </div>
-        </div>
+        </LazySection>
       )}
 
       <div style={{ marginBottom: selectedLapNums.length > 0 ? '1rem' : '2rem' }}>

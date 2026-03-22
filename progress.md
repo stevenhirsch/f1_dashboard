@@ -1,7 +1,7 @@
 # F1 Dashboard — Progress Log
 
 ## Current Status
-**Phase 3 Driver Tab complete. Next: Phase 4 polish (mobile layout, loading/empty states, backfill ingestion).**
+**Phase 4 complete. Phase 5 (Derived Metrics Pipeline) scoped and ready to implement. Backfill ingestion ongoing in background.**
 
 ---
 
@@ -199,11 +199,53 @@ All tables populated correctly for meeting 1280 (2026 Chinese GP).
 
 ---
 
+### Phase 4 — Polish and Public Release — Complete (2026-03-22)
+
+**Mobile fixes (2026-03-22):**
+- `text-size-adjust: 100%` added to `body` in `index.css` — fixes iOS Safari portrait/landscape font inflation on small text (qualifying elimination separators, badges, etc.)
+- `fixedrange: true` added to all axes on all 10 Plotly charts + `scrollZoom: false` on all configs — page scroll no longer accidentally zooms charts on touch devices
+- `overflowX: auto` + `WebkitOverflowScrolling: touch` wrappers added to all tables in RacePage and QualifyingPage (DriverPage already had these)
+
+**Lazy loading (2026-03-22):**
+- `dashboard/src/hooks/useInView.js` — IntersectionObserver hook; fires once then disconnects, pre-loads 150px before viewport
+- `dashboard/src/components/LazySection.jsx` — wrapper component; renders placeholder div until section nears viewport, then mounts children permanently
+- Applied to: TyreStrategyPlot + WeatherStrip in RacePage (defers Supabase queries); Session Analysis section in QualifyingPage (defers WeatherStrip query); Race Position + Gap to Leader charts in DriverPage (defers Plotly renders)
+
+**Decisions made:**
+- Loading states — sufficient as-is; plain text messages are functional, dropdowns only surface ingested sessions
+- Query optimisation — deferred pending Phase 5 architecture decisions (JS vs DB for metrics, chatbot data model)
+- Backfill ingestion (2023–2025) — ongoing slowly, not blocking other work
+
+---
+
 ## Where to Pick Up Next
 
-### Phase 4 — Polish and Public Release
+### Phase 5 — Derived Metrics Pipeline
 
-- Mobile responsive layout pass
-- Loading states and empty state handling throughout
-- Performance audit (lazy loading, query optimisation)
-- Backfill ingestion: `python pipeline/ingest.py --year 2025` (and 2023, 2024) — required for year-on-year comparison table
+Full scope documented in `product_roadmap.md`. Key implementation tasks:
+
+**Schema migrations (run against Supabase):**
+- Add `wind_speed`, `wind_direction`, `pressure` to `weather`
+- Add `circuit_length_km` to `races`
+- Add `points_gap_to_leader`, `points_gap_to_p2` to `championship_drivers` and `championship_teams`
+- Define full `lap_metrics` column set (currently exists but empty)
+- Create `session_sector_bests` table
+- Create `stint_metrics` table
+- Create `season_driver_stats` table (keyed on year, driver_number, meeting_key)
+- Create `season_constructor_stats` table (keyed on year, team_name, meeting_key)
+- Create `circuits` reference table
+
+**Pipeline work:**
+- `pipeline/seed_circuits.py` — one-off script to populate `circuits` table for all circuits from 2023 onwards
+- `ingest.py` — implement the 8-step ingestion order (see roadmap Phase 5)
+- Step 4 (car_data fetch) is the most expensive: 20 API calls per session, needs careful batching against rate limits
+
+**Signal definitions to encode in pipeline:**
+- Coasting: `throttle < 1% AND brake == 0` (not strict zero — document this consistently)
+- Brake is boolean in OpenF1 — no derivative; `throttle_smoothness_index` is throttle-only
+- Battle states computed per sector (3 snapshots per lap per driver from intervals × sector timestamps)
+- `is_clean_air`: gap_ahead > 2s AND gap_behind > 2s across all sectors (subject to refinement)
+
+**Backfill:**
+- Run `python pipeline/ingest.py --year 2025` then 2024, 2023
+- Car data metrics will be computed for all history; raw 3.7Hz data is not stored

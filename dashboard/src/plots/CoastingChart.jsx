@@ -69,6 +69,7 @@ export default function CoastingChart({ data, lapColours, height = 160 }) {
           gridcolor: 'rgba(255,255,255,0.06)',
           tickfont: { size: 9, color: '#a1a1aa' },
           zeroline: false,
+          fixedrange: true,
         },
         yaxis: {
           tickvals: tickVals,
@@ -78,6 +79,7 @@ export default function CoastingChart({ data, lapColours, height = 160 }) {
           gridcolor: 'rgba(255,255,255,0.06)',
           zeroline: false,
           range: [-0.6, lapNums.length - 0.4],
+          fixedrange: true,
         },
         shapes,
         margin: { l: 170, r: 20, t: 10, b: 40 },
@@ -87,7 +89,7 @@ export default function CoastingChart({ data, lapColours, height = 160 }) {
         font: { color: '#fafafa', family: 'monospace' },
         showlegend: false,
       }}
-      config={{ responsive: true, displayModeBar: false }}
+      config={{ responsive: true, displayModeBar: false, scrollZoom: false }}
       style={{ width: '100%' }}
     />
   )

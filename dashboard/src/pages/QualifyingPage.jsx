@@ -4,6 +4,7 @@ import { formatQualTime, formatDelta, computeSectorDeltas, computePhaseStints, a
 import { COMPOUND_COLOURS } from '../utils/compounds'
 import SectorDeltaHeatmap from '../plots/SectorDeltaHeatmap'
 import WeatherStrip from '../plots/WeatherStrip'
+import LazySection from '../components/LazySection'
 
 const THEME = {
   bg: '#09090b',
@@ -142,6 +143,7 @@ function QualifyingResultsTable({ results, driverPhaseMap, topSpeedByDriver }) {
   })
 
   return (
+    <div style={{ overflowX: 'auto', WebkitOverflowScrolling: 'touch' }}>
     <table style={{ borderCollapse: 'collapse', width: '100%', fontSize: '0.85rem', color: THEME.text }}>
       <thead>
         <tr style={{ borderBottom: `1px solid ${THEME.border}` }}>
@@ -150,6 +152,7 @@ function QualifyingResultsTable({ results, driverPhaseMap, topSpeedByDriver }) {
       </thead>
       <tbody>{rows}</tbody>
     </table>
+    </div>
   )
 }
 
@@ -192,6 +195,7 @@ function PhaseStintTable({ driverRows, driverMap, driverPhaseMap, activePhase, t
   const bestTopSpeed = Math.max(...orderedRows.map(r => topSpeedByDriver?.[r.driver_number] ?? 0))
 
   return (
+    <div style={{ overflowX: 'auto', WebkitOverflowScrolling: 'touch' }}>
     <table style={{ borderCollapse: 'collapse', width: '100%', fontSize: '0.85rem', color: THEME.text }}>
       <thead>
         <tr style={{ borderBottom: `1px solid ${THEME.border}` }}>
@@ -266,6 +270,7 @@ function PhaseStintTable({ driverRows, driverMap, driverPhaseMap, activePhase, t
         })}
       </tbody>
     </table>
+    </div>
   )
 }
 
@@ -424,18 +429,20 @@ export default function QualifyingPage({ sessionKey, gmtOffset }) {
         </div>
       </div>
 
-      <div style={sectionStyle}>
-        <h2 style={headingStyle}>Phase Analysis</h2>
-        <PhaseTabView
-          laps={laps}
-          phaseEvents={phaseEvents}
-          stintsByDriver={stintsByDriver}
-          driverMap={driverMap}
-          weatherData={weatherData}
-          gmtOffset={gmtOffset}
-          driverPhaseMap={driverPhaseMap}
-        />
-      </div>
+      <LazySection minHeight={900}>
+        <div style={sectionStyle}>
+          <h2 style={headingStyle}>Session Analysis</h2>
+          <PhaseTabView
+            laps={laps}
+            phaseEvents={phaseEvents}
+            stintsByDriver={stintsByDriver}
+            driverMap={driverMap}
+            weatherData={weatherData}
+            gmtOffset={gmtOffset}
+            driverPhaseMap={driverPhaseMap}
+          />
+        </div>
+      </LazySection>
 
     </div>
   )

@@ -95,6 +95,7 @@ export default function QualifyingTyreStrategyPlot({ results, stintsByDriver }) 
           color: '#a1a1aa',
           gridcolor: 'rgba(255,255,255,0.07)',
           tickfont: { color: '#a1a1aa' },
+          fixedrange: true,
         },
         yaxis: {
           categoryorder: 'array',
@@ -116,7 +117,7 @@ export default function QualifyingTyreStrategyPlot({ results, stintsByDriver }) 
         plot_bgcolor: '#18181b',
         font: { color: '#fafafa', family: 'monospace' },
       }}
-      config={{ responsive: true, displayModeBar: false }}
+      config={{ responsive: true, displayModeBar: false, scrollZoom: false }}
       style={{ width: '100%' }}
     />
   )

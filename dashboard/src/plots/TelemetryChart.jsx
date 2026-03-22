@@ -18,6 +18,7 @@ const AXIS_BASE = {
   gridcolor: 'rgba(255,255,255,0.06)',
   tickfont: { size: 9, color: '#a1a1aa' },
   zeroline: false,
+  fixedrange: true,
 }
 
 function hex2rgba(hex, alpha) {
@@ -170,7 +171,7 @@ export default function TelemetryChart({ data, lapColours, height = 740 }) {
         font: { color: '#fafafa', family: 'monospace' },
         hovermode: 'x unified',
       }}
-      config={{ responsive: true, displayModeBar: false }}
+      config={{ responsive: true, displayModeBar: false, scrollZoom: false }}
       style={{ width: '100%' }}
     />
   )

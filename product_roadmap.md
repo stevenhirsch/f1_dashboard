@@ -61,16 +61,18 @@ A post-race Formula 1 analytics platform built as a static React web app. The Da
 ### Supabase Schema
 
 ```
-races                — meeting metadata, circuit, year, circuit_type
+races                — meeting metadata, circuit, year, circuit_type, circuit_length_km
 sessions             — session key, type (Race/Qualifying/Sprint), date
 drivers              — driver number, name, acronym, team, per session
 laps                 — core OpenF1 lap data (times, sector splits, compounds, pit flags)
 lap_metrics          — derived values keyed on (session_key, driver_number, lap_number)
-                       includes computed_at timestamp
+                       includes computed_at timestamp; see Phase 5 for full column spec
 stints               — compound, lap start/end, tyre age per driver
 pit_stops            — lane duration, stop duration (2024 US GP+), lap number
-weather              — track temp, air temp, humidity, rainfall per session
+weather              — track temp, air temp, humidity, rainfall, wind_speed, wind_direction,
+                       pressure per session
 race_results         — position, gap, DNF/DSQ with reason, pit count, fastest lap flag
+                       (fastest_lap_flag derived from minimum lap_duration among classified finishers)
 qualifying_results   — Q1/Q2/Q3 best times, compounds, lap counts, delta to pole
 overtakes            — overtaking/overtaken driver, position, lap number, date
 
@@ -78,11 +80,31 @@ overtakes            — overtaking/overtaken driver, position, lap number, date
 intervals            — gap_to_leader and interval per driver per timestamp (race/sprint only)
 starting_grid        — grid position + qualifying lap_duration per driver per session
 championship_drivers — driver championship points/position before and after each race (Beta)
+                       + points_gap_to_leader, points_gap_to_p2
 championship_teams   — constructor championship points/position before and after each race (Beta)
+                       + points_gap_to_leader, points_gap_to_p2
 
 -- Added in Phase 3 --
 position             — driver position over time throughout session
 team_radio           — radio recording URLs per driver per timestamp
+
+-- Added in Phase 5 --
+session_sector_bests — best S1/S2/S3 time + driver per session; theoretical best lap
+                       one row per session; enables fast chatbot queries without full lap scan
+stint_metrics        — per (session_key, driver_number, stint_number)
+                       clean_air_pace, dirty_air_pace, first/second half pace,
+                       representative_pace, racing_lap_count
+season_driver_stats  — cumulative season totals per (year, driver_number, meeting_key)
+                       one row per round so full-season progression is plottable
+                       includes: laps_completed, distance_km, overtakes, pit_stops,
+                       podiums, poles, fastest_laps, points_scored, dnf/dns counts
+season_constructor_stats — same structure at constructor level
+                           keyed on (year, team_name, meeting_key)
+circuits             — static reference table: circuit_key, name, location, country,
+                       length_km, num_corners, drs_zones, circuit_type, lap_record,
+                       lap_record_driver, lap_record_year, first_gp_year
+                       populated by a one-off Python script (pipeline/seed_circuits.py),
+                       not part of the automated ingest workflow
 ```
 
 ### Ingestion Principles
@@ -242,7 +264,7 @@ team_radio           — radio recording URLs per driver per timestamp
 ---
 
 ### Phase 4 — Polish and Public Release
-- Status: **In progress (2026-03-21)**
+- Status: **Complete (2026-03-22)**
 
 *No new data features. Full UX pass before derived metrics.*
 
@@ -252,10 +274,13 @@ team_radio           — radio recording URLs per driver per timestamp
 - ✅ Footer — GitHub repo link, dynamic copyright year, OpenF1 attribution
 - ✅ App branding — title removed, F1 logo stands alone top-left; Dashboard / Chat top-level nav top-right
 - ✅ `races.gmt_offset` — weather chart x-axis now shows local race timezone, not UTC
-- Responsive layout for mobile and tablet — partially addressed (Event dropdown hidden on non-sprint weekends reduces clutter; legend moved off sidebar in tyre plot); full mobile pass still pending
-- Loading states and empty state handling throughout — pending
-- Performance audit — lazy loading, query optimisation — pending
-- Backfill ingestion for all available race weekends from 2023 onwards — pending
+- ✅ Mobile touch fix — `fixedrange: true` + `scrollZoom: false` on all 10 Plotly charts; page scroll no longer triggers accidental zoom
+- ✅ Mobile text size fix — `text-size-adjust: 100%` on body prevents iOS Safari portrait/landscape font inflation
+- ✅ Table horizontal scroll — `overflowX: auto` wrappers on all tables across Race, Qualifying, and Driver pages
+- ✅ Lazy loading — `TyreStrategyPlot`, `WeatherStrip`, and Qualifying Session Analysis section defer Supabase queries until scrolled into view; Position and Gap charts in Driver tab defer rendering
+- Loading states — deemed sufficient as-is (plain text loading messages, dropdowns only surface ingested sessions)
+- Performance / query optimisation — intentionally deferred pending Phase 5 architecture decisions
+- Backfill ingestion (2023–2025) — in progress, done slowly alongside other work
 
 **Exit criteria:** a clean shareable link working on desktop and mobile, covering all races from 2023 onwards across all three tabs.
 
@@ -263,28 +288,88 @@ team_radio           — radio recording URLs per driver per timestamp
 
 ### Phase 5 — Derived Metrics Pipeline
 - Status: Incomplete
-*All computed at ingestion time, stored in `lap_metrics`. Unlocks Phase 6.*
+*All computed at ingestion time. Populates `lap_metrics`, `stint_metrics`, `session_sector_bests`, `season_driver_stats`, `season_constructor_stats`. Unlocks Phase 6 and the chatbot data model.*
 
-**Input characterisation**
-- Coasting ratio — proportion of time with throttle = 0 and brake = 0
-- Throttle-brake overlap — simultaneous inputs as proportion of lap (trail braking proxy)
-- Input smoothness index — variance of first derivative of throttle and brake signals
-- Full-throttle percentage
+**Signal notes**
+- OpenF1 `brake` is boolean (0/1) — no derivative is meaningful for brake
+- Coasting uses `throttle < 1%` threshold, not strict zero — captures light lift-and-glide; annotate this definition in UI labels and chatbot descriptions for consistency
+- Car data is fetched at ingestion per driver per session (3.7 Hz), metrics computed, raw data discarded — not stored
 
-**Braking profile**
-- Braking event detection — speed at brake onset, deceleration rate, event duration
-- Braking consistency index — lap-over-lap variance at the same circuit corners
+**`lap_metrics` — car-data derived (per lap per driver)**
+- `coasting_ratio` — proportion of samples where throttle < 1% AND brake == 0
+- `coasting_distance_m` — metres accumulated under same condition
+- `throttle_brake_overlap_ratio` — proportion of samples where brake == 1 AND throttle ≥ 10% (trail braking proxy)
+- `full_throttle_pct` — proportion of samples where throttle ≥ 99%
+- `throttle_smoothness_index` — variance of diff(throttle_values); lower = smoother (throttle only; brake is bool)
+- `drs_activation_count` — number of DRS opens (closed → open transitions)
+- `drs_distance_m` — metres driven with DRS open
+- `max_speed_kph` — session max from car_data (distinct from speed trap, which is a fixed point)
 
-**Load indices**
-- High lateral load index — speed × curvature integral over the lap
-- Longitudinal load index — sum of absolute acceleration and deceleration events above threshold
+**`lap_metrics` — battle and proximity states (per sector per lap)**
+Derived from intervals timestamps cross-referenced with sector boundary times from `laps`.
+- `gap_ahead_s1/s2/s3` — gap to car ahead at end of each sector (seconds)
+- `gap_behind_s1/s2/s3` — gap to car behind at end of each sector
+- `battle_ahead_s1/s2/s3_driver` — driver number of car < 1s ahead at sector end (nullable)
+- `battle_behind_s1/s2/s3_driver` — driver number of car < 1s behind (nullable)
+- `is_drs_range_s1/s2/s3` — gap_ahead < 1s at sector end
+- `is_clean_air` — gap_ahead > 2s AND gap_behind > 2s across all sectors (definition subject to refinement)
 
-**Pace analysis**
-- Pace degradation coefficient — expressed as seconds-per-lap lost per lap on tyre, comparable across drivers and teams
-- Clean air pace — average lap time when gap ahead > 2s and gap behind > 2s, stored per stint
-- Stint phase split — average pace in first half vs. second half of each stint
+**`lap_metrics` — lap-level flags and deltas**
+- `is_neutralized` — SC/VSC/red flag active on this lap (from race_control)
+- `tyre_age_at_lap` — tyre_age_at_start + (lap_number − stint.lap_start)
+- `delta_to_session_best_s1/s2/s3` — sector time minus fastest set by any driver in session
 
-When a formula changes, run `ingest.py --recompute --session <session_key>` to regenerate. The `computed_at` timestamp identifies rows predating a formula change.
+**`session_sector_bests`** — one row per session
+- `best_s1/s2/s3` — fastest sector time set by any driver
+- `best_s1/s2/s3_driver` — who set it
+- `theoretical_best_lap` — sum of best_s1 + best_s2 + best_s3
+
+**`stint_metrics`** — per (session_key, driver_number, stint_number)
+- `clean_air_pace_s` — mean lap time on laps where is_clean_air == true
+- `dirty_air_pace_s` — mean on non-clean laps
+- `first_half_pace_s` / `second_half_pace_s` — split on stint midpoint, excluding neutralized laps
+- `representative_pace_s` — median of non-neutralized, non-pit-in/out laps
+- `racing_lap_count` — laps excluding neutralized and pit-in/out
+
+**`race_results.fastest_lap_flag`**
+Derived from minimum `lap_duration` among classified finishers (not DNF/DNS/DSQ) for the session. Computed after all laps are ingested.
+
+**`weather` additions**
+- `wind_speed` (m/s), `wind_direction` (degrees 0–359), `pressure` (mbar) — already in OpenF1 response, just not stored
+
+**`championship_drivers` / `championship_teams` additions**
+- `points_gap_to_leader`, `points_gap_to_p2` — derived from same API response at ingestion
+
+**`season_driver_stats`** — cumulative per (year, driver_number, meeting_key)
+One row per driver per round; full table gives season progression plottable over time.
+- `round_number` — integer round within the year (for ordering)
+- `races_entered`, `races_classified`, `dnf_count`, `dns_count`
+- `laps_completed`, `distance_km` (laps × `races.circuit_length_km`)
+- `total_overtakes_made`, `total_overtakes_suffered`, `total_pit_stops`
+- `podiums`, `poles`, `fastest_laps`, `points_scored`
+- Sprints count toward all totals (laps, distance, overtakes, etc.)
+
+**`season_constructor_stats`** — same structure at constructor level, keyed on (year, team_name, meeting_key)
+
+**`circuits`** — static reference table, populated by `pipeline/seed_circuits.py` (not automated ingest)
+- `circuit_key`, `circuit_name`, `location`, `country`, `length_km`
+- `num_corners`, `drs_zones`, `circuit_type`
+- `lap_record_time_s`, `lap_record_driver`, `lap_record_year`, `first_gp_year`
+
+**Ingestion order**
+```
+1. Raw ingest — laps, stints, race_control, intervals, weather (+wind/pressure), overtakes
+2. lap_metrics pass 1 — is_neutralized, tyre_age_at_lap
+3. lap_metrics pass 2 — gap/battle states per sector (intervals × sector timestamps)
+4. lap_metrics pass 3 — car_data fetch per driver → coasting/DRS/smoothness → store → discard
+5. session_sector_bests + lap_metrics sector deltas (requires all drivers' sector times)
+6. stint_metrics (requires lap_metrics.is_neutralized + is_clean_air)
+7. race_results.fastest_lap_flag (derive from laps)
+8. season_driver_stats + season_constructor_stats (cumulative row; reads prior round, adds delta)
+   championship gap columns
+```
+
+When a formula changes, run `ingest.py --recompute --session <session_key>` to regenerate from step 2 onwards without re-fetching raw data. The `computed_at` timestamp on `lap_metrics` identifies rows predating a formula change.
 
 ---
 
@@ -392,9 +477,18 @@ OpenF1 does not expose G-force directly. All G metrics are approximated:
 
 ```python
 # Per lap, from car_data samples
-coast_samples = sum(1 for s in samples if s['throttle'] == 0 and s['brake'] == 0)
+# Threshold: throttle < 1% (not strict zero — captures light lift-and-glide)
+# brake is boolean in OpenF1 (0 or 1)
+coast_samples = sum(1 for s in samples if s['throttle'] < 1 and s['brake'] == 0)
 coasting_ratio = coast_samples / total_samples
+coasting_distance_m = sum(
+    (samples[i+1]['distance'] - samples[i]['distance'])
+    for i in range(len(samples)-1)
+    if samples[i]['throttle'] < 1 and samples[i]['brake'] == 0
+)
 ```
+
+Use the `throttle < 1%` definition consistently across pipeline code, dashboard labels, and chatbot descriptions.
 
 In 2026 this metric doubles as a battery regeneration proxy — annotate accordingly in the UI.
 
@@ -405,27 +499,15 @@ overlap_samples = sum(1 for s in samples if s['throttle'] > 0 and s['brake'] > 0
 overlap_ratio = overlap_samples / total_samples
 ```
 
-**Input smoothness index**
+**Throttle smoothness index**
 
 ```python
 import numpy as np
+# brake is boolean in OpenF1 — no derivative meaningful
+# smoothness index applies to throttle only
 throttle_vals = [s['throttle'] for s in samples]
-brake_vals = [s['brake'] for s in samples]
-throttle_smoothness = np.var(np.diff(throttle_vals))
-brake_smoothness = np.var(np.diff(brake_vals))
-smoothness_index = (throttle_smoothness + brake_smoothness) / 2
-# Lower = smoother
-```
-
-**Pace degradation coefficient**
-
-For each stint, fit a linear regression of lap time vs. laps on tyre:
-
-```python
-from scipy.stats import linregress
-slope, intercept, r, p, se = linregress(laps_on_tyre, lap_times)
-# slope = seconds per lap degradation rate
-# Store slope as degradation_rate in lap_metrics or a stints_metrics table
+throttle_smoothness_index = np.var(np.diff(throttle_vals))
+# Lower = smoother throttle application
 ```
 
 **Clean air pace**
