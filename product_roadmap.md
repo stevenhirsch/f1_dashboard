@@ -291,19 +291,43 @@ circuits             — static reference table: circuit_key, name, location, co
 *All computed at ingestion time. Populates `lap_metrics`, `stint_metrics`, `session_sector_bests`, `season_driver_stats`, `season_constructor_stats`. Unlocks Phase 6 and the chatbot data model.*
 
 **Signal notes**
-- OpenF1 `brake` is boolean (0/1) — no derivative is meaningful for brake
+- OpenF1 `brake` is boolean (0/100) — no derivative is meaningful for brake
+  - An alternative is to compute deceleration of the car. Although this doesn't capture braking strategies of the driver, it does capture the outputs of their braking strategies (i.e., brake pressure changes throghout a race may change how a driver uses their brakes to create deceleration profiles)
 - Coasting uses `throttle < 1%` threshold, not strict zero — captures light lift-and-glide; annotate this definition in UI labels and chatbot descriptions for consistency
 - Car data is fetched at ingestion per driver per session (3.7 Hz), metrics computed, raw data discarded — not stored
 
 **`lap_metrics` — car-data derived (per lap per driver)**
-- `coasting_ratio` — proportion of samples where throttle < 1% AND brake == 0
-- `coasting_distance_m` — metres accumulated under same condition
-- `throttle_brake_overlap_ratio` — proportion of samples where brake == 1 AND throttle ≥ 10% (trail braking proxy)
-- `full_throttle_pct` — proportion of samples where throttle ≥ 99%
-- `throttle_smoothness_index` — variance of diff(throttle_values); lower = smoother (throttle only; brake is bool)
+- **all metrics should be computed per sector where possible; this is not always indicated below, but the variable names should also use the same patterning for each sector of the race and provide an overall lap metric**
+- `coasting_ratio_s1/s2/s3/lap` — proportion of samples where throttle < 1% AND brake == 0
+- `coasting_distance_m_s1/s2/s3/lap` — metres accumulated under same condition; proxy for energy regeneration in 2026+ regulations
+- `throttle_brake_overlap_ratio_s1/s2/s3/lap` — proportion of samples where brake == 1 AND throttle ≥ 10% (trail braking proxy)
+- `full_throttle_pct_s1/s2/s3/lap` — proportion of samples where throttle ≥ 99%
+- `throttle_input_variance_s1/s2/s3/lap` — variance of diff(throttle_values); higher = rougher inputs (throttle only; brake is boolean so no derivative is meaningful)
 - `drs_activation_count` — number of DRS opens (closed → open transitions)
 - `drs_distance_m` — metres driven with DRS open
-- `max_speed_kph` — session max from car_data (distinct from speed trap, which is a fixed point)
+- `max_speed_kph_s1/s2/s3/lap` — max speed from car_data within each sector; lap = max across all sectors (distinct from speed trap, which is a fixed point)
+  - Sector boundaries derived from lap start UTC + cumulative sector times
+- `max_linear_acceleration_g_s1/s2/s3/lap` — max(diff(speed_kph) * sampling_freq), converted to g; lap = max across all sectors
+  - No smoothing applied yet; use actual sampling frequency from data, not hardcoded 3.7
+- `max_linear_deceleration_g_s1/s2/s3/lap` - min(diff(speed_kph) * sampling_freq), converted to g
+  - No smoothing applied yet; used to get an indication of how hard someone is braking
+  - Lap value = min across all three sectors (i.e., the hardest single braking point in the lap)
+  - Per-turn granularity deferred — requires corner coordinate reference data in `circuits` table
+- `brake_zone_count_s1/s2/s3/lap` — number of distinct braking events per sector; lap = sum of s1+s2+s3
+  - A braking event is a contiguous window of negative speed deltas exceeding a threshold (e.g., decel > 0.5g)
+- `mean_peak_decel_g_s1/s2/s3/lap` — average of peak decel across all braking events in each sector; lap = mean of s1/s2/s3 peaks
+  - More robust driver fingerprint than max alone — a single late-braking outlier lap won't dominate
+- `speed_at_brake_start_kph_s1/s2/s3/lap` — speed entering the primary braking zone (braking event with max peak decel) per sector; lap = mean of s1/s2/s3 values
+  - Late-braking proxy: higher speed = later braking point
+- `brake_entry_speed_pct_rank_s1/s2/s3/lap` — percentile rank (0–100 float) of speed_at_brake_start_kph within the session for that sector; lap = rank on the lap-level value
+  - Computed in a session-level pass after all drivers are processed (not inline per-driver)
+  - Recomputing one driver requires recomputing all drivers' ranks for that session
+  - Interpretation: higher rank = later braking relative to the field (late-braking proxy)
+- `brake_entry_speed_z_score_s1/s2/s3/lap` — z-score of speed_at_brake_start_kph relative to session mean/SD for that sector; lap = z-score on lap-level value
+  - Stored alongside percentile rank since braking distributions are unlikely to be normal; z-score adds magnitude of deviation from mean when distribution happens to be well-behaved
+- `brake_entry_speed_category_s1/s2/s3/lap` — categorical label derived from brake_entry_speed_pct_rank: 'early' (0–33), 'average' (34–66), 'late' (67–100)
+- `max_lateral_g_s1/s2/s3` - estimates of the max lateral g forces on each turn
+  - Advanced, doing this later as we need to build more logic around how to do this.
 
 **`lap_metrics` — battle and proximity states (per sector per lap)**
 Derived from intervals timestamps cross-referenced with sector boundary times from `laps`.
@@ -311,8 +335,30 @@ Derived from intervals timestamps cross-referenced with sector boundary times fr
 - `gap_behind_s1/s2/s3` — gap to car behind at end of each sector
 - `battle_ahead_s1/s2/s3_driver` — driver number of car < 1s ahead at sector end (nullable)
 - `battle_behind_s1/s2/s3_driver` — driver number of car < 1s behind (nullable)
-- `is_drs_range_s1/s2/s3` — gap_ahead < 1s at sector end
-- `is_clean_air` — gap_ahead > 2s AND gap_behind > 2s across all sectors (definition subject to refinement)
+- `is_estimated_clean_air` — gap_ahead > 2s across all sectors (estimation of clean air subject to refinement)
+- `overtakes_s1/s2/s3` - number of times a driver overtook another driver in each sector
+- `overtaken_s1/s2/s3` - number of times a driver was overtaken by another driver in each sector
+  - need to match overtake UTC time to the sector utc time (i.e., take lap start UTC time, add sector times)
+- `lap_overtakes` - total overtakes in a lap (sum of s1/s2/s3)
+- `lap_overtaken` - total times overtaken in a lap (sum of s1/s2/s3)
+- `i1_speed` - speed of car in first intermediate point (from openf1 api)
+- `i2_speed` - speed of car in second intermediate point (from openf1 api)
+- `sector_context` - uses the `segments_sector_1/2/3` key to return a list of mini sectors. Mini sectors are defined as:
+|value | colour |
+| ---- | ------ |
+| 0    | not available |
+| 2048 | yellow sector |
+| 2049 | green sector |
+| 2050 | ? (null) |
+| 2051 | purple sector |
+| 2052 | ? (null) |
+| 2064 | pit lane |
+| 2068 | ? (null) |
+  - Purple (Fastest of All): Indicates the absolute fastest time recorded in that specific sector by any driver during the entire session.
+  - Green (Personal Best): Indicates the driver has set their own best time for that sector, but it is not faster than the purple time.
+  - Yellow (Slower Sector): Indicates the driver did not improve on their personal best time for that sector. This often suggests a mistake, heavy fuel, tire degradation, or traffic.
+  - Sector Timing Usage: These colors are primarily used in qualifying and practice sessions to help teams and viewers analyze performance in the three designated sectors (S1, S2, S3) of the track. 
+  - We can ingest this for qualifying data as additional context
 
 **`lap_metrics` — lap-level flags and deltas**
 - `is_neutralized` — SC/VSC/red flag active on this lap (from race_control)
@@ -320,12 +366,12 @@ Derived from intervals timestamps cross-referenced with sector boundary times fr
 - `delta_to_session_best_s1/s2/s3` — sector time minus fastest set by any driver in session
 
 **`session_sector_bests`** — one row per session
-- `best_s1/s2/s3` — fastest sector time set by any driver
+- `best_s1/s2/s3` — fastest sector time set by any driver (i.e., the lowest time in the sector)
 - `best_s1/s2/s3_driver` — who set it
 - `theoretical_best_lap` — sum of best_s1 + best_s2 + best_s3
 
 **`stint_metrics`** — per (session_key, driver_number, stint_number)
-- `clean_air_pace_s` — mean lap time on laps where is_clean_air == true
+- `clean_air_pace_s` — mean lap time on laps where is_estimated_clean_air == true
 - `dirty_air_pace_s` — mean on non-clean laps
 - `first_half_pace_s` / `second_half_pace_s` — split on stint midpoint, excluding neutralized laps
 - `representative_pace_s` — median of non-neutralized, non-pit-in/out laps
@@ -343,10 +389,11 @@ Derived from minimum `lap_duration` among classified finishers (not DNF/DNS/DSQ)
 **`season_driver_stats`** — cumulative per (year, driver_number, meeting_key)
 One row per driver per round; full table gives season progression plottable over time.
 - `round_number` — integer round within the year (for ordering)
-- `races_entered`, `races_classified`, `dnf_count`, `dns_count`
+- `races_entered`, `races_classified`, `dnf_count`, `dns_count`, `dsq_count`, `penalty_points`
 - `laps_completed`, `distance_km` (laps × `races.circuit_length_km`)
 - `total_overtakes_made`, `total_overtakes_suffered`, `total_pit_stops`
-- `podiums`, `poles`, `fastest_laps`, `points_scored`
+- `podiums`, `poles`, `fastest_laps`, `points_scored`, `points_per_race`, `percent_of_driver_points_relative_to_maximum` (i.e., winning every race), `percent_of_team_points_by_driver`, `wins_over_teammate`
+- `qualifying_supertimes` - average gap between teammate from the best qualifying lap of each race weekend; assesses pure pace between drivers 
 - Sprints count toward all totals (laps, distance, overtakes, etc.)
 
 **`season_constructor_stats`** — same structure at constructor level, keyed on (year, team_name, meeting_key)
@@ -355,6 +402,7 @@ One row per driver per round; full table gives season progression plottable over
 - `circuit_key`, `circuit_name`, `location`, `country`, `length_km`
 - `num_corners`, `drs_zones`, `circuit_type`
 - `lap_record_time_s`, `lap_record_driver`, `lap_record_year`, `first_gp_year`
+- Note that openf1 only has data since 2023
 
 **Ingestion order**
 ```

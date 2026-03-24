@@ -242,9 +242,9 @@ Full scope documented in `product_roadmap.md`. Key implementation tasks:
 
 **Signal definitions to encode in pipeline:**
 - Coasting: `throttle < 1% AND brake == 0` (not strict zero — document this consistently)
-- Brake is boolean in OpenF1 — no derivative; `throttle_smoothness_index` is throttle-only
+- Brake is boolean in OpenF1 — no derivative; `throttle_input_variance` is throttle-only (higher = rougher inputs)
 - Battle states computed per sector (3 snapshots per lap per driver from intervals × sector timestamps)
-- `is_clean_air`: gap_ahead > 2s AND gap_behind > 2s across all sectors (subject to refinement)
+- `is_estimated_clean_air`: gap_ahead > 2s across all sectors (gap_behind condition dropped; subject to refinement)
 
 **Backfill:**
 - Run `python pipeline/ingest.py --year 2025` then 2024, 2023
