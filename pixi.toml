@@ -20,6 +20,7 @@ altair = ">=6.0.0,<7"
 pandas = ">=2.2,<3"
 numpy = ">=2.0,<3"
 pytest = ">=9.0.2,<10"
+scipy = ">=1.17.1,<2"
 
 [feature.pipeline.dependencies]
 requests = ">=2.32.5,<3"
