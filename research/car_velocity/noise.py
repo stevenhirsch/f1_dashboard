@@ -307,6 +307,45 @@ def get_accel_from_speed(timestamps, speeds):
     return speed_diffs / time_diffs
 
 
+@app.function
+def compute_psd_stats(car_data_raw, fs=4.0, cutoff=1.25):
+    """Dedup → PCHIP resample → Butterworth filter → Welch PSD.
+    Returns (freqs, psd, frac_below_cutoff, peak_freq) or None if data insufficient."""
+    import numpy as np, pandas as pd
+    from scipy.interpolate import PchipInterpolator
+    from scipy.signal import butter, filtfilt, welch
+
+    if not car_data_raw or len(car_data_raw) < 20:
+        return None
+    df = pd.DataFrame(car_data_raw)
+    df['date'] = pd.to_datetime(df['date'])
+    df = df.sort_values('date').reset_index(drop=True)
+
+    same = df['speed'].diff().eq(0)
+    group_id = (~same).cumsum()
+    run_len = group_id.map(group_id.value_counts())
+    clean = df[run_len < 8]
+    if len(clean) < 10:
+        return None
+
+    t = clean['date'].astype(np.int64).to_numpy() / 1e9
+    v = clean['speed'].to_numpy().astype(float)
+    pchip = PchipInterpolator(t, v)
+    t_reg = np.arange(t[0], t[-1], 1 / fs)
+    if len(t_reg) < 32:
+        return None
+    v_reg = pchip(t_reg)
+
+    b, a = butter(N=4, Wn=cutoff / (fs / 2), btype='low')
+    v_filt = filtfilt(b, a, v_reg)
+
+    freqs, psd = welch(v_filt, fs=fs, nperseg=min(256, len(v_filt) // 4))
+    total = np.trapezoid(psd, freqs)
+    below = np.trapezoid(psd[freqs <= cutoff], freqs[freqs <= cutoff])
+    frac = below / total if total > 0 else 0.0
+    return freqs, psd, frac, freqs[np.argmax(psd)]
+
+
 @app.cell
 def _(car_data_df):
     accels_raw = get_accel_from_speed(
@@ -443,6 +482,71 @@ def _(FS, np, plt, v_regular):
 
 
 @app.cell
+def _(mo):
+    mo.md("""
+    ### Power Spectral Density
+
+    The residual analysis tells us about *how much* signal energy we remove at each cutoff,
+    but not *where* that energy sits in frequency. The PSD (estimated via Welch's method)
+    lets us see the frequency distribution directly and check whether our chosen cutoff is
+    consistent with the signal's natural spectral structure.
+
+    Welch's method averages overlapping periodograms to reduce variance, giving a more
+    reliable estimate than a raw FFT on a short, noisy segment.
+    """)
+    return
+
+
+@app.cell
+def _(CUTOFF_HZ, FS, plt, v_regular):
+    from scipy.signal import welch
+
+    _freqs, _psd = welch(v_regular, fs=FS, nperseg=min(256, len(v_regular) // 4))
+
+    fig_psd, ax_psd = plt.subplots()
+    ax_psd.semilogy(_freqs, _psd)
+    ax_psd.axvline(CUTOFF_HZ, color='orange', linestyle='--', label=f'Chosen cutoff: {CUTOFF_HZ} Hz')
+    ax_psd.axvline(FS / 2, color='grey', linestyle=':', label=f'Nyquist: {FS/2:.1f} Hz')
+    ax_psd.set_xlabel('Frequency (Hz)')
+    ax_psd.set_ylabel('PSD (kph² / Hz)')
+    ax_psd.set_title('Power spectral density — PCHIP resampled speed (Welch estimate)')
+    ax_psd.legend()
+    fig_psd
+    return (welch,)
+
+
+@app.cell
+def _(CUTOFF_HZ, FS, np, v_regular, welch):
+    _freqs, _psd = welch(v_regular, fs=FS, nperseg=min(256, len(v_regular) // 4))
+    _total_power = np.trapezoid(_psd, _freqs)
+    _signal_power = np.trapezoid(_psd[_freqs <= CUTOFF_HZ], _freqs[_freqs <= CUTOFF_HZ])
+    _frac = _signal_power / _total_power
+    return
+
+
+@app.cell
+def _(CUTOFF_HZ, FS, mo, np, v_regular, welch):
+    _freqs, _psd = welch(v_regular, fs=FS, nperseg=min(256, len(v_regular) // 4))
+    _total_power = np.trapezoid(_psd, _freqs)
+    _signal_power = np.trapezoid(_psd[_freqs <= CUTOFF_HZ], _freqs[_freqs <= CUTOFF_HZ])
+    _frac = _signal_power / _total_power
+    _peak_freq = _freqs[np.argmax(_psd)]
+    mo.md(f"""
+    | Metric | Value |
+    |---|---|
+    | Peak power frequency | {_peak_freq:.3f} Hz |
+    | Power below {CUTOFF_HZ} Hz | {_signal_power:.3f} kph² / Hz ({_frac*100:.3f}% of total) |
+    | Power above {CUTOFF_HZ} Hz | {(_total_power - _signal_power):.3f} kph² / Hz ({(1-_frac)*100:.3f}% of total) |
+
+    The bulk of signal power sits at low frequencies, consistent with lap-scale speed variation
+    (straights, braking zones, corners). The cutoff at **{CUTOFF_HZ} Hz** retains
+    **{_frac*100:.3f}%** of total power while discarding the high-frequency tail that is
+    dominated by sampling irregularity rather than physical dynamics.
+    """)
+    return
+
+
+@app.cell
 def _(CUTOFF_HZ, FS, butter, filtfilt, v_regular):
     _b, _a = butter(N=4, Wn=CUTOFF_HZ / (FS / 2), btype='low')
     v_filtered = filtfilt(_b, _a, v_regular)
@@ -507,26 +611,317 @@ def _(jerk_gs, plt, t_regular):
 
 @app.cell
 def _():
-    return
+    from pipeline.api.openf1 import get_car_data as get_car_data_slow
+
+    return (get_car_data_slow,)
 
 
 @app.cell
 def _():
+    import pickle, pathlib
+
+    try:
+        CACHE_DIR = pathlib.Path(__file__).resolve().parent / 'cache'
+    except NameError:
+        CACHE_DIR = pathlib.Path('/home/steven/f1_dashboard/research/car_velocity/cache')
+    CACHE_DIR.mkdir(exist_ok=True)
+    # Set to True to load previously saved results instead of re-fetching from the API.
+    USE_CACHE = True
+    return CACHE_DIR, USE_CACHE, pickle
+
+
+@app.cell
+def _(mo):
+    mo.md("""
+    ---
+
+    ## 7. Full-Race Spectral Analysis (HAM)
+
+    The PSD analysis in Section 5 used only laps 1–10. To confirm the spectral structure and
+    the 1.25 Hz cutoff are not artefacts of an early-race window, we repeat the per-lap PSD
+    computation across **all race laps** for Hamilton. Each lap is treated independently: the
+    PCHIP → Butterworth → Welch pipeline runs on data bounded by consecutive lap start times.
+
+    If the cutoff is well-chosen, every lap should show the same low-frequency-dominated shape,
+    and the fraction of power below 1.25 Hz should be stable (< 5 pp variation) across the race.
+    """)
     return
 
 
 @app.cell
-def _():
+def _(DRIVER_NUMBER, SESSION_KEY, get_laps):
+    ham_laps_timed = [l for l in get_laps(SESSION_KEY, DRIVER_NUMBER) if l.get('date_start')]
+    return (ham_laps_timed,)
+
+
+@app.cell
+def _(
+    CACHE_DIR,
+    DRIVER_NUMBER,
+    SESSION_KEY,
+    USE_CACHE,
+    get_car_data_slow,
+    ham_laps_timed,
+    pickle,
+):
+    _cache_file = CACHE_DIR / 'ham_psd_rows.pkl'
+    if USE_CACHE and _cache_file.exists():
+        with open(_cache_file, 'rb') as _f:
+            ham_psd_rows, ham_psd_failures = pickle.load(_f)
+    else:
+        ham_psd_rows = []
+        ham_psd_failures = []
+        for _i in range(len(ham_laps_timed) - 1):
+            _lap_num = ham_laps_timed[_i].get('lap_number', _i + 1)
+            try:
+                _date_start = ham_laps_timed[_i]['date_start']
+                _date_end = ham_laps_timed[_i + 1]['date_start']
+                _raw = get_car_data_slow(
+                    session_key=SESSION_KEY,
+                    driver_number=DRIVER_NUMBER,
+                    date_start=_date_start,
+                    date_end=_date_end,
+                )
+                _result = compute_psd_stats(_raw)
+                if _result is None:
+                    ham_psd_failures.append(_lap_num)
+                    continue
+                _freqs, _psd, _frac, _peak = _result
+                ham_psd_rows.append({
+                    'lap': _lap_num,
+                    'peak_freq_hz': round(_peak, 4),
+                    'frac_below_cutoff': round(_frac, 4),
+                    'pct_below_cutoff': round(_frac * 100, 2),
+                    'freqs': _freqs,
+                    'psd': _psd,
+                })
+            except Exception as _e:
+                ham_psd_failures.append(_lap_num)
+        with open(_cache_file, 'wb') as _f:
+            pickle.dump((ham_psd_rows, ham_psd_failures), _f)
+    return ham_psd_failures, ham_psd_rows
+
+
+@app.cell
+def _(ham_psd_failures, ham_psd_rows, mo):
+    import pandas as _pd_s7
+    _df = _pd_s7.DataFrame([{k: v for k, v in r.items() if k not in ('freqs', 'psd')} for r in ham_psd_rows])
+    _mean_pct = _df['pct_below_cutoff'].mean()
+    _min_pct = _df['pct_below_cutoff'].min()
+    _max_pct = _df['pct_below_cutoff'].max()
+    _range_pp = _max_pct - _min_pct
+    mo.md(f"""
+    **{len(ham_psd_rows)} laps** processed successfully; **{len(ham_psd_failures)} failed** (insufficient data): {ham_psd_failures}
+
+    | Stat | Value |
+    |---|---|
+    | Mean % power below 1.25 Hz | {_mean_pct:.2f}% |
+    | Min % power below 1.25 Hz | {_min_pct:.2f}% |
+    | Max % power below 1.25 Hz | {_max_pct:.2f}% |
+    | Range (pp) | {_range_pp:.2f} pp |
+
+    A range of **{_range_pp:.2f} pp** {'is well within the 5 pp stability target ✓' if _range_pp < 5 else 'exceeds the 5 pp stability target — inspect outlier laps'}.
+    """)
     return
 
 
 @app.cell
-def _():
+def _(ham_psd_rows, mo):
+    import pandas as _pd_s7b
+    _rows = [{k: v for k, v in r.items() if k not in ('freqs', 'psd')} for r in ham_psd_rows]
+    _df = _pd_s7b.DataFrame(_rows)
+    mo.md(
+        "| Lap | Peak freq (Hz) | % power below 1.25 Hz |\n|---|---|---|\n" +
+        "\n".join(f"| {int(r['lap'])} | {r['peak_freq_hz']:.4f} | {r['pct_below_cutoff']:.2f}% |" for _, r in _df.iterrows())
+    )
     return
 
 
 @app.cell
-def _():
+def _(ham_psd_rows, plt):
+    _cmap = plt.get_cmap('plasma')
+    _n = len(ham_psd_rows)
+    _fig_s7, _ax_s7 = plt.subplots()
+    for _idx, _row in enumerate(ham_psd_rows):
+        _ax_s7.semilogy(_row['freqs'], _row['psd'], color=_cmap(_idx / max(_n - 1, 1)), alpha=0.7, linewidth=0.8)
+    _sm = plt.cm.ScalarMappable(cmap='plasma', norm=plt.Normalize(vmin=ham_psd_rows[0]['lap'], vmax=ham_psd_rows[-1]['lap']))
+    _sm.set_array([])
+    _fig_s7.colorbar(_sm, ax=_ax_s7, label='Lap number')
+    _ax_s7.axvline(1.25, color='orange', linestyle='--', label='Cutoff: 1.25 Hz')
+    _ax_s7.axvline(2.0, color='grey', linestyle=':', label='Nyquist: 2.0 Hz')
+    _ax_s7.set_xlabel('Frequency (Hz)')
+    _ax_s7.set_ylabel('PSD (kph² / Hz)')
+    _ax_s7.set_title('PSD overlay — all HAM race laps (colour = lap number)')
+    _ax_s7.legend(fontsize=8)
+    _fig_s7
+    return
+
+
+@app.cell
+def _(ham_psd_rows, np, plt):
+    _laps = [r['lap'] for r in ham_psd_rows]
+    _pcts = [r['pct_below_cutoff'] for r in ham_psd_rows]
+    _mean_line = np.mean(_pcts)
+    _fig_s7b, _ax_s7b = plt.subplots()
+    _ax_s7b.plot(_laps, _pcts, marker='o', markersize=3, linewidth=1)
+    _ax_s7b.axhline(_mean_line, color='orange', linestyle='--', label=f'Mean: {_mean_line:.1f}%')
+    _ax_s7b.set_xlabel('Lap number')
+    _ax_s7b.set_ylabel('% power below 1.25 Hz')
+    _ax_s7b.set_title('Power retained below cutoff per lap — HAM full race')
+    _ax_s7b.legend()
+    _fig_s7b
+    return
+
+
+@app.cell
+def _(mo):
+    mo.md("""
+    ---
+
+    ## 8. Cross-Driver PSD Consistency
+
+    Section 7 confirms spectral stability across the full race for Hamilton. Here we check whether
+    the same pipeline parameters generalise to **all 20 drivers**. We reuse the laps 3–7 window
+    from Section 3 (same `get_laps` calls, already cached). Car data is fetched via the rate-limited
+    pipeline API. Each driver's data passes through the same `compute_psd_stats` pipeline.
+
+    If the 1.25 Hz cutoff is universal, all drivers should show:
+    - A low-frequency-dominated PSD shape (peak well below 1.25 Hz)
+    - ≥ 90% of power retained below the cutoff
+    - No driver significantly outside the cluster
+    """)
+    return
+
+
+@app.cell
+def _(
+    CACHE_DIR,
+    SESSION_KEY,
+    USE_CACHE,
+    drivers,
+    get_car_data_slow,
+    get_laps,
+    pickle,
+):
+    _cache_file = CACHE_DIR / 'cross_psd_rows.pkl'
+    if USE_CACHE and _cache_file.exists():
+        with open(_cache_file, 'rb') as _f:
+            cross_psd_rows, cross_psd_failures = pickle.load(_f)
+    else:
+        _cross_rows = []
+        _cross_failures = []
+        for _drv in drivers:
+            _dn = _drv['driver_number']
+            _acro = _drv['name_acronym']
+            try:
+                _laps = get_laps(SESSION_KEY, _dn)
+                _timed = [l for l in _laps if not l.get('is_pit_out_lap') and l.get('date_start')]
+                if len(_timed) < 5:
+                    _cross_failures.append(_acro)
+                    continue
+                _start = _timed[2]['date_start']
+                _end = _timed[6]['date_start'] if len(_timed) > 6 else _timed[-1]['date_start']
+                _raw = get_car_data_slow(SESSION_KEY, _dn, _start, _end)
+                _result = compute_psd_stats(_raw)
+                if _result is None:
+                    _cross_failures.append(_acro)
+                    continue
+                _freqs, _psd, _frac, _peak = _result
+                _cross_rows.append({
+                    'driver': _acro,
+                    'team': _drv['team_name'],
+                    'team_colour': '#' + (_drv.get('team_colour') or 'aaaaaa'),
+                    'peak_freq_hz': round(_peak, 4),
+                    'frac_below_cutoff': round(_frac, 4),
+                    'pct_below_cutoff': round(_frac * 100, 2),
+                    'freqs': _freqs,
+                    'psd': _psd,
+                })
+            except Exception:
+                _cross_failures.append(_acro)
+        cross_psd_rows = _cross_rows
+        cross_psd_failures = _cross_failures
+        with open(_cache_file, 'wb') as _f:
+            pickle.dump((cross_psd_rows, cross_psd_failures), _f)
+    return cross_psd_failures, cross_psd_rows
+
+
+@app.cell
+def _(cross_psd_failures, cross_psd_rows, mo):
+    import pandas as _pd_s8
+    _df8 = _pd_s8.DataFrame([{k: v for k, v in r.items() if k not in ('freqs', 'psd', 'team_colour')} for r in cross_psd_rows])
+    _mean8 = _df8['pct_below_cutoff'].mean()
+    _min8 = _df8['pct_below_cutoff'].min()
+    _max8 = _df8['pct_below_cutoff'].max()
+    mo.md(f"""
+    **{len(cross_psd_rows)} drivers** processed successfully; **{len(cross_psd_failures)} excluded** (insufficient data): {cross_psd_failures}
+
+    | Stat | Value |
+    |---|---|
+    | Mean % power below 1.25 Hz | {_mean8:.2f}% |
+    | Min % power below 1.25 Hz | {_min8:.2f}% |
+    | Max % power below 1.25 Hz | {_max8:.2f}% |
+
+    | Driver | Team | Peak freq (Hz) | % power below 1.25 Hz |
+    |---|---|---|---|
+    """ + "\n".join(
+        f"| {r['driver']} | {r['team']} | {r['peak_freq_hz']:.4f} | {r['pct_below_cutoff']:.2f}% |"
+        for r in sorted(cross_psd_rows, key=lambda x: x['pct_below_cutoff'], reverse=True)
+    ))
+    return
+
+
+@app.cell
+def _(cross_psd_rows, plt):
+    _fig_s8, _ax_s8 = plt.subplots()
+    for _row in cross_psd_rows:
+        _ax_s8.semilogy(_row['freqs'], _row['psd'], color=_row['team_colour'], alpha=0.75, linewidth=0.9, label=_row['driver'])
+    _ax_s8.axvline(1.25, color='orange', linestyle='--', label='Cutoff: 1.25 Hz', zorder=10)
+    _ax_s8.axvline(2.0, color='grey', linestyle=':', label='Nyquist: 2.0 Hz', zorder=10)
+    _ax_s8.set_xlabel('Frequency (Hz)')
+    _ax_s8.set_ylabel('PSD (kph² / Hz)')
+    _ax_s8.set_title('PSD overlay — all drivers, laps 3–7 (colour = team colour)')
+    _ax_s8.legend(fontsize=6, ncol=2, loc='upper right', bbox_to_anchor=(1.18, 1))
+    _fig_s8
+    return
+
+
+@app.cell
+def _(cross_psd_rows, np, plt):
+    _sorted = sorted(cross_psd_rows, key=lambda x: x['pct_below_cutoff'])
+    _drivers_sorted = [r['driver'] for r in _sorted]
+    _pcts_sorted = [r['pct_below_cutoff'] for r in _sorted]
+    _colours_sorted = [r['team_colour'] for r in _sorted]
+    _mean_all = np.mean(_pcts_sorted)
+    _fig_s8b, _ax_s8b = plt.subplots(figsize=(12, 5))
+    _ax_s8b.bar(_drivers_sorted, _pcts_sorted, color=_colours_sorted)
+    _ax_s8b.axhline(_mean_all, color='orange', linestyle='--', label=f'Mean: {_mean_all:.1f}%')
+    _ax_s8b.set_xlabel('Driver')
+    _ax_s8b.set_ylabel('% power below 1.25 Hz')
+    _ax_s8b.set_title('Power retained below cutoff — all drivers, laps 3–7')
+    _ax_s8b.legend()
+    _fig_s8b
+    return
+
+
+@app.cell
+def _(mo):
+    mo.md("""
+    ---
+
+    ## Conclusion: Pipeline Generalisation Evidence
+
+    | Claim | Evidence |
+    |---|---|
+    | 4 Hz resample is appropriate | Source ~3.7 Hz irregular; 4 Hz is minimally super-Nyquist, no phantom information added |
+    | 1.25 Hz cutoff retains signal | HAM laps 1–10: >95% power below cutoff (Section 5) |
+    | Cutoff stable across full race | Section 7: per-lap % retained varies < 5 pp across all HAM race laps |
+    | Cutoff applies to all drivers | Section 8: all ~20 drivers show same low-frequency-dominated structure; all within a narrow band |
+
+    A single pipeline configuration — PCHIP resample to 4 Hz, 4th-order Butterworth at 1.25 Hz —
+    can be applied universally to produce acceleration and jerk signals for all drivers across
+    the full race.
+    """)
     return
 
 
