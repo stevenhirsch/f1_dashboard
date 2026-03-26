@@ -8,6 +8,7 @@ import httpx
 import ingest
 from ingest import (
     _assign_qualifying_phases,
+    _compute_peak_g,
     _get_compound_for_lap,
     _normalize_phase,
     _parse_gap,
@@ -17,6 +18,7 @@ from ingest import (
     ingest_championship_teams,
     ingest_drivers,
     ingest_intervals,
+    ingest_lap_metrics,
     ingest_laps,
     ingest_meeting,
     ingest_overtakes,
@@ -1667,6 +1669,165 @@ class TestProcessMeeting(unittest.TestCase):
 
         self.assertEqual(mock_process_session.call_count, 1)
         self.assertEqual(mock_process_session.call_args.args[1], 9000)
+
+
+# ===========================================================================
+# _compute_peak_g
+# ===========================================================================
+
+def _make_car_data(n=80, throttle=100, brake=0, speed_slope=0.5):
+    """Generate synthetic car_data records at 1 Hz with controllable throttle/brake.
+
+    Uses whole-second timestamps to avoid pandas ISO8601 microsecond ambiguity.
+    Records at 1 Hz are fine: _compute_peak_g resamples to 4 Hz via PCHIP.
+    """
+    import datetime
+    base = datetime.datetime(2024, 3, 2, 13, 0, 0)
+    records = []
+    for i in range(n):
+        records.append({
+            'date': (base + datetime.timedelta(seconds=i)).strftime('%Y-%m-%dT%H:%M:%SZ'),
+            'speed': 200.0 + speed_slope * i,   # gently accelerating
+            'throttle': throttle,
+            'brake': brake,
+        })
+    return records
+
+
+class TestComputePeakG(unittest.TestCase):
+
+    def test_returns_none_for_empty(self):
+        self.assertIsNone(_compute_peak_g([]))
+
+    def test_returns_none_for_too_few_records(self):
+        self.assertIsNone(_compute_peak_g(_make_car_data(n=10)))
+
+    def test_returns_tuple_for_valid_data(self):
+        result = _compute_peak_g(_make_car_data(n=80, throttle=100, brake=0))
+        self.assertIsNotNone(result)
+        peak_accel, peak_decel_abs = result
+        # With throttle=100 there should be an accel window
+        self.assertIsNotNone(peak_accel)
+
+    def test_accel_none_when_throttle_always_low(self):
+        # throttle=0 → accel_mask always False → peak_accel_g should be None
+        result = _compute_peak_g(_make_car_data(n=80, throttle=0, brake=0))
+        self.assertIsNotNone(result)
+        peak_accel, _ = result
+        self.assertIsNone(peak_accel)
+
+    def test_decel_captured_when_braking(self):
+        # brake=100 → decel_mask always True → peak_decel_g_abs should be non-None
+        result = _compute_peak_g(_make_car_data(n=80, throttle=0, brake=100, speed_slope=-0.5))
+        self.assertIsNotNone(result)
+        _, peak_decel_abs = result
+        self.assertIsNotNone(peak_decel_abs)
+        self.assertGreaterEqual(peak_decel_abs, 0.0)
+
+    def test_peak_accel_g_is_positive(self):
+        result = _compute_peak_g(_make_car_data(n=80, throttle=100, brake=0, speed_slope=1.0))
+        self.assertIsNotNone(result)
+        peak_accel, _ = result
+        if peak_accel is not None:
+            self.assertGreater(peak_accel, 0.0)
+
+    def test_returns_none_for_insufficient_after_dedup(self):
+        # All records have identical speed → dedup removes them all → < 10 clean rows
+        import datetime
+        base = datetime.datetime(2024, 3, 2, 13, 0, 0)
+        records = [
+            {
+                'date': (base + datetime.timedelta(seconds=i)).strftime('%Y-%m-%dT%H:%M:%SZ'),
+                'speed': 200.0,  # constant speed → long run → deduped out
+                'throttle': 50,
+                'brake': 0,
+            }
+            for i in range(80)
+        ]
+        result = _compute_peak_g(records)
+        self.assertIsNone(result)
+
+
+# ===========================================================================
+# ingest_lap_metrics
+# ===========================================================================
+
+def _make_laps(n_laps=5, driver_number=44):
+    """Minimal lap dicts for ingest_lap_metrics."""
+    import datetime
+    base = datetime.datetime(2024, 3, 2, 13, 0, 0)
+    laps = []
+    for i in range(n_laps):
+        laps.append({
+            'session_key': 9158,
+            'driver_number': driver_number,
+            'lap_number': i + 1,
+            'is_pit_out_lap': False,
+            'date_start': (base + datetime.timedelta(minutes=i * 2)).strftime('%Y-%m-%dT%H:%M:%SZ'),
+        })
+    return laps
+
+
+class TestIngestLapMetrics(unittest.TestCase):
+
+    @patch("ingest.openf1.get_car_data")
+    def test_empty_car_data_produces_no_rows(self, mock_get_car_data):
+        mock_get_car_data.return_value = []
+        client = _mock_client()
+        stats = ingest_lap_metrics(client, 9158, _make_laps(5))
+        # No car data → _upsert called with empty rows (exits early), driver_stats empty
+        client.table.assert_not_called()
+        self.assertEqual(stats, {})
+
+    @patch("ingest.openf1.get_car_data")
+    def test_pit_out_laps_excluded(self, mock_get_car_data):
+        mock_get_car_data.return_value = []
+        client = _mock_client()
+        laps = _make_laps(3)
+        laps[1]['is_pit_out_lap'] = True
+        ingest_lap_metrics(client, 9158, laps)
+        # Pit-out lap excluded from driver laps, but the driver still has 2 laps
+        # and we still call get_car_data if ≥ 2 non-pit-out laps remain
+        mock_get_car_data.assert_called_once()
+
+    @patch("ingest.openf1.get_car_data")
+    def test_single_non_pit_lap_skips_driver(self, mock_get_car_data):
+        mock_get_car_data.return_value = []
+        client = _mock_client()
+        # Only 1 non-pit-out lap → can't slice between consecutive laps → skip driver
+        laps = _make_laps(2)
+        laps[1]['is_pit_out_lap'] = True
+        stats = ingest_lap_metrics(client, 9158, laps)
+        mock_get_car_data.assert_not_called()
+        self.assertEqual(stats, {})
+
+    @patch("ingest._compute_peak_g")
+    @patch("ingest.openf1.get_car_data")
+    def test_valid_laps_upserted_and_returned(self, mock_get_car_data, mock_cpg):
+        mock_get_car_data.return_value = _make_car_data(n=80)
+        mock_cpg.return_value = (1.5, 3.2)
+        client = _mock_client()
+
+        stats = ingest_lap_metrics(client, 9158, _make_laps(3, driver_number=44))
+
+        # 3 laps → 2 intervals → 2 peak_g calls → 2 rows upserted
+        self.assertEqual(mock_cpg.call_count, 2)
+        self.assertIn(44, stats)
+        self.assertEqual(len(stats[44]), 2)
+        self.assertEqual(stats[44][0], (1.5, 3.2))
+
+    @patch("ingest._compute_peak_g")
+    @patch("ingest.openf1.get_car_data")
+    def test_none_peak_g_laps_excluded_from_stats(self, mock_get_car_data, mock_cpg):
+        mock_get_car_data.return_value = _make_car_data(n=80)
+        # First lap: valid; second: accel window empty
+        mock_cpg.side_effect = [(1.5, 3.2), (None, 2.1)]
+        client = _mock_client()
+
+        stats = ingest_lap_metrics(client, 9158, _make_laps(3, driver_number=44))
+
+        self.assertIn(44, stats)
+        self.assertEqual(len(stats[44]), 1)   # only the valid lap
 
 
 if __name__ == "__main__":

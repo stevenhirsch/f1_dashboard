@@ -25,6 +25,9 @@ scipy = ">=1.17.1,<2"
 [feature.pipeline.dependencies]
 requests = ">=2.32.5,<3"
 websockets = "<16"
+numpy = ">=2.0,<3"
+scipy = ">=1.17.1,<2"
+pandas = ">=2.2,<3"
 
 [feature.pipeline.pypi-dependencies]
 supabase = ">=2.0,<3"

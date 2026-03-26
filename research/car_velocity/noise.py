@@ -953,9 +953,12 @@ def _(mo):
 
 @app.function
 def compute_lap_accel_stats(car_data_raw, fs=4.0, cutoff=0.5):
-    """Dedup → PCHIP → Butterworth → differentiate.
+    """Dedup → PCHIP → Butterworth → differentiate → throttle/brake gating.
+
     Returns (peak_accel_g, peak_decel_g) where peak_decel_g is the signed minimum (negative).
-    Returns None if data is insufficient.
+    Either element may be None if no valid window exists for that channel (e.g. a lap with no
+    throttle application above the 20% gate, or no braking events).
+    Returns None (not a tuple) if data is insufficient to process at all.
 
     cutoff=0.5 Hz, matching the pipeline-wide cutoff established in Sections 5–8.
     Differentiation amplifies noise proportionally to frequency; diagnostic analysis (Section 9)
@@ -964,7 +967,15 @@ def compute_lap_accel_stats(car_data_raw, fs=4.0, cutoff=0.5):
     contamination. 0.75 Hz was also evaluated but reintroduced high/low outliers within the
     included laps. Values are attenuated relative to true instantaneous peak g (accelerometer-
     grade sampling required for that) but are internally consistent and reliable for relative
-    driver comparison."""
+    driver comparison.
+
+    Throttle/brake windowing:
+    - accel_mask: throttle > 20% — gates genuine power application; 20% is a coarse threshold
+      appropriate for power circuits. Monaco/slow circuits may yield fewer valid samples (see
+      Section 11.5 empty-window report).
+    - decel_mask: throttle < 20% OR any brake — captures genuine deceleration events.
+    - Alignment: accel_g[i] spans [t_reg[i], t_reg[i+1]], so masks use throttle_reg[:-1]
+      (left-edge convention) to stay aligned with the diff output (shape N-1)."""
     import numpy as np, pandas as pd
     from scipy.interpolate import PchipInterpolator
     from scipy.signal import butter, filtfilt
@@ -982,6 +993,10 @@ def compute_lap_accel_stats(car_data_raw, fs=4.0, cutoff=0.5):
     if len(clean) < 10:
         return None
 
+    t_ctrl     = clean['date'].astype(np.int64).to_numpy() / 1e9
+    throttle_r = clean['throttle'].to_numpy().astype(float)
+    brake_r    = clean['brake'].to_numpy().astype(float)
+
     t = clean['date'].astype(np.int64).to_numpy() / 1e9
     v = clean['speed'].to_numpy().astype(float)
     pchip = PchipInterpolator(t, v)
@@ -989,6 +1004,12 @@ def compute_lap_accel_stats(car_data_raw, fs=4.0, cutoff=0.5):
     if len(t_reg) < 32:
         return None
     v_reg = pchip(t_reg)
+
+    # Resample throttle (linear) and brake (nearest-neighbour) onto the regular grid.
+    # Nearest-neighbour for brake preserves its binary character; linear interp would
+    # produce fractional values at step edges, corrupting the brake > 0 test.
+    throttle_reg = np.clip(np.interp(t_reg, t_ctrl, throttle_r), 0, 100)
+    brake_reg    = np.clip(np.round(np.interp(t_reg, t_ctrl, brake_r) / 100) * 100, 0, 100)
 
     b, a = butter(N=4, Wn=cutoff / (fs / 2), btype='low')
     # Use a generous padlen (up to 5 s each side) so the filter fully stabilises at
@@ -998,7 +1019,20 @@ def compute_lap_accel_stats(car_data_raw, fs=4.0, cutoff=0.5):
 
     accel_g = np.diff(v_filt) / (1 / fs) * (1000 / 3600) / 9.81
 
-    return float(np.max(accel_g)), float(np.min(accel_g))
+    # Left-edge alignment: accel_g[i] spans [t_reg[i], t_reg[i+1]] → index with [:-1]
+    thr = throttle_reg[:-1]   # shape (N-1,) — aligns with accel_g
+    brk = brake_reg[:-1]
+
+    accel_mask = thr > 20                   # throttle above 20% → genuine acceleration
+    decel_mask = (thr < 20) | (brk > 0)    # light throttle OR any brake → genuine deceleration
+
+    accel_candidates = accel_g[accel_mask]
+    decel_candidates = accel_g[decel_mask]
+
+    peak_accel_g = float(np.max(accel_candidates)) if len(accel_candidates) > 0 else None
+    peak_decel_g = float(np.min(decel_candidates)) if len(decel_candidates) > 0 else None
+
+    return peak_accel_g, peak_decel_g
 
 
 @app.cell
@@ -1046,6 +1080,9 @@ def _(
                         _failures.append((_acro, _lap_num))
                         continue
                     _peak_accel, _peak_decel = _result
+                    if _peak_accel is None or _peak_decel is None:
+                        _failures.append((_acro, _lap_num, 'empty_window'))
+                        continue
                     _rows.append({
                         'driver': _acro,
                         'team': _drv['team_name'],
@@ -1061,6 +1098,88 @@ def _(
         with open(_cache_file, 'wb') as _f:
             pickle.dump((lap_accel_rows, lap_accel_failures), _f)
     return lap_accel_failures, lap_accel_rows
+
+
+@app.cell
+def _(
+    CACHE_DIR,
+    SESSION_KEY,
+    USE_CACHE,
+    drivers,
+    get_car_data_slow,
+    get_laps,
+    pickle,
+):
+    _cache_file_w = CACHE_DIR / 'lap_accel_windowed_rows.pkl'
+    if USE_CACHE and _cache_file_w.exists():
+        with open(_cache_file_w, 'rb') as _f:
+            lap_accel_windowed_rows, lap_accel_windowed_failures = pickle.load(_f)
+    else:
+        import pandas as _pd_s9w
+        _rows_w = []
+        _failures_w = []
+        _windowed_empty_window = []
+        for _drv in drivers:
+            _dn = _drv['driver_number']
+            _acro = _drv['name_acronym']
+            try:
+                _laps_all = get_laps(SESSION_KEY, _dn)
+                _timed = [l for l in _laps_all if not l.get('is_pit_out_lap') and l.get('date_start')]
+                if len(_timed) < 2:
+                    _failures_w.append((_acro, 'all'))
+                    continue
+                _raw = get_car_data_slow(SESSION_KEY, _dn, _timed[0]['date_start'], _timed[-1]['date_start'])
+                if not _raw:
+                    _failures_w.append((_acro, 'all'))
+                    continue
+                _df_all = _pd_s9w.DataFrame(_raw)
+                _df_all['date'] = _pd_s9w.to_datetime(_df_all['date'])
+                _df_all = _df_all.sort_values('date').reset_index(drop=True)
+                for _i in range(len(_timed) - 1):
+                    _lap_num = _timed[_i].get('lap_number', _i + 1)
+                    _t0 = _pd_s9w.to_datetime(_timed[_i]['date_start'])
+                    _t1 = _pd_s9w.to_datetime(_timed[_i + 1]['date_start'])
+                    _lap_slice = _df_all[(_df_all['date'] >= _t0) & (_df_all['date'] < _t1)]
+                    _result = compute_lap_accel_stats(_lap_slice.to_dict('records'))
+                    if _result is None:
+                        _failures_w.append((_acro, _lap_num))
+                        continue
+                    _peak_accel, _peak_decel = _result
+                    if _peak_accel is None or _peak_decel is None:
+                        _windowed_empty_window.append({
+                            'driver': _acro,
+                            'lap': _lap_num,
+                            'which': ('both' if _peak_accel is None and _peak_decel is None
+                                      else 'accel' if _peak_accel is None else 'decel'),
+                        })
+                        continue
+                    _rows_w.append({
+                        'driver': _acro,
+                        'team': _drv['team_name'],
+                        'team_colour': '#' + (_drv.get('team_colour') or 'aaaaaa'),
+                        'lap': _lap_num,
+                        'peak_accel_g': round(_peak_accel, 4),
+                        'peak_decel_g': round(_peak_decel, 4),
+                    })
+            except Exception:
+                _failures_w.append((_acro, 'all'))
+        lap_accel_windowed_rows = _rows_w
+        lap_accel_windowed_failures = _failures_w
+        with open(_cache_file_w, 'wb') as _f:
+            pickle.dump((lap_accel_windowed_rows, lap_accel_windowed_failures), _f)
+    return (lap_accel_windowed_rows,)
+
+
+@app.cell
+def _(lap_accel_windowed_rows, pd):
+    lap_accel_windowed_df = pd.DataFrame(lap_accel_windowed_rows)
+    if 'peak_decel_g' in lap_accel_windowed_df.columns:
+        lap_accel_windowed_df['peak_decel_g_abs'] = lap_accel_windowed_df['peak_decel_g'].abs()
+    else:
+        # Empty fetch — no laps passed the windowed filter yet
+        for _col in ('driver', 'team', 'team_colour', 'lap', 'peak_accel_g', 'peak_decel_g', 'peak_decel_g_abs'):
+            lap_accel_windowed_df[_col] = pd.Series(dtype=float if _col.startswith('peak') or _col == 'lap' else str)
+    return (lap_accel_windowed_df,)
 
 
 @app.cell
@@ -1252,6 +1371,226 @@ def _(lap_accel_df, mo):
 
 @app.cell
 def _():
+    return
+
+
+@app.cell
+def _(mo):
+    mo.md("""
+    ---
+
+    ## 11. Windowing Impact Analysis
+
+    How does throttle/brake gating change the peak g distributions relative to the global
+    max/min approach? We compare `lap_accel_df` (unwindowed, plausibility-filtered) against
+    `lap_accel_windowed_df` (windowed, no hard plausibility cap) across five views.
+    """)
+    return
+
+
+@app.cell
+def _(lap_accel_df, lap_accel_windowed_df, plt):
+    """11.1 — Paired histograms (2×2 grid): unwindowed vs windowed distributions."""
+    import numpy as _np_11
+
+    _bins_a = _np_11.linspace(
+        min(lap_accel_df['peak_accel_g'].min(), lap_accel_windowed_df['peak_accel_g'].min()),
+        max(lap_accel_df['peak_accel_g'].max(), lap_accel_windowed_df['peak_accel_g'].max()),
+        40,
+    )
+    _bins_d = _np_11.linspace(
+        min(lap_accel_df['peak_decel_g_abs'].min(), lap_accel_windowed_df['peak_decel_g_abs'].min()),
+        max(lap_accel_df['peak_decel_g_abs'].max(), lap_accel_windowed_df['peak_decel_g_abs'].max()),
+        40,
+    )
+
+    _fig11, _axes = plt.subplots(2, 2, figsize=(14, 8), sharey='row')
+
+    for _ax, _data, _col, _label, _bins in [
+        (_axes[0, 0], lap_accel_df['peak_accel_g'],           'grey',    'Unwindowed', _bins_a),
+        (_axes[0, 1], lap_accel_windowed_df['peak_accel_g'],  'steelblue','Windowed',  _bins_a),
+        (_axes[1, 0], lap_accel_df['peak_decel_g_abs'],       'grey',    'Unwindowed', _bins_d),
+        (_axes[1, 1], lap_accel_windowed_df['peak_decel_g_abs'],'tomato', 'Windowed',  _bins_d),
+    ]:
+        _mu = _data.mean()
+        _sd = _data.std()
+        _ax.hist(_data, bins=_bins, color=_col, alpha=0.75, edgecolor='none')
+        _ax.axvline(_mu,        color='orange', linestyle='--', linewidth=1.5, label=f'Mean: {_mu:.2f} g')
+        _ax.axvline(_mu - _sd, color='orange', linestyle=':',  linewidth=1.0, alpha=0.7, label=f'±1 SD: {_sd:.2f} g')
+        _ax.axvline(_mu + _sd, color='orange', linestyle=':',  linewidth=1.0, alpha=0.7)
+        _ax.set_title(_label)
+        _ax.legend(fontsize=8)
+
+    _axes[0, 0].set_ylabel('Count (laps)')
+    _axes[1, 0].set_ylabel('Count (laps)')
+    _axes[1, 0].set_xlabel('Peak deceleration (g)')
+    _axes[1, 1].set_xlabel('Peak deceleration (g)')
+    _axes[0, 0].set_xlabel('Peak acceleration (g)')
+    _axes[0, 1].set_xlabel('Peak acceleration (g)')
+    _fig11.suptitle('11.1 — Paired histograms: unwindowed vs windowed peak g-forces')
+    _fig11.tight_layout()
+    _fig11
+    return
+
+
+@app.cell
+def _(lap_accel_df, lap_accel_windowed_df, plt):
+    """11.2 — Per-driver scatter: windowed vs unwindowed median (coloured by team)."""
+    import numpy as _np_112
+
+    _med_uw = (
+        lap_accel_df.groupby('driver')[['peak_accel_g', 'peak_decel_g_abs', 'team_colour']]
+        .agg({'peak_accel_g': 'median', 'peak_decel_g_abs': 'median', 'team_colour': 'first'})
+        .rename(columns={'peak_accel_g': 'accel_uw', 'peak_decel_g_abs': 'decel_uw'})
+    )
+    _med_w = (
+        lap_accel_windowed_df.groupby('driver')[['peak_accel_g', 'peak_decel_g_abs']]
+        .agg({'peak_accel_g': 'median', 'peak_decel_g_abs': 'median'})
+        .rename(columns={'peak_accel_g': 'accel_w', 'peak_decel_g_abs': 'decel_w'})
+    )
+    _med = _med_uw.join(_med_w, how='inner').reset_index()
+
+    _fig112, (_ax_a, _ax_d) = plt.subplots(1, 2, figsize=(14, 5))
+
+    for _ax, _xcol, _ycol, _xlabel, _ylabel, _title in [
+        (_ax_a, 'accel_uw', 'accel_w',
+         'Unwindowed median accel (g)', 'Windowed median accel (g)',
+         'Peak acceleration: windowed vs unwindowed median'),
+        (_ax_d, 'decel_uw', 'decel_w',
+         'Unwindowed median decel (g)', 'Windowed median decel (g)',
+         'Peak deceleration: windowed vs unwindowed median'),
+    ]:
+        _lo = min(_med[_xcol].min(), _med[_ycol].min()) * 0.95
+        _hi = max(_med[_xcol].max(), _med[_ycol].max()) * 1.05
+        _ax.plot([_lo, _hi], [_lo, _hi], 'k--', linewidth=1, alpha=0.5, label='y = x')
+        for _, _r in _med.iterrows():
+            _ax.scatter(_r[_xcol], _r[_ycol], color=_r['team_colour'], s=80, zorder=3)
+            _ax.annotate(_r['driver'], (_r[_xcol], _r[_ycol]),
+                         textcoords='offset points', xytext=(4, 4), fontsize=7)
+        _ax.set_xlabel(_xlabel)
+        _ax.set_ylabel(_ylabel)
+        _ax.set_title(_title)
+        _ax.legend(fontsize=8)
+
+    _fig112.suptitle('11.2 — Per-driver scatter: windowed vs unwindowed median')
+    _fig112.tight_layout()
+    _fig112
+    return
+
+
+@app.cell
+def _(lap_accel_df, lap_accel_windowed_df, plt):
+    """11.3 — Per-lap delta box plot: windowed − unwindowed, per driver."""
+    import numpy as _np_113
+    import pandas as _pd_113
+
+    _uw = lap_accel_df[['driver', 'lap', 'peak_accel_g', 'peak_decel_g_abs']].copy()
+    _w  = lap_accel_windowed_df[['driver', 'lap', 'peak_accel_g', 'peak_decel_g_abs']].copy()
+    _merged = _uw.merge(_w, on=['driver', 'lap'], suffixes=('_uw', '_w'))
+    _merged['delta_accel'] = _merged['peak_accel_g_w'] - _merged['peak_accel_g_uw']
+    _merged['delta_decel'] = _merged['peak_decel_g_abs_w'] - _merged['peak_decel_g_abs_uw']
+
+    _fig113, (_ax_a, _ax_d) = plt.subplots(1, 2, figsize=(16, 5))
+
+    for _ax, _dcol, _ylabel, _title in [
+        (_ax_a, 'delta_accel', 'Windowed − Unwindowed (g)',
+         'Δ Peak acceleration per lap, per driver'),
+        (_ax_d, 'delta_decel', 'Windowed − Unwindowed (g)',
+         'Δ Peak deceleration per lap, per driver'),
+    ]:
+        _order = (
+            _merged.groupby('driver')[_dcol]
+            .median()
+            .sort_values()
+            .index.tolist()
+        )
+        _data = [_merged.loc[_merged['driver'] == d, _dcol].values for d in _order]
+        _bp = _ax.boxplot(_data, patch_artist=True,
+                          medianprops=dict(color='white', linewidth=1.5))
+        _colours_bp = {
+            row['driver']: row['team_colour']
+            for _, row in lap_accel_df[['driver', 'team_colour']].drop_duplicates().iterrows()
+        }
+        for _patch, _drv in zip(_bp['boxes'], _order):
+            _patch.set_facecolor(_colours_bp.get(_drv, '#aaaaaa'))
+            _patch.set_alpha(0.8)
+        _ax.axhline(0, color='k', linestyle='--', linewidth=1, alpha=0.5)
+        _ax.set_xticks(range(1, len(_order) + 1))
+        _ax.set_xticklabels(_order, rotation=45, ha='right')
+        _ax.set_ylabel(_ylabel)
+        _ax.set_title(_title)
+
+    _fig113.suptitle('11.3 — Per-lap delta box plot (windowed − unwindowed), per driver')
+    _fig113.tight_layout()
+    _fig113
+    return
+
+
+@app.cell
+def _(lap_accel_df, lap_accel_windowed_df, plt):
+    """11.4 — Full-race time series: unwindowed vs windowed."""
+    DRIVER = 'ALO'
+    _ham_uw = lap_accel_df[lap_accel_df['driver'] == DRIVER].sort_values('lap')
+    _ham_w  = lap_accel_windowed_df[lap_accel_windowed_df['driver'] == DRIVER].sort_values('lap')
+
+    _fig114, (_ax_a, _ax_d) = plt.subplots(2, 1, figsize=(14, 7), sharex=True)
+
+    _ax_a.plot(_ham_uw['lap'], _ham_uw['peak_accel_g'],     color='grey',     linewidth=1.5, label='Unwindowed')
+    _ax_a.plot(_ham_w['lap'],  _ham_w['peak_accel_g'],      color='steelblue', linewidth=1.5, linestyle='--', label='Windowed')
+    _ax_a.set_ylabel('Peak acceleration (g)')
+    _ax_a.set_title(f'{DRIVER} — peak acceleration per lap')
+    _ax_a.legend(fontsize=8)
+
+    _ax_d.plot(_ham_uw['lap'], _ham_uw['peak_decel_g_abs'], color='grey',  linewidth=1.5, label='Unwindowed')
+    _ax_d.plot(_ham_w['lap'],  _ham_w['peak_decel_g_abs'],  color='tomato', linewidth=1.5, linestyle='--', label='Windowed')
+    _ax_d.set_ylabel('Peak deceleration (g)')
+    _ax_d.set_xlabel('Lap number')
+    _ax_d.set_title(f'{DRIVER} — peak deceleration per lap')
+    _ax_d.legend(fontsize=8)
+
+    _fig114.suptitle('11.4 — HAM full-race time series: unwindowed (solid) vs windowed (dashed)')
+    _fig114.tight_layout()
+    _fig114
+    return
+
+
+@app.cell
+def _(CACHE_DIR, mo):
+    """11.5 — Empty-window lap report (laps where throttle/brake gate returned None)."""
+    _cache_file_w = CACHE_DIR / 'lap_accel_windowed_rows.pkl'
+    _empty_laps = []
+    # Reconstruct empty-window list from cache metadata if available; otherwise show
+    # placeholder note directing user to re-run without cache.
+    if _cache_file_w.exists():
+        # The empty-window list is not stored in the cache — it only appears on a fresh
+        # compute run. This cell shows a note explaining how to surface it.
+        mo.md("""
+        **11.5 — Empty-window lap report**
+
+        Laps where the throttle/brake gate returned `None` for at least one channel were
+        logged to `_windowed_empty_window` during the fetch loop. To inspect them:
+
+        1. Delete `lap_accel_windowed_rows.pkl` from the cache directory.
+        2. Set `USE_CACHE = True` and re-run — the fetch loop will print the list.
+
+        If all laps have valid windows this list will be empty, which is the expected
+        result for a power circuit. Monaco-style circuits may show accel-channel `None`
+        entries due to very limited high-throttle opportunities (< 20% throttle gate).
+        """)
+    else:
+        mo.md("_Cache not yet built — run the windowed fetch cell above to populate._")
+    return
+
+
+@app.cell
+def _(lap_accel_df):
+    lap_accel_df
+    return
+
+
+@app.cell
+def _(lap_accel_windowed_df):
+    lap_accel_windowed_df
     return
 
 

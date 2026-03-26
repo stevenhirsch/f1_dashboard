@@ -605,15 +605,212 @@ def ingest_championship_teams(client: Client, session_key: int) -> None:
 # Derived metrics (Phase 5)
 # ---------------------------------------------------------------------------
 
-def recompute_lap_metrics(client: Client, session_key: int) -> None:
-    """
-    Regenerate derived metrics in `lap_metrics` for a session.
+def _compute_peak_g(
+    car_data_records: list[dict],
+    fs: float = 4.0,
+    cutoff: float = 0.5,
+) -> tuple[float | None, float | None] | None:
+    """Windowed peak longitudinal acceleration and deceleration for one lap.
 
-    Not yet implemented — see Phase 5 of the roadmap.
-    Run with `--recompute` to invoke this after Phase 5 is built.
+    Pipeline-side port of the validated research computation (noise.py Section 9).
+    Returns (peak_accel_g, peak_decel_g_abs) — both positive floats — or None for
+    either channel if the throttle/brake gate produces no valid samples, or None
+    (not a tuple) if the raw data is insufficient to process.
+
+    Signal processing:
+      dedup → PCHIP resample to 4 Hz grid → 4th-order Butterworth low-pass at
+      0.5 Hz → differentiate → convert to g.
+
+    Throttle/brake windowing (left-edge convention, shape N-1 to match diff output):
+      accel_mask  = throttle_reg[:-1] > 20          (>20 % throttle → genuine power)
+      decel_mask  = throttle_reg[:-1] < 20 | brake_reg[:-1] > 0  (lifting/braking)
+
+    Plausibility bounds are NOT applied here; the caller (ingest_race_peak_g_summary)
+    applies them when computing the 'clean' race averages.
     """
-    print("  [skip] lap_metrics computation not yet implemented (Phase 5)")
-    print("         Run `ingest.py --session <key> --recompute` again after Phase 5.")
+    import numpy as np
+    import pandas as pd
+    from scipy.interpolate import PchipInterpolator
+    from scipy.signal import butter, filtfilt
+
+    if not car_data_records or len(car_data_records) < 20:
+        return None
+
+    df = pd.DataFrame(car_data_records)
+    df['date'] = pd.to_datetime(df['date'])
+    df = df.sort_values('date').reset_index(drop=True)
+
+    same     = df['speed'].diff().eq(0)
+    group_id = (~same).cumsum()
+    run_len  = group_id.map(group_id.value_counts())
+    clean    = df[run_len < 8]
+    if len(clean) < 10:
+        return None
+
+    t_ctrl     = clean['date'].astype(np.int64).to_numpy() / 1e9
+    throttle_r = clean['throttle'].to_numpy().astype(float)
+    brake_r    = clean['brake'].to_numpy().astype(float)
+
+    t     = t_ctrl.copy()
+    v     = clean['speed'].to_numpy().astype(float)
+    pchip = PchipInterpolator(t, v)
+    t_reg = np.arange(t[0], t[-1], 1 / fs)
+    if len(t_reg) < 32:
+        return None
+    v_reg = pchip(t_reg)
+
+    # Throttle: linear interp (smooth, 20 % gate is coarse enough).
+    # Brake: nearest-neighbour (preserves binary 0/100 character; linear would
+    # produce fractional values at step edges, corrupting the brake > 0 test).
+    throttle_reg = np.clip(np.interp(t_reg, t_ctrl, throttle_r), 0, 100)
+    brake_reg    = np.clip(np.round(np.interp(t_reg, t_ctrl, brake_r) / 100) * 100, 0, 100)
+
+    b, a    = butter(N=4, Wn=cutoff / (fs / 2), btype='low')
+    padlen  = min(len(v_reg) // 4, int(5 * fs))
+    v_filt  = filtfilt(b, a, v_reg, padlen=padlen)
+
+    accel_g = np.diff(v_filt) / (1 / fs) * (1000 / 3600) / 9.81
+
+    thr = throttle_reg[:-1]
+    brk = brake_reg[:-1]
+    accel_mask = thr > 20
+    decel_mask = (thr < 20) | (brk > 0)
+
+    accel_cand = accel_g[accel_mask]
+    decel_cand = accel_g[decel_mask]
+
+    peak_accel_g     = float(np.max(accel_cand))          if len(accel_cand) > 0 else None
+    peak_decel_g_abs = float(abs(np.min(decel_cand)))     if len(decel_cand) > 0 else None
+
+    return peak_accel_g, peak_decel_g_abs
+
+
+def ingest_lap_metrics(
+    client: Client,
+    session_key: int,
+    laps: list[dict],
+) -> dict[int, list[tuple[float, float]]]:
+    """Compute windowed peak g per lap and upsert into `lap_metrics`.
+
+    Uses a single get_car_data call per driver (full race window) and slices
+    client-side, matching the batch-fetch pattern used throughout the pipeline.
+
+    Returns a dict mapping driver_number → list of (peak_accel_g, peak_decel_g_abs)
+    for use by ingest_race_peak_g_summary.  Laps where _compute_peak_g returns None
+    or either channel is None are silently excluded from the dict (they are not
+    upserted to lap_metrics either).
+    """
+    import pandas as pd
+
+    # Group non-pit-out laps by driver, sorted by date_start.
+    from collections import defaultdict
+    laps_by_driver: dict[int, list[dict]] = defaultdict(list)
+    for lap in laps:
+        dn = lap.get('driver_number')
+        if dn is not None and not lap.get('is_pit_out_lap') and lap.get('date_start'):
+            laps_by_driver[dn].append(lap)
+
+    rows: list[dict] = []
+    driver_stats: dict[int, list[tuple[float, float]]] = {}
+
+    for dn, driver_laps in laps_by_driver.items():
+        driver_laps = sorted(driver_laps, key=lambda x: x['date_start'])
+        if len(driver_laps) < 2:
+            continue
+
+        raw = openf1.get_car_data(
+            session_key, dn,
+            driver_laps[0]['date_start'],
+            driver_laps[-1]['date_start'],
+        )
+        if not raw:
+            continue
+
+        df_all = pd.DataFrame(raw)
+        df_all['date'] = pd.to_datetime(df_all['date'])
+        df_all = df_all.sort_values('date').reset_index(drop=True)
+
+        lap_stats: list[tuple[float, float]] = []
+        for i in range(len(driver_laps) - 1):
+            lap      = driver_laps[i]
+            lap_num  = lap.get('lap_number', i + 1)
+            t0       = pd.to_datetime(lap['date_start'])
+            t1       = pd.to_datetime(driver_laps[i + 1]['date_start'])
+            lap_data = df_all[(df_all['date'] >= t0) & (df_all['date'] < t1)]
+
+            result = _compute_peak_g(lap_data.to_dict('records'))
+            if result is None:
+                continue
+            peak_accel, peak_decel_abs = result
+            if peak_accel is None or peak_decel_abs is None:
+                continue
+
+            rows.append({
+                'session_key':    session_key,
+                'driver_number':  dn,
+                'lap_number':     lap_num,
+                'peak_accel_g':   round(peak_accel,     4),
+                'peak_decel_g_abs': round(peak_decel_abs, 4),
+            })
+            lap_stats.append((peak_accel, peak_decel_abs))
+
+        if lap_stats:
+            driver_stats[dn] = lap_stats
+
+    _upsert(client, 'lap_metrics', rows)
+    return driver_stats
+
+
+def ingest_race_peak_g_summary(
+    client: Client,
+    session_key: int,
+    driver_stats: dict[int, list[tuple[float, float]]],
+) -> None:
+    """Aggregate per-lap peak g into per-driver race means and upsert to `race_results`.
+
+    Two averages per channel:
+      mean_peak_*          — all laps (raw windowed values)
+      mean_peak_*_clean    — laps within plausibility bounds (accel ≤ 4 g, decel ≤ 8 g)
+
+    Bounds are not applied at the lap_metrics level so outlier laps remain
+    inspectable in that table.
+    """
+    _ACCEL_BOUND = 4.0   # g — above this a lap is considered a noise artefact
+    _DECEL_BOUND = 8.0   # g — above this a lap is considered a noise artefact
+
+    rows: list[dict] = []
+    for dn, stats in driver_stats.items():
+        accels = [s[0] for s in stats]
+        decels = [s[1] for s in stats]
+        accels_clean = [a for a in accels if a <= _ACCEL_BOUND]
+        decels_clean = [d for d in decels if d <= _DECEL_BOUND]
+
+        rows.append({
+            'session_key':              session_key,
+            'driver_number':            dn,
+            'mean_peak_accel_g':        round(sum(accels) / len(accels), 4),
+            'mean_peak_accel_g_clean':  round(sum(accels_clean) / len(accels_clean), 4) if accels_clean else None,
+            'mean_peak_decel_g_abs':    round(sum(decels) / len(decels), 4),
+            'mean_peak_decel_g_abs_clean': round(sum(decels_clean) / len(decels_clean), 4) if decels_clean else None,
+        })
+
+    _upsert(client, 'race_results', rows)
+
+
+def recompute_lap_metrics(client: Client, session_key: int, laps: list[dict], session_type: str) -> None:
+    """Regenerate derived metrics for a session.
+
+    Currently computes windowed peak longitudinal g per lap (lap_metrics table)
+    and per-driver race averages (race_results table).  Only runs for race/sprint
+    sessions — qualifying has no meaningful deceleration/acceleration comparison.
+    """
+    if session_type not in ('race', 'sprint'):
+        print(f"  [skip] lap_metrics: session type '{session_type}' — race/sprint only")
+        return
+    print("  computing windowed peak g per lap …")
+    driver_stats = ingest_lap_metrics(client, session_key, laps)
+    ingest_race_peak_g_summary(client, session_key, driver_stats)
+    print(f"  lap_metrics: {sum(len(v) for v in driver_stats.values())} laps across {len(driver_stats)} drivers")
 
 
 # ---------------------------------------------------------------------------
@@ -668,7 +865,7 @@ def process_session(client: Client, session_key: int, recompute: bool = False) -
         ingest_starting_grid(client, session_key)
 
     if recompute:
-        recompute_lap_metrics(client, session_key)
+        recompute_lap_metrics(client, session_key, laps, session_type)
 
     elapsed = time.time() - t0
     stats = openf1.get_stats()

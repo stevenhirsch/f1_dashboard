@@ -155,8 +155,8 @@ All tables populated correctly for meeting 1280 (2026 Chinese GP).
 ## Known Issues / Decisions Made
 - `race_results.status_detail` is always null — DNF/DSQ reasons need to be parsed from `race_control` messages; deferred
 - `race_results.fastest_lap_flag` is always null — not yet sourced from the API
-- `lap_metrics` table exists in schema but is empty — populated in Phase 5
-- `--recompute` flag is wired up but no-ops until Phase 5
+- `lap_metrics` table exists in schema but needs `peak_accel_g` and `peak_decel_g_abs` columns added before `--recompute` can populate it
+- `--recompute` is now functional for peak G (race/sprint); remaining Phase 5 metrics (coasting, DRS, battle states, etc.) still pending
 - `overtakes` table is empty for session 11245 (Race) — OpenF1 may not have this data populated yet for the 2026 Chinese GP race session; sprint overtakes (11240) are present
 - **OpenF1 sprint stints data gap (session 11240):** The OpenF1 `/stints` endpoint only returns `stint_number=2` for drivers who pitted during the sprint (all pitted around lap 13 under SC). Their first stints (laps 1–13) are completely absent from the OpenF1 API — confirmed by direct API query. The dashboard renders a gray "Unknown compound" placeholder bar for the missing laps. This may be a permanent OpenF1 data gap or a delayed population issue. Candidate for a GitHub issue against OpenF1. Affected drivers: 1, 3, 6, 11, 12, 16, 18, 23, 43, 44, 63, 81 (session 11240).
 - **OpenF1 qualifying stint data incomplete:** Many drivers show no stint match for Q1/Q2 laps even though they participated. `computePhaseStints` falls back to `overallBest` (best lap duration regardless of stint match) so times always display; compound badges just show empty for unmatched phases.
@@ -199,6 +199,38 @@ All tables populated correctly for meeting 1280 (2026 Chinese GP).
 
 ---
 
+### Signal Processing Research — Complete (2026-03-26)
+
+**`research/car_velocity/noise.py`** — full signal processing pipeline validated across all 20 drivers for the 2026 Chinese GP race session.
+
+- **Sections 1–8:** Validated that raw `diff(speed)/dt` is too noisy for reliable peak G. Established 4th-order Butterworth low-pass at 0.5 Hz as the correct cutoff — eliminates structured noise in the 0.5–2 Hz band without distorting the true acceleration envelope. 0.75 Hz reintroduced high/low outliers; 0.5 Hz did not.
+- **Sections 9–10:** Scaled to all race laps for all 20 drivers. Plausibility bounds: accel ≤ 4 g and decel ≤ 8 g used for exclusion (not clipping — avoids artificial pile-up at boundary).
+- **Section 11:** Windowed vs. unwindowed comparison across 5 visualisations. Confirmed throttle/brake gating (accel: throttle > 20%, decel: throttle < 20% OR brake > 0) produces more physically meaningful peaks. Several drivers showed noise-driven decel spikes outside braking windows that inflated the unwindowed values. 20% throttle gate validated for power circuits; Monaco-style circuits may yield fewer valid accel windows and are flagged as a future revisit.
+
+**Key validated findings (now pipeline-standard):**
+- 0.5 Hz Butterworth cutoff is pipeline-wide for all speed-derived metrics
+- Windowed approach (throttle/brake gating) is strictly better than global max/min for race averages
+- Brake is nearest-neighbour resampled (preserves binary 0/100 character); throttle is linearly interpolated
+- Left-edge alignment: `accel_g[i]` spans `[t_reg[i], t_reg[i+1]]` → masks use `throttle_reg[:-1]`
+
+---
+
+### Phase 5 — Derived Metrics Pipeline (Partial) — In Progress (2026-03-26)
+
+**Implemented:**
+- `_compute_peak_g(car_data_records)` in `ingest.py` — validated windowed pipeline: dedup → PCHIP → 0.5 Hz Butterworth → diff → throttle/brake gating. Returns `(peak_accel_g, peak_decel_g_abs)` (both positive floats, either can be `None`), or `None` for insufficient data.
+- `ingest_lap_metrics(client, session_key, laps)` — one `get_car_data` call per driver for the full race window, sliced client-side per lap. Upserts `peak_accel_g` and `peak_decel_g_abs` to `lap_metrics`.
+- `ingest_race_peak_g_summary(client, session_key, driver_stats)` — aggregates per-driver race-level means and upserts four new columns to `race_results`: `mean_peak_accel_g`, `mean_peak_accel_g_clean` (≤4 g laps only), `mean_peak_decel_g_abs`, `mean_peak_decel_g_abs_clean` (≤8 g laps only). The split between raw and clean averages preserves outlier visibility in `lap_metrics` while giving clean summary values for the race table.
+- `recompute_lap_metrics` now fully functional for race/sprint sessions. Invoked via `ingest.py --session <key> --recompute`.
+- numpy, scipy, pandas added to `[feature.pipeline.dependencies]` in `pixi.toml`.
+- 12 new tests; total now 156 (all passing).
+
+**Schema changes required in Supabase before running `--recompute`:**
+- `lap_metrics`: add `peak_accel_g float`, `peak_decel_g_abs float` columns
+- `race_results`: add `mean_peak_accel_g float`, `mean_peak_accel_g_clean float`, `mean_peak_decel_g_abs float`, `mean_peak_decel_g_abs_clean float` columns
+
+---
+
 ### Phase 4 — Polish and Public Release — Complete (2026-03-22)
 
 **Mobile fixes (2026-03-22):**
@@ -220,33 +252,33 @@ All tables populated correctly for meeting 1280 (2026 Chinese GP).
 
 ## Where to Pick Up Next
 
-### Phase 5 — Derived Metrics Pipeline
+### Phase 5 — Derived Metrics Pipeline (continuing)
 
-Full scope documented in `product_roadmap.md`. Key implementation tasks:
+Full scope documented in `product_roadmap.md`. Peak G (longitudinal) is the first metric implemented. Next steps:
 
-**Schema migrations (run against Supabase):**
-- Add `wind_speed`, `wind_direction`, `pressure` to `weather`
-- Add `circuit_length_km` to `races`
-- Add `points_gap_to_leader`, `points_gap_to_p2` to `championship_drivers` and `championship_teams`
-- Define full `lap_metrics` column set (currently exists but empty)
-- Create `session_sector_bests` table
-- Create `stint_metrics` table
-- Create `season_driver_stats` table (keyed on year, driver_number, meeting_key)
-- Create `season_constructor_stats` table (keyed on year, team_name, meeting_key)
-- Create `circuits` reference table
+**Immediate — schema migrations needed in Supabase:**
+- `lap_metrics`: add `peak_accel_g float`, `peak_decel_g_abs float`
+- `race_results`: add `mean_peak_accel_g float`, `mean_peak_accel_g_clean float`, `mean_peak_decel_g_abs float`, `mean_peak_decel_g_abs_clean float`
+- Still needed for remaining Phase 5 metrics: `wind_speed`/`wind_direction`/`pressure` in `weather`; `circuit_length_km` in `races`; full `lap_metrics` column set; `session_sector_bests`, `stint_metrics`, `season_driver_stats`, `season_constructor_stats`, `circuits` tables
 
-**Pipeline work:**
-- `pipeline/seed_circuits.py` — one-off script to populate `circuits` table for all circuits from 2023 onwards
-- `ingest.py` — implement the 8-step ingestion order (see roadmap Phase 5)
-- Step 4 (car_data fetch) is the most expensive: 20 API calls per session, needs careful batching against rate limits
-- **API efficiency rule:** always fetch the broadest useful time window in a single call and segment client-side — never loop per-lap over the API. Per-lap loops (20 drivers × 55 laps = 1,100 calls) reliably hit the OpenF1 sustained limit (30 req/min) even with inter-call sleeps. Learned during `research/car_velocity/noise.py` Section 9.
+**Next pipeline work:**
+- Extend `recompute_lap_metrics` to qualifying sessions — per-lap peak G stored in `lap_metrics` using the same `_compute_peak_g` function; session-level aggregate to `qualifying_results` (best-lap peak G per phase, not an average). See roadmap Phase 5.
+- Cornering G estimation research — lateral G from XY location data + speed. Research notebook first, pipeline second. See roadmap Phase 5 for full scope.
+- Remaining car_data metrics: coasting ratio/distance, throttle/brake overlap, full throttle %, throttle input variance, DRS activation/distance, max speed per sector, brake zone count, mean peak decel per sector.
+- Battle states: gap_ahead/behind per sector from intervals × sector timestamps.
+- `pipeline/seed_circuits.py` — one-off script to populate `circuits` reference table.
+- `race_results.fastest_lap_flag` — derive from min `lap_duration` among classified finishers.
 
-**Signal definitions to encode in pipeline:**
-- Coasting: `throttle < 1% AND brake == 0` (not strict zero — document this consistently)
-- Brake is boolean in OpenF1 — no derivative; `throttle_input_variance` is throttle-only (higher = rougher inputs)
-- Battle states computed per sector (3 snapshots per lap per driver from intervals × sector timestamps)
-- `is_estimated_clean_air`: gap_ahead > 2s across all sectors (gap_behind condition dropped; subject to refinement)
+**API efficiency rule (established, do not regress):**
+Always fetch the broadest useful time window in a single call and segment client-side. Per-lap loops (20 drivers × 55 laps = 1,100 calls) reliably hit the OpenF1 sustained limit. Learned during `research/car_velocity/noise.py` Section 9, implemented in `ingest_lap_metrics`.
+
+**Signal definitions (established, encode consistently):**
+- Coasting: `throttle < 1%` AND `brake == 0` (not strict zero — light lift-and-glide)
+- Brake is boolean (0 or 100) in OpenF1 — no derivative is meaningful
+- `throttle_input_variance` is throttle-only (higher = rougher inputs)
+- Peak G uses windowed approach: accel gate = throttle > 20%, decel gate = throttle < 20% OR brake > 0
+- `is_estimated_clean_air`: gap_ahead > 2s across all sectors (gap_behind condition dropped)
 
 **Backfill:**
 - Run `python pipeline/ingest.py --year 2025` then 2024, 2023
-- Car data metrics will be computed for all history; raw 3.7Hz data is not stored
+- Car data metrics computed for all history; raw 3.7 Hz telemetry not stored

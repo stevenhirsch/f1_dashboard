@@ -73,6 +73,9 @@ weather              — track temp, air temp, humidity, rainfall, wind_speed, w
                        pressure per session
 race_results         — position, gap, DNF/DSQ with reason, pit count, fastest lap flag
                        (fastest_lap_flag derived from minimum lap_duration among classified finishers)
+                       + mean_peak_accel_g, mean_peak_accel_g_clean, mean_peak_decel_g_abs,
+                         mean_peak_decel_g_abs_clean — per-driver race averages from lap_metrics
+                         (_clean variants exclude laps exceeding plausibility bounds: accel ≤ 4 g, decel ≤ 8 g)
 qualifying_results   — Q1/Q2/Q3 best times, compounds, lap counts, delta to pole
 overtakes            — overtaking/overtaken driver, position, lap number, date
 
@@ -287,17 +290,44 @@ circuits             — static reference table: circuit_key, name, location, co
 ---
 
 ### Phase 5 — Derived Metrics Pipeline
-- Status: Incomplete
+- Status: **Partial — Peak G (longitudinal) implemented 2026-03-26**
 *All computed at ingestion time. Populates `lap_metrics`, `stint_metrics`, `session_sector_bests`, `season_driver_stats`, `season_constructor_stats`. Unlocks Phase 6 and the chatbot data model.*
 
 **Signal notes**
-- OpenF1 `brake` is boolean (0/100) — no derivative is meaningful for brake
-  - An alternative is to compute deceleration of the car. Although this doesn't capture braking strategies of the driver, it does capture the outputs of their braking strategies (i.e., brake pressure changes throghout a race may change how a driver uses their brakes to create deceleration profiles)
+- OpenF1 `brake` is boolean (0/100) — no derivative is meaningful for brake; deceleration of the car is computed instead (output of braking strategy, not the inputs)
 - Coasting uses `throttle < 1%` threshold, not strict zero — captures light lift-and-glide; annotate this definition in UI labels and chatbot descriptions for consistency
 - Car data is fetched at ingestion per driver per session (3.7 Hz), metrics computed, raw data discarded — not stored
+- **Peak G signal processing (validated in `research/car_velocity/noise.py`):** dedup → PCHIP resample to 4 Hz → 4th-order Butterworth low-pass at 0.5 Hz → diff → throttle/brake gating. Cutoff of 0.5 Hz is pipeline-wide standard. Windowed approach (throttle > 20% for accel, throttle < 20% OR brake > 0 for decel) is strictly better than global max/min. Brake resampled nearest-neighbour; throttle linearly interpolated.
 
 **`lap_metrics` — car-data derived (per lap per driver)**
-- **all metrics should be computed per sector where possible; this is not always indicated below, but the variable names should also use the same patterning for each sector of the race and provide an overall lap metric**
+*All metrics computed per sector where possible. Variable names follow `_s1/_s2/_s3/_lap` suffix convention.*
+
+**Longitudinal G — Implemented (race/sprint) ✅**
+- `peak_accel_g` — windowed peak acceleration (throttle > 20% gate); 4th-order 0.5 Hz Butterworth on speed before diff; positive float or null
+- `peak_decel_g_abs` — windowed peak deceleration magnitude (throttle < 20% OR brake > 0 gate); positive float or null
+- Both stored at lap level; plausibility bounds (accel ≤ 4 g, decel ≤ 8 g) applied only at the race_results summary level — raw per-lap values remain inspectable
+
+**Longitudinal G — Qualifying extension (scoped, not yet implemented)**
+- Same `_compute_peak_g` function applies unchanged; `recompute_lap_metrics` needs to run for qualifying sessions (currently race/sprint only)
+- Session-level qualifying aggregate goes to `qualifying_results` — use best-lap peak G per phase (Q1/Q2/Q3), not an average across all qualifying laps (a driver's best lap is the representative effort; averaging all their laps conflates flying and out/in-laps even after filtering)
+- New columns: `q1_peak_accel_g`, `q1_peak_decel_g_abs`, `q2_*`, `q3_*` — keyed to the lap that produced the best time in that phase (not independently optimised peak G laps)
+- The 20% throttle gate and Monaco caveat apply identically; qualifying laps are by nature high-throttle flying laps so empty accel windows are unlikely except in extreme cases
+- Schema: add 6 nullable float columns to `qualifying_results`
+
+**Lateral G — Cornering estimation (scoped, not yet implemented)**
+- Goal: estimate peak lateral G per lap and per sector from XY position data + speed; stored as `peak_lateral_g_s1/s2/s3/lap` in `lap_metrics`
+- **Data sources:** `get_location(session_key, driver_number, date_start, date_end)` → x, y, z at ~3.7 Hz (independent timestamp sequence from car_data); `get_car_data` → speed at ~3.7 Hz
+- **Method (heading-rate approach):** resample both streams onto a common 4 Hz grid via PCHIP; apply smoothing to XY before differentiation (Butterworth, cutoff TBD — likely 0.3–0.4 Hz given XY noise characteristics); compute heading angle θ = atan2(Δy, Δx); angular rate ω = Δθ/Δt; lateral_G = v × ω / 9.81. Alternative: curvature method κ = |x'y'' - y'x''| / (x'² + y'²)^(3/2), lateral_G = v² × κ / 9.81 — mathematically equivalent but curvature is noisier to compute directly.
+- **Key unknowns to resolve in research notebook first:**
+  1. Coordinate units and scale: OpenF1 XY may not be in metres — determine scale factor by integrating speed over time and comparing to known `circuit_length_km`
+  2. Noise characteristics of XY at 3.7 Hz: plot a full lap, check if track outline is recognisable; raw curvature will reveal noise floor
+  3. Appropriate smoothing cutoff for XY vs. speed (different sensor, different noise spectrum)
+  4. Corner-to-sector assignment: lateral G peaks need to be mapped to sectors using time-based sector boundaries (lap_start UTC + cumulative sector times from laps table)
+  5. Validation: peak lateral G at known high-G corners (e.g., Eau Rouge ~4–5 g at ~280 km/h, Maggots/Becketts ~3–4 g) provides a sanity check on scale and smoothing
+- **Pipeline integration:** `ingest_lap_metrics` already fetches `get_car_data` per driver; add a parallel `get_location` call in the same loop, merge by nearest timestamp onto the common 4 Hz grid, compute lateral G after longitudinal G. One additional API call per driver per session.
+- **Research first:** build in `research/car_velocity/` before encoding in pipeline. Validate on one race session; assess whether 3.7 Hz + smoothing produces reliable per-corner estimates before committing to the pipeline schema.
+
+**Remaining car-data metrics (not yet implemented):**
 - `coasting_ratio_s1/s2/s3/lap` — proportion of samples where throttle < 1% AND brake == 0
 - `coasting_distance_m_s1/s2/s3/lap` — metres accumulated under same condition; proxy for energy regeneration in 2026+ regulations
 - `throttle_brake_overlap_ratio_s1/s2/s3/lap` — proportion of samples where brake == 1 AND throttle ≥ 10% (trail braking proxy)
@@ -307,11 +337,8 @@ circuits             — static reference table: circuit_key, name, location, co
 - `drs_distance_m` — metres driven with DRS open
 - `max_speed_kph_s1/s2/s3/lap` — max speed from car_data within each sector; lap = max across all sectors (distinct from speed trap, which is a fixed point)
   - Sector boundaries derived from lap start UTC + cumulative sector times
-- `max_linear_acceleration_g_s1/s2/s3/lap` — max(diff(speed_kph) * sampling_freq), converted to g; lap = max across all sectors
-  - No smoothing applied yet; use actual sampling frequency from data, not hardcoded 3.7
-- `max_linear_deceleration_g_s1/s2/s3/lap` - min(diff(speed_kph) * sampling_freq), converted to g
-  - No smoothing applied yet; used to get an indication of how hard someone is braking
-  - Lap value = min across all three sectors (i.e., the hardest single braking point in the lap)
+- `max_linear_acceleration_g_s1/s2/s3/lap` — windowed peak accel per sector (same gating as `peak_accel_g`); lap = max across sectors
+- `max_linear_deceleration_g_s1/s2/s3/lap` — windowed peak decel per sector; lap = min (hardest single braking point)
   - Per-turn granularity deferred — requires corner coordinate reference data in `circuits` table
 - `brake_zone_count_s1/s2/s3/lap` — number of distinct braking events per sector; lap = sum of s1+s2+s3
   - A braking event is a contiguous window of negative speed deltas exceeding a threshold (e.g., decel > 0.5g)
@@ -326,8 +353,10 @@ circuits             — static reference table: circuit_key, name, location, co
 - `brake_entry_speed_z_score_s1/s2/s3/lap` — z-score of speed_at_brake_start_kph relative to session mean/SD for that sector; lap = z-score on lap-level value
   - Stored alongside percentile rank since braking distributions are unlikely to be normal; z-score adds magnitude of deviation from mean when distribution happens to be well-behaved
 - `brake_entry_speed_category_s1/s2/s3/lap` — categorical label derived from brake_entry_speed_pct_rank: 'early' (0–33), 'average' (34–66), 'late' (67–100)
-- `max_lateral_g_s1/s2/s3` - estimates of the max lateral g forces on each turn
-  - Advanced, doing this later as we need to build more logic around how to do this.
+- `peak_lateral_g_s1/s2/s3/lap` — peak lateral G from XY + speed estimation (see Lateral G scope above)
+- `accumulated_linear_acceleration_g_s1/s2/s3/lap` - some potential aggregation of all accelerations, not just the peak
+- `accumulated_linear_deceleration_g_21/s2/s3/lap` - some potenteial aggregation of all decelerations, not just the peak
+- `accumulated_lateral_g_s1/s2/s3/lap` - some potential aggregation of all lateral g, not just the peak
 
 **`lap_metrics` — battle and proximity states (per sector per lap)**
 Derived from intervals timestamps cross-referenced with sector boundary times from `laps`.
