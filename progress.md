@@ -239,6 +239,7 @@ Full scope documented in `product_roadmap.md`. Key implementation tasks:
 - `pipeline/seed_circuits.py` — one-off script to populate `circuits` table for all circuits from 2023 onwards
 - `ingest.py` — implement the 8-step ingestion order (see roadmap Phase 5)
 - Step 4 (car_data fetch) is the most expensive: 20 API calls per session, needs careful batching against rate limits
+- **API efficiency rule:** always fetch the broadest useful time window in a single call and segment client-side — never loop per-lap over the API. Per-lap loops (20 drivers × 55 laps = 1,100 calls) reliably hit the OpenF1 sustained limit (30 req/min) even with inter-call sleeps. Learned during `research/car_velocity/noise.py` Section 9.
 
 **Signal definitions to encode in pipeline:**
 - Coasting: `throttle < 1% AND brake == 0` (not strict zero — document this consistently)

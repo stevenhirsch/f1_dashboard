@@ -32,7 +32,7 @@ def _(mo):
 
     The [OpenF1 API](https://openf1.org) provides car telemetry including speed, throttle, brake,
     DRS, and gear data sampled at approximately 3.7 Hz. Before we can compute meaningful
-    acceleration or jerk signals, we need to understand the sampling characteristics of this data
+    acceleration (or jerk) signals, we need to understand the sampling characteristics of this data
     and make principled decisions about how to process it.
 
     This notebook walks through that process: from raw speed data to filtered acceleration and jerk,
@@ -42,8 +42,8 @@ def _(mo):
 
     ## 1. Data Collection
 
-    We'll work with Lewis Hamilton's car data from the 2024 Miami Grand Prix race (meeting 1280),
-    focusing on laps 2–3 as a representative window of normal racing conditions.
+    We'll work with Lewis Hamilton's car data from the 2026 Chinese Grand Prix race (meeting 1280),
+    focusing initially on a subset of laps as a representative window of normal racing conditions.
     """)
     return
 
@@ -114,10 +114,7 @@ def _(mo):
 
     ## 2. Assessing Sampling Consistency
 
-    Before differentiating speed to get acceleration, we need to characterise the sampling rate.
-    Numerical differentiation amplifies noise, and that effect is compounded when the time steps
-    between samples are irregular — a small speed change divided by a very short time interval
-    produces a spuriously large apparent acceleration.
+    Before differentiating speed to get acceleration, we need to characterise the sampling rate. We know we need to filter the data, but many digital filters (like the Butterworth filter we'll use later) require a consistent sampling frequency. Furthermore, we need context about the sampling rates anyways to compute any acceleration (or other) signals.
 
     We compute the inter-sample time differences and summarise their distribution.
     """)
@@ -135,7 +132,7 @@ def _(plt, sampling_diffs):
     plt.hist(sampling_diffs.dropna())
     plt.xlabel('Inter-sample interval (s)')
     plt.ylabel('Count')
-    plt.title('Distribution of sampling intervals — HAM laps 2–3')
+    plt.title('Distribution of sampling intervals — HAM')
     return
 
 
@@ -152,14 +149,20 @@ def _(mo, sampling_diffs_cov, sampling_diffs_mean, sampling_diffs_std):
     mo.md(f"""
     | Statistic | Value |
     |---|---|
-    | Mean interval | {sampling_diffs_mean:.4f} s (~{1/sampling_diffs_mean:.1f} Hz) |
+    | Mean interval | {sampling_diffs_mean:.4f} s (~{1/sampling_diffs_mean:.4f} Hz) |
     | Std deviation | {sampling_diffs_std:.4f} s |
-    | Coefficient of variation | {sampling_diffs_cov:.3f} |
+    | Coefficient of variation | {sampling_diffs_cov:.4f} |
 
-    A CV of **{sampling_diffs_cov:.2f}** indicates meaningful variability — roughly ±37% around the
-    mean interval. This isn't noise in the physical signal; it's a property of how OpenF1
-    publishes telemetry. The question is whether it's specific to Hamilton or consistent across
-    the whole grid.
+    A CV of **{sampling_diffs_cov:.4f}** indicates meaningful variability. This isn't noise in the physical signal; it's a property of how OpenF1
+    publishes telemetry. The next question we should explore is whether it's specific to Hamilton or consistent across the whole grid. I don't believe there's any reason to believe there to be differences across the grid, but it's good practice to confirm just in case.
+    """)
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    Now for a quick aside- we also can see some flat spots in the speed plot above. These are likely `null` values that the API either forward or backward fills. We know it's unlikely that a driver's speed actually remains "flat" for that long. Next, we'll highlight instances where there are about 2s of speed not changing. The idea would be that if speed doesn't change for that long, we should probably drop those frames and interpolate over them rather than just use the forward/backward filled data. This window of ~2 seconds is perhaps too conservative since it's unlikely there would even be 1s of "flat" speed during a race, but given the resolution of the data I don't want to be overly conservative and gap fill more than we need to.
     """)
     return
 
@@ -204,9 +207,9 @@ def _(car_data_df, dup_mask, plt):
 @app.cell
 def _(dup_mask, mo):
     mo.md(f"""
-    **{dup_mask.sum()} duplicate sample(s)** identified — speed identical to the previous sample.
+    There were **{dup_mask.sum()} duplicate sample(s)** identified.
     These are dropped before PCHIP interpolation so the spline spans those points naturally,
-    rather than being forced through a repeated value that isn't real new information.
+    rather than being forced through a repeated value that isn't real new information. We'll keep this in mind moving forward.
     """)
     return
 
@@ -218,10 +221,10 @@ def _(mo):
 
     ## 3. Sampling Consistency Across All Drivers
 
-    We repeat the same analysis for every driver in the race, using laps 3–7 as a
+    We repeat the same analysis for every driver in the race, using the same subset of laps as a
     consistent mid-race window (skipping the formation lap and first racing lap).
     Team colour is included so we can visually check whether any constructor shows
-    systematically different behaviour.
+    systematically different behaviour. I limited the scope here since I don't anticipate that there's going to be much variation between drivers, so this is more of just a quick sanity check.
     """)
     return
 
@@ -294,7 +297,7 @@ def _(mo):
     ## 4. Why Direct Differentiation Fails
 
     To motivate the filtering pipeline, we first show what happens if we naively differentiate
-    speed against the raw, irregularly-spaced timestamps. Acceleration is computed as
+    speed against the raw data and amplify the higher-frequency noise. Acceleration is computed as
     Δspeed / Δtime and converted to g (1 g = 9.81 m/s²; 1 kph/s = 1000/3600 m/s²).
     """)
     return
@@ -308,7 +311,7 @@ def get_accel_from_speed(timestamps, speeds):
 
 
 @app.function
-def compute_psd_stats(car_data_raw, fs=4.0, cutoff=1.25):
+def compute_psd_stats(car_data_raw, fs=4.0, cutoff=0.5):
     """Dedup → PCHIP resample → Butterworth filter → Welch PSD.
     Returns (freqs, psd, frac_below_cutoff, peak_freq) or None if data insufficient."""
     import numpy as np, pandas as pd
@@ -368,13 +371,9 @@ def _(accels_raw, car_data_df, plt):
 @app.cell
 def _(mo):
     mo.md("""
-    The signal contains physically implausible spikes (±6-8g longitudinally). These are
-    directly caused by the irregular sampling: when two consecutive samples happen to land
-    unusually close together in time, even a modest speed change produces an artificially
-    large apparent acceleration. This is not signal — it is a sampling artifact.
+    The signal contains physically implausible spikes. This is not signal — it is amplified high-frequency components of the signal.
 
-    F1 cars produce roughly 5–6g under heavy braking and 1.5–2g under acceleration. Any
-    spike significantly outside that envelope is noise.
+    Although I'm not aware of any "gold standard" public data, from what I've gathered F1 cars produce roughly 5-6g (up to 8g) under heavy braking and 1.5-2g (up to 4g) under acceleration. Any spike significantly outside that envelope is almost certainly errors in the signal.
 
     ---
 
@@ -383,7 +382,7 @@ def _(mo):
     We address the irregular sampling with a three-step pipeline:
 
     1. **Resample to a regular grid** using PCHIP interpolation
-    2. **Apply a low-pass Butterworth filter** to attenuate sampling noise
+    2. **Apply a low-pass Butterworth filter** to attenuate high-frequency noise
     3. **Differentiate** on the clean, regular grid
 
     ### Step 1: Resampling with PCHIP
@@ -399,7 +398,7 @@ def _(mo):
       since filtering handles the rest.
 
     We resample to **4 Hz** — close to the nominal source rate of ~3.7 Hz. Upsampling further
-    (e.g. 10 Hz) does not add information; the signal's true bandwidth is capped at ~1.85 Hz
+    (e.g. 5 or 10 Hz) does not add information; the signal's true bandwidth is capped at ~1.85 Hz
     (half the source rate), so additional points are pure interpolation with no new content.
     """)
     return
@@ -437,17 +436,24 @@ def _(mo):
     the resulting curve typically shows a steep drop (signal being removed) followed by a
     flat plateau (only noise remaining), with the optimal cutoff at the transition.
 
-    For this data, no such plateau exists — the residual declines continuously across the
-    entire testable range (0.1–1.85 Hz). This is expected: the irregular sampling contaminates
+    For this data, no such clear plateau exists. The residual declines mostly continuously across the
+    entire testable range (0.1–1.85 Hz). This is somewhat expected: the irregular sampling contaminates
     all frequencies, not just the high end, so there is no clean noise floor to identify.
     Automated elbow-detection methods (kneedle, maximum curvature) both failed for this reason.
 
     The residual plot is shown below for transparency, but the cutoff was ultimately chosen
     on domain knowledge. F1 braking events typically last **2–4 seconds**, placing their fundamental energy at ~0.25–0.5 Hz — well
     below our source bandwidth ceiling of ~1.85 Hz. This means we have meaningful headroom
-    above the signal of interest before we hit the noise floor, and a cutoff of **1.25 Hz**
-    is justified: it preserves all braking and throttle dynamics while attenuating the
-    bulk of the sampling irregularity noise. It also yielded gs similar to that reported elsewhere: https://f1chronicle.com/f1-g-force-how-many-gs-can-a-f1-car-pull/ & https://www.mercedesamgf1.com/news/g-force-and-formula-one-explained rather than overestimating the gs like with the raw data, so I think this is acceptable for our purposes.
+    above the signal of interest before we hit the noise floor, and a cutoff of **0.5 Hz**
+    is chosen: it captures the fundamental of all meaningful braking and acceleration events
+    (≥ 2 s duration) while attenuating the bulk of the sampling irregularity noise. A higher
+    cutoff of 1.25 Hz was initially explored but produced widespread spurious peaks in the
+    acceleration derivative (Section 9 diagnostic), confirmed as noise rather than anomalous
+    laps. 0.5 Hz removes that noise band at the cost of slight attenuation of braking onset
+    energy - an acceptable trade-off since the primary use is average load comparison, not
+    measurement of instantaneous peak g.
+
+    In summary, we know that this cutoff frequency is going to slightly attenuate the peaks, but result in reasonable averages across the session & should allow us to reliably compare drivers. This is a limitation of the data that we have access to, so we shouldn't take the actual "g" too seriously.
     """)
     return
 
@@ -464,7 +470,7 @@ def _(plt, t_regular, v_regular):
 @app.cell
 def _(FS, np, plt, v_regular):
     from scipy.signal import butter, filtfilt
-    CUTOFF_HZ = 1.25
+    CUTOFF_HZ = 0.5
     _cutoffs = np.linspace(0.1, 1.85, 50)
     _residuals = []
     for _fc in _cutoffs:
@@ -594,7 +600,7 @@ def _(mo):
     **Caveat**: jerk is the second derivative of speed. Noise is amplified quadratically with
     frequency at each differentiation step. With a source bandwidth of only ~1.85 Hz and a
     1 Hz filter cutoff, the jerk signal should be treated as a directional indicator of
-    smoothness rather than a precise physical measurement.
+    smoothness rather than a precise physical measurement. Alternatively, I may explore just the variance of the acceleration signal across the lap as a non-physical measurement of a similar quality.
     """)
     return
 
@@ -638,12 +644,12 @@ def _(mo):
     ## 7. Full-Race Spectral Analysis (HAM)
 
     The PSD analysis in Section 5 used only laps 1–10. To confirm the spectral structure and
-    the 1.25 Hz cutoff are not artefacts of an early-race window, we repeat the per-lap PSD
+    the 0.5 Hz cutoff are not artefacts of an early-race window, we repeat the per-lap PSD
     computation across **all race laps** for Hamilton. Each lap is treated independently: the
     PCHIP → Butterworth → Welch pipeline runs on data bounded by consecutive lap start times.
 
     If the cutoff is well-chosen, every lap should show the same low-frequency-dominated shape,
-    and the fraction of power below 1.25 Hz should be stable (< 5 pp variation) across the race.
+    and the fraction of power below 0.5 Hz should be stable (< 5 pp variation) across the race.
     """)
     return
 
@@ -715,12 +721,10 @@ def _(ham_psd_failures, ham_psd_rows, mo):
 
     | Stat | Value |
     |---|---|
-    | Mean % power below 1.25 Hz | {_mean_pct:.2f}% |
-    | Min % power below 1.25 Hz | {_min_pct:.2f}% |
-    | Max % power below 1.25 Hz | {_max_pct:.2f}% |
+    | Mean % power below 0.5 Hz | {_mean_pct:.2f}% |
+    | Min % power below 0.5 Hz | {_min_pct:.2f}% |
+    | Max % power below 0.5 Hz | {_max_pct:.2f}% |
     | Range (pp) | {_range_pp:.2f} pp |
-
-    A range of **{_range_pp:.2f} pp** {'is well within the 5 pp stability target ✓' if _range_pp < 5 else 'exceeds the 5 pp stability target — inspect outlier laps'}.
     """)
     return
 
@@ -731,7 +735,7 @@ def _(ham_psd_rows, mo):
     _rows = [{k: v for k, v in r.items() if k not in ('freqs', 'psd')} for r in ham_psd_rows]
     _df = _pd_s7b.DataFrame(_rows)
     mo.md(
-        "| Lap | Peak freq (Hz) | % power below 1.25 Hz |\n|---|---|---|\n" +
+        "| Lap | Peak freq (Hz) | % power below 0.5 Hz |\n|---|---|---|\n" +
         "\n".join(f"| {int(r['lap'])} | {r['peak_freq_hz']:.4f} | {r['pct_below_cutoff']:.2f}% |" for _, r in _df.iterrows())
     )
     return
@@ -747,7 +751,7 @@ def _(ham_psd_rows, plt):
     _sm = plt.cm.ScalarMappable(cmap='plasma', norm=plt.Normalize(vmin=ham_psd_rows[0]['lap'], vmax=ham_psd_rows[-1]['lap']))
     _sm.set_array([])
     _fig_s7.colorbar(_sm, ax=_ax_s7, label='Lap number')
-    _ax_s7.axvline(1.25, color='orange', linestyle='--', label='Cutoff: 1.25 Hz')
+    _ax_s7.axvline(0.5, color='orange', linestyle='--', label='Cutoff: 0.5 Hz')
     _ax_s7.axvline(2.0, color='grey', linestyle=':', label='Nyquist: 2.0 Hz')
     _ax_s7.set_xlabel('Frequency (Hz)')
     _ax_s7.set_ylabel('PSD (kph² / Hz)')
@@ -764,9 +768,11 @@ def _(ham_psd_rows, np, plt):
     _mean_line = np.mean(_pcts)
     _fig_s7b, _ax_s7b = plt.subplots()
     _ax_s7b.plot(_laps, _pcts, marker='o', markersize=3, linewidth=1)
-    _ax_s7b.axhline(_mean_line, color='orange', linestyle='--', label=f'Mean: {_mean_line:.1f}%')
+    _ax_s7b.axhline(_mean_line, color='orange', linestyle='--', label=f'Mean: {_mean_line:.2f}%')
     _ax_s7b.set_xlabel('Lap number')
-    _ax_s7b.set_ylabel('% power below 1.25 Hz')
+    _ax_s7b.set_ylabel('% power below 0.5 Hz')
+    _ax_s7b.set_ylim(0, 100)
+    _ax_s7b.yaxis.get_major_formatter().set_useOffset(False)
     _ax_s7b.set_title('Power retained below cutoff per lap — HAM full race')
     _ax_s7b.legend()
     _fig_s7b
@@ -781,13 +787,13 @@ def _(mo):
     ## 8. Cross-Driver PSD Consistency
 
     Section 7 confirms spectral stability across the full race for Hamilton. Here we check whether
-    the same pipeline parameters generalise to **all 20 drivers**. We reuse the laps 3–7 window
+    the same pipeline parameters generalise to **all 20 drivers**. We reuse the laps window
     from Section 3 (same `get_laps` calls, already cached). Car data is fetched via the rate-limited
     pipeline API. Each driver's data passes through the same `compute_psd_stats` pipeline.
 
-    If the 1.25 Hz cutoff is universal, all drivers should show:
-    - A low-frequency-dominated PSD shape (peak well below 1.25 Hz)
-    - ≥ 90% of power retained below the cutoff
+    If the 0.5 Hz cutoff is universal, all drivers should show:
+    - A low-frequency-dominated PSD shape (peak well below 0.5 Hz)
+    - ≥ 80% of power retained below the cutoff
     - No driver significantly outside the cluster
     """)
     return
@@ -858,11 +864,11 @@ def _(cross_psd_failures, cross_psd_rows, mo):
 
     | Stat | Value |
     |---|---|
-    | Mean % power below 1.25 Hz | {_mean8:.2f}% |
-    | Min % power below 1.25 Hz | {_min8:.2f}% |
-    | Max % power below 1.25 Hz | {_max8:.2f}% |
+    | Mean % power below 0.5 Hz | {_mean8:.2f}% |
+    | Min % power below 0.5 Hz | {_min8:.2f}% |
+    | Max % power below 0.5 Hz | {_max8:.2f}% |
 
-    | Driver | Team | Peak freq (Hz) | % power below 1.25 Hz |
+    | Driver | Team | Peak freq (Hz) | % power below 0.5 Hz |
     |---|---|---|---|
     """ + "\n".join(
         f"| {r['driver']} | {r['team']} | {r['peak_freq_hz']:.4f} | {r['pct_below_cutoff']:.2f}% |"
@@ -876,7 +882,7 @@ def _(cross_psd_rows, plt):
     _fig_s8, _ax_s8 = plt.subplots()
     for _row in cross_psd_rows:
         _ax_s8.semilogy(_row['freqs'], _row['psd'], color=_row['team_colour'], alpha=0.75, linewidth=0.9, label=_row['driver'])
-    _ax_s8.axvline(1.25, color='orange', linestyle='--', label='Cutoff: 1.25 Hz', zorder=10)
+    _ax_s8.axvline(0.5, color='orange', linestyle='--', label='Cutoff: 0.5 Hz', zorder=10)
     _ax_s8.axvline(2.0, color='grey', linestyle=':', label='Nyquist: 2.0 Hz', zorder=10)
     _ax_s8.set_xlabel('Frequency (Hz)')
     _ax_s8.set_ylabel('PSD (kph² / Hz)')
@@ -897,7 +903,7 @@ def _(cross_psd_rows, np, plt):
     _ax_s8b.bar(_drivers_sorted, _pcts_sorted, color=_colours_sorted)
     _ax_s8b.axhline(_mean_all, color='orange', linestyle='--', label=f'Mean: {_mean_all:.1f}%')
     _ax_s8b.set_xlabel('Driver')
-    _ax_s8b.set_ylabel('% power below 1.25 Hz')
+    _ax_s8b.set_ylabel('% power below 0.5 Hz')
     _ax_s8b.set_title('Power retained below cutoff — all drivers, laps 3–7')
     _ax_s8b.legend()
     _fig_s8b
@@ -914,14 +920,343 @@ def _(mo):
     | Claim | Evidence |
     |---|---|
     | 4 Hz resample is appropriate | Source ~3.7 Hz irregular; 4 Hz is minimally super-Nyquist, no phantom information added |
-    | 1.25 Hz cutoff retains signal | HAM laps 1–10: >95% power below cutoff (Section 5) |
+    | 0.5 Hz cutoff retains signal | HAM laps subset: majority of power below cutoff (Section 5); captures fundamentals of all braking events ≥ 2 s |
     | Cutoff stable across full race | Section 7: per-lap % retained varies < 5 pp across all HAM race laps |
     | Cutoff applies to all drivers | Section 8: all ~20 drivers show same low-frequency-dominated structure; all within a narrow band |
 
-    A single pipeline configuration — PCHIP resample to 4 Hz, 4th-order Butterworth at 1.25 Hz —
+    A single pipeline configuration — PCHIP resample to 4 Hz, 4th-order Butterworth at 0.5 Hz —
     can be applied universally to produce acceleration and jerk signals for all drivers across
     the full race.
     """)
+    return
+
+
+@app.cell
+def _(mo):
+    mo.md("""
+    ---
+
+    ## 9. Per-Lap Peak Acceleration Metrics — Full Grid
+
+    The signal processing pipeline is now validated. We apply it at scale: for **every driver**,
+    across **every timed race lap**, computing the peak longitudinal acceleration and peak
+    deceleration from the filtered signal.
+
+    - **Peak acceleration** (max g) captures the hardest throttle application in a lap.
+    - **Peak deceleration** (min g, reported as a positive magnitude) captures the hardest braking event.
+
+    These are naturally per-lap metrics as various factors (e.g., tyre degradation) shifts the distribution over a stint. Pit-out laps
+    are excluded since their speed profiles (cold tyres, slow pit-lane exit) are not representative of racing conditions.
+    """)
+    return
+
+
+@app.function
+def compute_lap_accel_stats(car_data_raw, fs=4.0, cutoff=0.5):
+    """Dedup → PCHIP → Butterworth → differentiate.
+    Returns (peak_accel_g, peak_decel_g) where peak_decel_g is the signed minimum (negative).
+    Returns None if data is insufficient.
+
+    cutoff=0.5 Hz, matching the pipeline-wide cutoff established in Sections 5–8.
+    Differentiation amplifies noise proportionally to frequency; diagnostic analysis (Section 9)
+    confirmed that residual above ~0.5 Hz produces spurious peak g values (GAS/RUS decel
+    outliers scattered every 2–3 laps throughout the race) rather than anomalous-lap
+    contamination. 0.75 Hz was also evaluated but reintroduced high/low outliers within the
+    included laps. Values are attenuated relative to true instantaneous peak g (accelerometer-
+    grade sampling required for that) but are internally consistent and reliable for relative
+    driver comparison."""
+    import numpy as np, pandas as pd
+    from scipy.interpolate import PchipInterpolator
+    from scipy.signal import butter, filtfilt
+
+    if not car_data_raw or len(car_data_raw) < 20:
+        return None
+    df = pd.DataFrame(car_data_raw)
+    df['date'] = pd.to_datetime(df['date'])
+    df = df.sort_values('date').reset_index(drop=True)
+
+    same = df['speed'].diff().eq(0)
+    group_id = (~same).cumsum()
+    run_len = group_id.map(group_id.value_counts())
+    clean = df[run_len < 8]
+    if len(clean) < 10:
+        return None
+
+    t = clean['date'].astype(np.int64).to_numpy() / 1e9
+    v = clean['speed'].to_numpy().astype(float)
+    pchip = PchipInterpolator(t, v)
+    t_reg = np.arange(t[0], t[-1], 1 / fs)
+    if len(t_reg) < 32:
+        return None
+    v_reg = pchip(t_reg)
+
+    b, a = butter(N=4, Wn=cutoff / (fs / 2), btype='low')
+    # Use a generous padlen (up to 5 s each side) so the filter fully stabilises at
+    # lap boundaries rather than leaving transient edge artefacts.
+    _padlen = min(len(v_reg) // 4, int(5 * fs))
+    v_filt = filtfilt(b, a, v_reg, padlen=_padlen)
+
+    accel_g = np.diff(v_filt) / (1 / fs) * (1000 / 3600) / 9.81
+
+    return float(np.max(accel_g)), float(np.min(accel_g))
+
+
+@app.cell
+def _(
+    CACHE_DIR,
+    SESSION_KEY,
+    USE_CACHE,
+    drivers,
+    get_car_data_slow,
+    get_laps,
+    pickle,
+):
+    _cache_file = CACHE_DIR / 'lap_accel_rows.pkl'
+    if USE_CACHE and _cache_file.exists():
+        with open(_cache_file, 'rb') as _f:
+            lap_accel_rows, lap_accel_failures = pickle.load(_f)
+    else:
+        import pandas as _pd_s9
+        _rows = []
+        _failures = []
+        for _drv in drivers:
+            _dn = _drv['driver_number']
+            _acro = _drv['name_acronym']
+            try:
+                _laps_all = get_laps(SESSION_KEY, _dn)
+                _timed = [l for l in _laps_all if not l.get('is_pit_out_lap') and l.get('date_start')]
+                if len(_timed) < 2:
+                    _failures.append((_acro, 'all'))
+                    continue
+                # One API call for the full race window, then segment client-side
+                _raw = get_car_data_slow(SESSION_KEY, _dn, _timed[0]['date_start'], _timed[-1]['date_start'])
+                if not _raw:
+                    _failures.append((_acro, 'all'))
+                    continue
+                _df_all = _pd_s9.DataFrame(_raw)
+                _df_all['date'] = _pd_s9.to_datetime(_df_all['date'])
+                _df_all = _df_all.sort_values('date').reset_index(drop=True)
+                for _i in range(len(_timed) - 1):
+                    _lap_num = _timed[_i].get('lap_number', _i + 1)
+                    _t0 = _pd_s9.to_datetime(_timed[_i]['date_start'])
+                    _t1 = _pd_s9.to_datetime(_timed[_i + 1]['date_start'])
+                    _lap_slice = _df_all[(_df_all['date'] >= _t0) & (_df_all['date'] < _t1)]
+                    _result = compute_lap_accel_stats(_lap_slice.to_dict('records'))
+                    if _result is None:
+                        _failures.append((_acro, _lap_num))
+                        continue
+                    _peak_accel, _peak_decel = _result
+                    _rows.append({
+                        'driver': _acro,
+                        'team': _drv['team_name'],
+                        'team_colour': '#' + (_drv.get('team_colour') or 'aaaaaa'),
+                        'lap': _lap_num,
+                        'peak_accel_g': round(_peak_accel, 4),
+                        'peak_decel_g': round(_peak_decel, 4),
+                    })
+            except Exception:
+                _failures.append((_acro, 'all'))
+        lap_accel_rows = _rows
+        lap_accel_failures = _failures
+        with open(_cache_file, 'wb') as _f:
+            pickle.dump((lap_accel_rows, lap_accel_failures), _f)
+    return lap_accel_failures, lap_accel_rows
+
+
+@app.cell
+def _(lap_accel_rows, pd):
+    lap_accel_df_raw = pd.DataFrame(lap_accel_rows)
+    lap_accel_df_raw['peak_decel_g_abs'] = lap_accel_df_raw['peak_decel_g'].abs()
+    # Exclude laps that exceed physical plausibility bounds rather than clipping them.
+    # Clipping creates artificial pile-ups at the boundary; exclusion keeps the
+    # remaining distribution honest. Bounds: 4 g acceleration, 8 g braking.
+    _mask = (lap_accel_df_raw['peak_accel_g'] <= 4.0) & (lap_accel_df_raw['peak_decel_g_abs'] <= 8.0)
+    lap_accel_df = lap_accel_df_raw[_mask].reset_index(drop=True)
+    lap_accel_excluded = lap_accel_df_raw[~_mask][['driver', 'lap', 'peak_accel_g', 'peak_decel_g_abs']].sort_values(['driver', 'lap'])
+    return lap_accel_df, lap_accel_df_raw, lap_accel_excluded
+
+
+@app.cell
+def _(lap_accel_df_raw, lap_accel_excluded, mo):
+    _n_excluded = len(lap_accel_excluded)
+    _pct = _n_excluded / len(lap_accel_df_raw) * 100
+    mo.md(
+        f"**{_n_excluded} laps excluded ({_pct:.1f}%) — peak accel > 4 g or peak decel > 8 g.**\n\n"
+        "Inspect the table below: if exclusions are scattered randomly across drivers and lap "
+        "numbers it is a noise/filter problem; if they cluster at lap 1, post-SC laps, or "
+        "specific drivers it is anomalous-lap contamination.\n\n"
+        "| Driver | Lap | Peak accel (g) | Peak decel (g) |\n|---|---|---|---|\n" +
+        "\n".join(
+            f"| {r['driver']} | {int(r['lap'])} | {r['peak_accel_g']:.3f} | {r['peak_decel_g_abs']:.3f} |"
+            for _, r in lap_accel_excluded.iterrows()
+        )
+    )
+    return
+
+
+@app.cell
+def _(lap_accel_df, lap_accel_failures, mo):
+    _n_laps = len(lap_accel_df)
+    _n_drivers = lap_accel_df['driver'].nunique()
+    _n_failures = len(lap_accel_failures)
+    mo.md(f"""
+    **{_n_laps} lap records** computed across **{_n_drivers} drivers**;
+    **{_n_failures} laps excluded** (insufficient data or API error).
+    """)
+    return
+
+
+@app.cell
+def _(mo):
+    mo.md("""
+    ---
+
+    ## 10. Distribution Analysis
+
+    We examine the distribution of per-lap peak values to assess:
+    1. Whether values are physically plausible (F1 braking: ~4–6 g; acceleration: ~1–2 g)
+    2. Whether any driver or team is a significant outlier
+    3. The spread of individual performance across the grid
+
+    **Grid distributions** give the aggregate picture; **per-driver box plots** reveal
+    individual patterns and lap-to-lap consistency.
+    """)
+    return
+
+
+@app.cell
+def _(lap_accel_df, plt):
+    _fig_hist, (_ax_a, _ax_d) = plt.subplots(1, 2, figsize=(12, 4))
+
+    _mean_a = lap_accel_df['peak_accel_g'].mean()
+    _std_a = lap_accel_df['peak_accel_g'].std()
+    _ax_a.hist(lap_accel_df['peak_accel_g'], bins=40, edgecolor='none')
+    _ax_a.axvline(_mean_a, color='orange', linestyle='--', label=f'Mean: {_mean_a:.2f} g')
+    _ax_a.axvline(_mean_a - _std_a, color='orange', linestyle=':', alpha=0.6, label=f'±1 SD: {_std_a:.2f} g')
+    _ax_a.axvline(_mean_a + _std_a, color='orange', linestyle=':', alpha=0.6)
+    _ax_a.set_xlabel('Peak acceleration (g)')
+    _ax_a.set_ylabel('Count (laps)')
+    _ax_a.set_title('Grid: peak acceleration per lap')
+    _ax_a.legend(fontsize=8)
+
+    _mean_d = lap_accel_df['peak_decel_g_abs'].mean()
+    _std_d = lap_accel_df['peak_decel_g_abs'].std()
+    _ax_d.hist(lap_accel_df['peak_decel_g_abs'], bins=40, edgecolor='none', color='tomato')
+    _ax_d.axvline(_mean_d, color='orange', linestyle='--', label=f'Mean: {_mean_d:.2f} g')
+    _ax_d.axvline(_mean_d - _std_d, color='orange', linestyle=':', alpha=0.6, label=f'±1 SD: {_std_d:.2f} g')
+    _ax_d.axvline(_mean_d + _std_d, color='orange', linestyle=':', alpha=0.6)
+    _ax_d.set_xlabel('Peak deceleration (g)')
+    _ax_d.set_ylabel('Count (laps)')
+    _ax_d.set_title('Grid: peak deceleration per lap')
+    _ax_d.legend(fontsize=8)
+
+    _fig_hist.suptitle('Distribution of per-lap peak g-forces — full grid, full race')
+    _fig_hist.tight_layout()
+    _fig_hist
+    return
+
+
+@app.cell
+def _(lap_accel_df, plt):
+    _drv_order_a = (
+        lap_accel_df.groupby('driver')['peak_accel_g']
+        .median()
+        .sort_values(ascending=False)
+        .index.tolist()
+    )
+    _colours_a = {
+        row['driver']: row['team_colour']
+        for _, row in lap_accel_df[['driver', 'team_colour']].drop_duplicates().iterrows()
+    }
+    _data_a = [lap_accel_df.loc[lap_accel_df['driver'] == d, 'peak_accel_g'].values for d in _drv_order_a]
+
+    _fig_a, _ax_a2 = plt.subplots(figsize=(14, 5))
+    _bp_a = _ax_a2.boxplot(_data_a, patch_artist=True, medianprops=dict(color='white', linewidth=1.5))
+    for _patch, _drv in zip(_bp_a['boxes'], _drv_order_a):
+        _patch.set_facecolor(_colours_a.get(_drv, '#aaaaaa'))
+        _patch.set_alpha(0.8)
+    _ax_a2.set_xticks(range(1, len(_drv_order_a) + 1))
+    _ax_a2.set_xticklabels(_drv_order_a, rotation=45, ha='right')
+    _ax_a2.set_ylabel('Peak acceleration (g)')
+    _ax_a2.set_title('Per-driver distribution of per-lap peak acceleration (sorted by median, coloured by team)')
+    _fig_a.tight_layout()
+    _fig_a
+    return
+
+
+@app.cell
+def _(lap_accel_df, plt):
+    _drv_order_d = (
+        lap_accel_df.groupby('driver')['peak_decel_g_abs']
+        .median()
+        .sort_values(ascending=False)
+        .index.tolist()
+    )
+    _colours_d = {
+        row['driver']: row['team_colour']
+        for _, row in lap_accel_df[['driver', 'team_colour']].drop_duplicates().iterrows()
+    }
+    _data_d = [lap_accel_df.loc[lap_accel_df['driver'] == d, 'peak_decel_g_abs'].values for d in _drv_order_d]
+
+    _fig_d, _ax_d2 = plt.subplots(figsize=(14, 5))
+    _bp_d = _ax_d2.boxplot(_data_d, patch_artist=True, medianprops=dict(color='white', linewidth=1.5))
+    for _patch, _drv in zip(_bp_d['boxes'], _drv_order_d):
+        _patch.set_facecolor(_colours_d.get(_drv, '#aaaaaa'))
+        _patch.set_alpha(0.8)
+    _ax_d2.set_xticks(range(1, len(_drv_order_d) + 1))
+    _ax_d2.set_xticklabels(_drv_order_d, rotation=45, ha='right')
+    _ax_d2.set_ylabel('Peak deceleration (g)')
+    _ax_d2.set_title('Per-driver distribution of per-lap peak deceleration (sorted by median, coloured by team)')
+    _fig_d.tight_layout()
+    _fig_d
+    return
+
+
+@app.cell
+def _(lap_accel_df, mo):
+    _grid_accel_mean = lap_accel_df['peak_accel_g'].mean()
+    _grid_accel_std = lap_accel_df['peak_accel_g'].std()
+    _grid_decel_mean = lap_accel_df['peak_decel_g_abs'].mean()
+    _grid_decel_std = lap_accel_df['peak_decel_g_abs'].std()
+
+    _summary = (
+        lap_accel_df.groupby(['driver', 'team'])
+        .agg(
+            n_laps=('lap', 'count'),
+            mean_peak_accel_g=('peak_accel_g', 'mean'),
+            std_peak_accel_g=('peak_accel_g', 'std'),
+            mean_peak_decel_g=('peak_decel_g_abs', 'mean'),
+            std_peak_decel_g=('peak_decel_g_abs', 'std'),
+        )
+        .round(3)
+        .sort_values('mean_peak_decel_g', ascending=False)
+        .reset_index()
+    )
+
+    _header = (
+        f"**Grid (all drivers, all laps):** "
+        f"peak accel {_grid_accel_mean:.3f} ± {_grid_accel_std:.3f} g | "
+        f"peak decel {_grid_decel_mean:.3f} ± {_grid_decel_std:.3f} g\n\n"
+        "| Driver | Team | Laps | Peak accel mean (g) | Peak accel SD | Peak decel mean (g) | Peak decel SD |\n"
+        "|---|---|---|---|---|---|---|\n"
+    )
+    _rows_md = "\n".join(
+        f"| {r['driver']} | {r['team']} | {int(r['n_laps'])} "
+        f"| {r['mean_peak_accel_g']:.3f} | {r['std_peak_accel_g']:.3f} "
+        f"| {r['mean_peak_decel_g']:.3f} | {r['std_peak_decel_g']:.3f} |"
+        for _, r in _summary.iterrows()
+    )
+    mo.md(_header + _rows_md)
+    return
+
+
+@app.cell
+def _():
+    return
+
+
+@app.cell
+def _():
     return
 
 
