@@ -314,26 +314,28 @@ circuits             — static reference table: circuit_key, name, location, co
 - The 20% throttle gate and Monaco caveat apply identically; qualifying laps are by nature high-throttle flying laps so empty accel windows are unlikely except in extreme cases
 - Schema: add 6 nullable float columns to `qualifying_results`
 
-**Lateral G — Cornering estimation (scoped, not yet implemented)**
-- Goal: estimate peak lateral G per lap and per sector from XY position data + speed; stored as `peak_lateral_g_s1/s2/s3/lap` in `lap_metrics`
-- **Data sources:** `get_location(session_key, driver_number, date_start, date_end)` → x, y, z at ~3.7 Hz (independent timestamp sequence from car_data); `get_car_data` → speed at ~3.7 Hz
-- **Method (heading-rate approach):** resample both streams onto a common 4 Hz grid via PCHIP; apply smoothing to XY before differentiation (Butterworth, cutoff TBD — likely 0.3–0.4 Hz given XY noise characteristics); compute heading angle θ = atan2(Δy, Δx); angular rate ω = Δθ/Δt; lateral_G = v × ω / 9.81. Alternative: curvature method κ = |x'y'' - y'x''| / (x'² + y'²)^(3/2), lateral_G = v² × κ / 9.81 — mathematically equivalent but curvature is noisier to compute directly.
-- **Key unknowns to resolve in research notebook first:**
-  1. Coordinate units and scale: OpenF1 XY may not be in metres — determine scale factor by integrating speed over time and comparing to known `circuit_length_km`
-  2. Noise characteristics of XY at 3.7 Hz: plot a full lap, check if track outline is recognisable; raw curvature will reveal noise floor
-  3. Appropriate smoothing cutoff for XY vs. speed (different sensor, different noise spectrum)
-  4. Corner-to-sector assignment: lateral G peaks need to be mapped to sectors using time-based sector boundaries (lap_start UTC + cumulative sector times from laps table)
-  5. Validation: peak lateral G at known high-G corners (e.g., Eau Rouge ~4–5 g at ~280 km/h, Maggots/Becketts ~3–4 g) provides a sanity check on scale and smoothing
-- **Pipeline integration:** `ingest_lap_metrics` already fetches `get_car_data` per driver; add a parallel `get_location` call in the same loop, merge by nearest timestamp onto the common 4 Hz grid, compute lateral G after longitudinal G. One additional API call per driver per session.
-- **Research first:** build in `research/car_velocity/` before encoding in pipeline. Validate on one race session; assess whether 3.7 Hz + smoothing produces reliable per-corner estimates before committing to the pipeline schema.
+**Lateral G — Cornering estimation (researched; pending validation before pipeline integration)**
+- **Status:** Method selected in `research/car_velocity/lateral_g.py` (2026-03-27). Validation notebook required before pipeline commit.
+- **Chosen method:** Yaw rate — `lat_g = v_car × |dθ/dt| / 9.81`
+  - XY resampled to 4 Hz via PCHIP; 4th-order Butterworth applied to XY (cutoff to be confirmed by spectral analysis — 0.3 Hz is current best candidate; 0.5 Hz over-smooths corner geometry)
+  - Heading θ = atan2(ẏ, ẋ); for raw (unfiltered) case use PCHIP analytical derivative directly; for filtered case use `np.gradient` on filtered arrays
+  - Speed from `/car_data` sensor (not position-derived)
+  - Lateral G ceiling: 7 g
+  - Metrics: `peak_lat_g_s1/s2/s3/lap` and `mean_lat_g_s1/s2/s3/lap`
+- **XY confirmed in metres** (path-length vs. Shanghai circuit length validation in notebook)
+- **Validation required before pipeline commit:** `research/car_velocity/lateral_g_validation.py`
+  - **Part A — Spectral analysis:** Welch PSD of raw XY residuals to justify Butterworth cutoff (0.3 Hz vs. 0.5 Hz); residual analysis comparing filtered variants
+  - **Part B — Bayesian tyre-wear model (PyMC):** test hypothesis that lateral G decreases as tyre ages; mixed model pooling compound, driver, constructor, and sector as grouping factors; fixed effect = laps on tyre; validate for peak lateral G, peak accel G, peak decel G; credible interval on tyre-age coefficient must exclude zero in the negative direction before lateral G is trusted as a physical signal
+- **Pipeline integration (after validation):** `ingest_lap_metrics` already fetches `get_car_data` per driver; add parallel `get_location` call in the same loop, merge onto common 4 Hz grid, compute yaw-rate lateral G after longitudinal G. One additional API call per driver per session.
 
 **Remaining car-data metrics (not yet implemented):**
 - `coasting_ratio_s1/s2/s3/lap` — proportion of samples where throttle < 1% AND brake == 0
 - `coasting_distance_m_s1/s2/s3/lap` — metres accumulated under same condition; proxy for energy regeneration in 2026+ regulations
+- `estimated_superclipping_distance_m_s1/s2/s3/lap` - metres accumulated where the driver is applying the throttle (>=10%), is not applying the brake (brake ==0), and the car is decelerating. Only relevant for 2026 regulations. 
 - `throttle_brake_overlap_ratio_s1/s2/s3/lap` — proportion of samples where brake == 1 AND throttle ≥ 10% (trail braking proxy)
 - `full_throttle_pct_s1/s2/s3/lap` — proportion of samples where throttle ≥ 99%
 - `throttle_input_variance_s1/s2/s3/lap` — variance of diff(throttle_values); higher = rougher inputs (throttle only; brake is boolean so no derivative is meaningful)
-- `drs_activation_count` — number of DRS opens (closed → open transitions)
+- `drs_activation_count` — number of DRS opens (closed → open transitions).
 - `drs_distance_m` — metres driven with DRS open
 - `max_speed_kph_s1/s2/s3/lap` — max speed from car_data within each sector; lap = max across all sectors (distinct from speed trap, which is a fixed point)
   - Sector boundaries derived from lap start UTC + cumulative sector times
@@ -353,7 +355,8 @@ circuits             — static reference table: circuit_key, name, location, co
 - `brake_entry_speed_z_score_s1/s2/s3/lap` — z-score of speed_at_brake_start_kph relative to session mean/SD for that sector; lap = z-score on lap-level value
   - Stored alongside percentile rank since braking distributions are unlikely to be normal; z-score adds magnitude of deviation from mean when distribution happens to be well-behaved
 - `brake_entry_speed_category_s1/s2/s3/lap` — categorical label derived from brake_entry_speed_pct_rank: 'early' (0–33), 'average' (34–66), 'late' (67–100)
-- `peak_lateral_g_s1/s2/s3/lap` — peak lateral G from XY + speed estimation (see Lateral G scope above)
+- `peak_lat_g_s1/s2/s3/lap` — peak lateral G, yaw-rate method (see Lateral G scope above); pending validation
+- `mean_lat_g_s1/s2/s3/lap` — mean lateral G per sector/lap; pending validation
 - `accumulated_linear_acceleration_g_s1/s2/s3/lap` - some potential aggregation of all accelerations, not just the peak
 - `accumulated_linear_deceleration_g_21/s2/s3/lap` - some potenteial aggregation of all decelerations, not just the peak
 - `accumulated_lateral_g_s1/s2/s3/lap` - some potential aggregation of all lateral g, not just the peak

@@ -358,45 +358,20 @@ def _get_compound_for_lap(driver_number: int, lap_number: int, stints: list[dict
     return None
 
 
-def ingest_qualifying_results(
-    client: Client,
-    session_key: int,
+def _compute_qualifying_best_per_phase(
     laps: list[dict],
-    race_control: list[dict] | None = None,
-    stints: list[dict] | None = None,
-) -> None:
+) -> dict[int, dict[str, tuple[float, int]]]:
+    """Return the best timed lap per qualifying phase per driver.
+
+    Expects laps to have ``_phase`` keys injected by ``_assign_qualifying_phases``.
+    Returns ``{driver_number: {phase_str: (lap_time_s, lap_number)}}``.
     """
-    Upsert qualifying best times per phase into ``qualifying_results``.
-
-    Assigns each lap to a qualifying phase (Q1/Q2/Q3) using race_control
-    events, then computes per-phase best times, compounds, and lap counts.
-    """
-    if race_control is None:
-        race_control = []
-    if stints is None:
-        stints = []
-
-    laps = _assign_qualifying_phases(laps, race_control)
-
-    # best_per_phase[dn][phase] = (time, lap_number)
-    best_per_phase: dict[int, dict[str, tuple[float, int]]] = {}
-    # laps_per_phase[dn][phase] = count (all laps in phase, not just timed ones)
-    laps_per_phase: dict[int, dict[str, int]] = {}
-
+    best: dict[int, dict[str, tuple[float, int]]] = {}
     for lap in laps:
-        dn = lap.get("driver_number")
-        if dn is None:
-            continue
+        dn    = lap.get("driver_number")
         phase = lap.get("_phase")
-        if phase is None:
+        if dn is None or phase is None:
             continue
-
-        # Count every lap that has a phase assignment
-        if dn not in laps_per_phase:
-            laps_per_phase[dn] = {}
-        laps_per_phase[dn][phase] = laps_per_phase[dn].get(phase, 0) + 1
-
-        # Track best timed lap per (driver, phase)
         dur = lap.get("lap_duration")
         if not dur:
             continue
@@ -406,16 +381,55 @@ def ingest_qualifying_results(
             continue
         if t <= 0:
             continue
-        if dn not in best_per_phase:
-            best_per_phase[dn] = {}
         lap_num = lap.get("lap_number")
-        if phase not in best_per_phase[dn] or t < best_per_phase[dn][phase][0]:
-            best_per_phase[dn][phase] = (t, lap_num)
+        if dn not in best:
+            best[dn] = {}
+        if phase not in best[dn] or t < best[dn][phase][0]:
+            best[dn][phase] = (t, lap_num)
+    return best
+
+
+def ingest_qualifying_results(
+    client: Client,
+    session_key: int,
+    laps: list[dict],
+    race_control: list[dict] | None = None,
+    stints: list[dict] | None = None,
+) -> dict[int, dict[str, tuple[float, int]]]:
+    """
+    Upsert qualifying best times per phase into ``qualifying_results``.
+
+    Assigns each lap to a qualifying phase (Q1/Q2/Q3) using race_control
+    events, then computes per-phase best times, compounds, and lap counts.
+
+    Returns ``best_per_phase`` (driver → phase → (time, lap_number)) so that
+    downstream callers (e.g. ``recompute_lap_metrics``) can look up which lap
+    number produced the best time in each phase without re-computing.
+    """
+    if race_control is None:
+        race_control = []
+    if stints is None:
+        stints = []
+
+    laps = _assign_qualifying_phases(laps, race_control)
+
+    # laps_per_phase[dn][phase] = count (all laps in phase, not just timed ones)
+    laps_per_phase: dict[int, dict[str, int]] = {}
+    for lap in laps:
+        dn    = lap.get("driver_number")
+        phase = lap.get("_phase")
+        if dn is None or phase is None:
+            continue
+        if dn not in laps_per_phase:
+            laps_per_phase[dn] = {}
+        laps_per_phase[dn][phase] = laps_per_phase[dn].get(phase, 0) + 1
+
+    best_per_phase = _compute_qualifying_best_per_phase(laps)
 
     all_drivers = set(best_per_phase.keys()) | set(laps_per_phase.keys())
     rows = []
     for dn in all_drivers:
-        phases = best_per_phase.get(dn, {})
+        phases    = best_per_phase.get(dn, {})
         lap_counts = laps_per_phase.get(dn, {})
 
         q1 = phases.get("Q1")
@@ -453,6 +467,7 @@ def ingest_qualifying_results(
         })
 
     _upsert(client, "qualifying_results", rows)
+    return best_per_phase
 
 
 def ingest_overtakes(client: Client, session_key: int) -> None:
@@ -605,28 +620,107 @@ def ingest_championship_teams(client: Client, session_key: int) -> None:
 # Derived metrics (Phase 5)
 # ---------------------------------------------------------------------------
 
-def _compute_peak_g(
+# Signal processing constants (pipeline-standard, validated in research/car_velocity/noise.py)
+_BRAKE_G_THRESHOLD  = 0.5   # g  — minimum deceleration to count as a braking event
+_DRS_OPEN_THRESHOLD = 10    # DRS value >= this → car is in a DRS zone or has DRS open
+
+
+def _windowed_peak_g(accel_g, thr, brk):
+    """Windowed peak accel and decel for a segment of the accel_g signal.
+
+    All three arrays must have the same length (left-edge convention: index i
+    covers the interval [t_reg[i], t_reg[i+1])).
+
+    Returns (peak_accel_g, peak_decel_g_abs) — either can be None when the
+    corresponding gate produces no valid samples.
+    """
+    import numpy as np
+    accel_mask = thr > 20
+    decel_mask = (thr < 20) | (brk > 0)
+    accel_cand = accel_g[accel_mask]
+    decel_cand = accel_g[decel_mask]
+    peak_accel     = float(np.max(accel_cand))      if len(accel_cand) > 0 else None
+    peak_decel_abs = float(abs(np.min(decel_cand))) if len(decel_cand) > 0 else None
+    return peak_accel, peak_decel_abs
+
+
+def _find_brake_zones(accel_g, v_filt):
+    """Find contiguous braking events where deceleration exceeds _BRAKE_G_THRESHOLD.
+
+    ``accel_g`` and ``v_filt`` must satisfy ``len(v_filt) >= len(accel_g)``;
+    ``v_filt[i]`` is the speed (km/h) at the start of the i-th interval.
+
+    Returns a list of (peak_decel_g_abs, speed_at_start_kph), one per event.
+    """
+    import numpy as np
+    in_brake = accel_g < -_BRAKE_G_THRESHOLD
+    zones, i, n = [], 0, len(in_brake)
+    while i < n:
+        if in_brake[i]:
+            start = i
+            while i < n and in_brake[i]:
+                i += 1
+            peak_decel = float(abs(np.min(accel_g[start:i])))
+            speed_kph  = float(v_filt[start])
+            zones.append((peak_decel, speed_kph))
+        else:
+            i += 1
+    return zones
+
+
+def _brake_zone_stats(zones):
+    """Aggregate a list of brake zone tuples into summary statistics.
+
+    Returns (count, mean_peak_decel_g, speed_at_primary_brake_start_kph).
+    ``speed_at_primary`` is the entry speed of the hardest braking zone.
+    Returns (0, None, None) when zones is empty.
+    """
+    if not zones:
+        return 0, None, None
+    count     = len(zones)
+    mean_peak = float(sum(z[0] for z in zones) / count)
+    primary   = max(zones, key=lambda z: z[0])
+    return count, mean_peak, primary[1]
+
+
+def _compute_lap_metrics(
     car_data_records: list[dict],
+    s1_end_t: float | None = None,
+    s2_end_t: float | None = None,
     fs: float = 4.0,
     cutoff: float = 0.5,
-) -> tuple[float | None, float | None] | None:
-    """Windowed peak longitudinal acceleration and deceleration for one lap.
+) -> dict | None:
+    """Compute all car-data derived metrics for one lap.
 
-    Pipeline-side port of the validated research computation (noise.py Section 9).
-    Returns (peak_accel_g, peak_decel_g_abs) — both positive floats — or None for
-    either channel if the throttle/brake gate produces no valid samples, or None
-    (not a tuple) if the raw data is insufficient to process.
+    Parameters
+    ----------
+    car_data_records : list[dict]
+        Raw OpenF1 car_data records for the lap window.
+    s1_end_t, s2_end_t : float or None
+        Absolute epoch timestamps (seconds) for the S1/S2 sector boundaries.
+        When either is None, all ``_s1``/``_s2``/``_s3`` keys are returned as None.
+    fs : float
+        Resampling frequency (Hz).  Pipeline standard: 4 Hz.
+    cutoff : float
+        Butterworth low-pass cutoff (Hz).  Pipeline standard: 0.5 Hz.
 
-    Signal processing:
-      dedup → PCHIP resample to 4 Hz grid → 4th-order Butterworth low-pass at
-      0.5 Hz → differentiate → convert to g.
+    Returns
+    -------
+    dict or None
+        All metrics as a flat dict, or None when data is insufficient.
+        Per-sector keys (``_s1``/``_s2``/``_s3``) are None when sector times
+        are unavailable or the sector slice is too short to compute reliably.
 
-    Throttle/brake windowing (left-edge convention, shape N-1 to match diff output):
-      accel_mask  = throttle_reg[:-1] > 20          (>20 % throttle → genuine power)
-      decel_mask  = throttle_reg[:-1] < 20 | brake_reg[:-1] > 0  (lifting/braking)
-
-    Plausibility bounds are NOT applied here; the caller (ingest_race_peak_g_summary)
-    applies them when computing the 'clean' race averages.
+    Notes
+    -----
+    Signal processing pipeline (validated in research/car_velocity/noise.py):
+      dedup → PCHIP resample to 4 Hz → 4th-order Butterworth low-pass at 0.5 Hz
+      → diff → throttle/brake gating.
+    Brake is boolean (0/100) in OpenF1 — nearest-neighbour resampling preserves
+    that character.  Throttle uses linear interpolation.
+    Plausibility bounds (accel ≤ 4 g, decel ≤ 8 g) are NOT applied here; the
+    caller applies them when computing clean race-level averages.
+    Schema note: lap_metrics requires new columns before these rows can be written.
     """
     import numpy as np
     import pandas as pd
@@ -640,6 +734,7 @@ def _compute_peak_g(
     df['date'] = pd.to_datetime(df['date'])
     df = df.sort_values('date').reset_index(drop=True)
 
+    # Dedup: remove runs of 8+ identical speed samples (stationary / pit-lane sections)
     same     = df['speed'].diff().eq(0)
     group_id = (~same).cumsum()
     run_len  = group_id.map(group_id.value_counts())
@@ -647,63 +742,245 @@ def _compute_peak_g(
     if len(clean) < 10:
         return None
 
-    t_ctrl     = clean['date'].astype(np.int64).to_numpy() / 1e9
+    t_ctrl     = clean['date'].astype(np.int64).to_numpy() / 1e9   # epoch seconds
+    v          = clean['speed'].to_numpy().astype(float)            # km/h
     throttle_r = clean['throttle'].to_numpy().astype(float)
     brake_r    = clean['brake'].to_numpy().astype(float)
 
-    t     = t_ctrl.copy()
-    v     = clean['speed'].to_numpy().astype(float)
-    pchip = PchipInterpolator(t, v)
-    t_reg = np.arange(t[0], t[-1], 1 / fs)
-    if len(t_reg) < 32:
+    has_drs = 'drs' in clean.columns and not clean['drs'].isna().all()
+    drs_r   = clean['drs'].fillna(0).to_numpy().astype(float) if has_drs else None
+
+    # PCHIP resample speed to regular grid; interp throttle/brake/drs
+    pchip = PchipInterpolator(t_ctrl, v)
+    t_reg = np.arange(t_ctrl[0], t_ctrl[-1], 1 / fs)
+    N = len(t_reg)
+    if N < 32:
         return None
     v_reg = pchip(t_reg)
 
-    # Throttle: linear interp (smooth, 20 % gate is coarse enough).
-    # Brake: nearest-neighbour (preserves binary 0/100 character; linear would
-    # produce fractional values at step edges, corrupting the brake > 0 test).
+    # Throttle: linear (coarse 20% gate tolerates small interpolation error)
+    # Brake:    nearest-neighbour (preserves binary 0/100 character)
+    # DRS:      nearest-neighbour (integer states)
     throttle_reg = np.clip(np.interp(t_reg, t_ctrl, throttle_r), 0, 100)
     brake_reg    = np.clip(np.round(np.interp(t_reg, t_ctrl, brake_r) / 100) * 100, 0, 100)
+    drs_reg      = np.round(np.interp(t_reg, t_ctrl, drs_r)) if drs_r is not None else None
 
+    # Butterworth low-pass on speed → accel in g (length N-1, left-edge convention)
     b, a    = butter(N=4, Wn=cutoff / (fs / 2), btype='low')
-    padlen  = min(len(v_reg) // 4, int(5 * fs))
+    padlen  = min(N // 4, int(5 * fs))
     v_filt  = filtfilt(b, a, v_reg, padlen=padlen)
-
     accel_g = np.diff(v_filt) / (1 / fs) * (1000 / 3600) / 9.81
 
+    # Left-edge throttle/brake slices aligned with accel_g (length N-1)
     thr = throttle_reg[:-1]
     brk = brake_reg[:-1]
-    accel_mask = thr > 20
-    decel_mask = (thr < 20) | (brk > 0)
 
-    accel_cand = accel_g[accel_mask]
-    decel_cand = accel_g[decel_mask]
+    # Sector boundary indices into t_reg
+    _MIN = 4   # minimum samples for a reliable sector metric
+    has_sectors = s1_end_t is not None and s2_end_t is not None
+    if has_sectors:
+        s1_idx = int(np.clip(np.searchsorted(t_reg, s1_end_t), 1, N))
+        s2_idx = int(np.clip(np.searchsorted(t_reg, s2_end_t), s1_idx, N))
+    else:
+        s1_idx = s2_idx = None
 
-    peak_accel_g     = float(np.max(accel_cand))          if len(accel_cand) > 0 else None
-    peak_decel_g_abs = float(abs(np.min(decel_cand)))     if len(decel_cand) > 0 else None
+    # Distance per sample (metres); v_reg in km/h, dt = 1/fs seconds
+    dt_s = 1 / fs
+    dist = v_reg * dt_s * (1000 / 3600)
 
-    return peak_accel_g, peak_decel_g_abs
+    # -------------------------------------------------------------------
+    # Sector-split helper closures
+    # -------------------------------------------------------------------
+    def _ratio_splits(mask):
+        """Proportion of True samples for lap and each sector."""
+        lap = float(np.mean(mask))
+        if not has_sectors:
+            return lap, None, None, None
+        s1 = float(np.mean(mask[:s1_idx]))        if s1_idx            >= _MIN else None
+        s2 = float(np.mean(mask[s1_idx:s2_idx])) if (s2_idx - s1_idx) >= _MIN else None
+        s3 = float(np.mean(mask[s2_idx:]))        if (N - s2_idx)      >= _MIN else None
+        return lap, s1, s2, s3
+
+    def _dist_splits(mask):
+        """Sum of dist[mask] for lap and each sector."""
+        lap = float(np.sum(dist[mask]))
+        if not has_sectors:
+            return lap, None, None, None
+        m1, m2, m3 = mask[:s1_idx], mask[s1_idx:s2_idx], mask[s2_idx:]
+        s1 = float(np.sum(dist[:s1_idx][m1]))        if s1_idx            >= _MIN else None
+        s2 = float(np.sum(dist[s1_idx:s2_idx][m2])) if (s2_idx - s1_idx) >= _MIN else None
+        s3 = float(np.sum(dist[s2_idx:][m3]))        if (N - s2_idx)      >= _MIN else None
+        return lap, s1, s2, s3
+
+    def _thr_var_splits():
+        """var(diff(throttle)) for lap and each sector."""
+        def _var(arr):
+            d = np.diff(arr)
+            return float(np.var(d)) if len(d) > 0 else None
+        lap = _var(throttle_reg)
+        if not has_sectors:
+            return lap, None, None, None
+        s1 = _var(throttle_reg[:s1_idx])        if s1_idx            >= 3 else None
+        s2 = _var(throttle_reg[s1_idx:s2_idx]) if (s2_idx - s1_idx) >= 3 else None
+        s3 = _var(throttle_reg[s2_idx:])        if (N - s2_idx)      >= 3 else None
+        return lap, s1, s2, s3
+
+    def _maxspd_splits():
+        """Max speed (km/h) for lap and each sector."""
+        lap = float(np.max(v_reg))
+        if not has_sectors:
+            return lap, None, None, None
+        s1 = float(np.max(v_reg[:s1_idx]))        if s1_idx            >= 1 else None
+        s2 = float(np.max(v_reg[s1_idx:s2_idx])) if (s2_idx - s1_idx) >= 1 else None
+        s3 = float(np.max(v_reg[s2_idx:]))        if (N - s2_idx)      >= 1 else None
+        return lap, s1, s2, s3
+
+    def _peak_g_splits():
+        """Windowed peak G for lap and each sector (accel_g length N-1)."""
+        lap_g = _windowed_peak_g(accel_g, thr, brk)
+        if not has_sectors:
+            return lap_g, (None, None), (None, None), (None, None)
+        def _sg(sl):
+            ag_sl = accel_g[sl]
+            return _windowed_peak_g(ag_sl, thr[sl], brk[sl]) if len(ag_sl) >= _MIN else (None, None)
+        return lap_g, _sg(slice(None, s1_idx)), _sg(slice(s1_idx, s2_idx)), _sg(slice(s2_idx, None))
+
+    def _bz_splits():
+        """Brake zone stats for lap and each sector."""
+        bz_lap = _brake_zone_stats(_find_brake_zones(accel_g, v_filt))
+        if not has_sectors:
+            return bz_lap, (None, None, None), (None, None, None), (None, None, None)
+        def _bz(ag_sl, vf_sl):
+            if len(ag_sl) < _MIN:
+                return None, None, None
+            return _brake_zone_stats(_find_brake_zones(ag_sl, vf_sl))
+        return (
+            bz_lap,
+            _bz(accel_g[:s1_idx],       v_filt[:s1_idx]),
+            _bz(accel_g[s1_idx:s2_idx], v_filt[s1_idx:s2_idx]),
+            _bz(accel_g[s2_idx:],       v_filt[s2_idx:]),
+        )
+
+    # -------------------------------------------------------------------
+    # Compute all metrics
+    # -------------------------------------------------------------------
+    pg_lap, pg_s1, pg_s2, pg_s3 = _peak_g_splits()
+    ms_lap, ms_s1, ms_s2, ms_s3 = _maxspd_splits()
+
+    coast_mask = (throttle_reg < 1) & (brake_reg == 0)
+    cr_lap, cr_s1, cr_s2, cr_s3 = _ratio_splits(coast_mask)
+    cd_lap, cd_s1, cd_s2, cd_s3 = _dist_splits(coast_mask)
+
+    ft_mask = throttle_reg >= 99
+    ft_lap, ft_s1, ft_s2, ft_s3 = _ratio_splits(ft_mask)
+
+    tb_mask = (brake_reg > 0) & (throttle_reg >= 10)
+    tb_lap, tb_s1, tb_s2, tb_s3 = _ratio_splits(tb_mask)
+
+    tv_lap, tv_s1, tv_s2, tv_s3 = _thr_var_splits()
+
+    if drs_reg is not None:
+        drs_open      = drs_reg >= _DRS_OPEN_THRESHOLD
+        drs_act_count = int(np.sum(np.diff(drs_open.astype(int)) > 0))
+        drs_dist_m    = float(np.sum(dist[drs_open]))
+    else:
+        drs_act_count = None
+        drs_dist_m    = None
+
+    bz_lap, bz_s1, bz_s2, bz_s3 = _bz_splits()
+
+    # -------------------------------------------------------------------
+    # Round helpers
+    # -------------------------------------------------------------------
+    def _r4(v_): return round(float(v_), 4) if v_ is not None else None
+    def _r1(v_): return round(float(v_), 1) if v_ is not None else None
+    def _r6(v_): return round(float(v_), 6) if v_ is not None else None
+
+    return {
+        # Longitudinal G — existing metric names preserved
+        'peak_accel_g':     _r4(pg_lap[0]),
+        'peak_decel_g_abs': _r4(pg_lap[1]),
+
+        # Per-sector peak G (lap = same as peak_accel/decel_g above)
+        'max_linear_acceleration_g_lap': _r4(pg_lap[0]),
+        'max_linear_acceleration_g_s1':  _r4(pg_s1[0]),
+        'max_linear_acceleration_g_s2':  _r4(pg_s2[0]),
+        'max_linear_acceleration_g_s3':  _r4(pg_s3[0]),
+        'max_linear_deceleration_g_lap': _r4(pg_lap[1]),
+        'max_linear_deceleration_g_s1':  _r4(pg_s1[1]),
+        'max_linear_deceleration_g_s2':  _r4(pg_s2[1]),
+        'max_linear_deceleration_g_s3':  _r4(pg_s3[1]),
+
+        # Max speed (km/h) from resampled signal (not filtered)
+        'max_speed_kph_lap': _r1(ms_lap),
+        'max_speed_kph_s1':  _r1(ms_s1),
+        'max_speed_kph_s2':  _r1(ms_s2),
+        'max_speed_kph_s3':  _r1(ms_s3),
+
+        # Coasting: throttle < 1% AND brake == 0
+        'coasting_ratio_lap':      _r4(cr_lap),
+        'coasting_ratio_s1':       _r4(cr_s1),
+        'coasting_ratio_s2':       _r4(cr_s2),
+        'coasting_ratio_s3':       _r4(cr_s3),
+        'coasting_distance_m_lap': _r1(cd_lap),
+        'coasting_distance_m_s1':  _r1(cd_s1),
+        'coasting_distance_m_s2':  _r1(cd_s2),
+        'coasting_distance_m_s3':  _r1(cd_s3),
+
+        # Full throttle: throttle >= 99%
+        'full_throttle_pct_lap': _r4(ft_lap),
+        'full_throttle_pct_s1':  _r4(ft_s1),
+        'full_throttle_pct_s2':  _r4(ft_s2),
+        'full_throttle_pct_s3':  _r4(ft_s3),
+
+        # Throttle-brake overlap: brake > 0 AND throttle >= 10% (trail braking proxy)
+        'throttle_brake_overlap_ratio_lap': _r4(tb_lap),
+        'throttle_brake_overlap_ratio_s1':  _r4(tb_s1),
+        'throttle_brake_overlap_ratio_s2':  _r4(tb_s2),
+        'throttle_brake_overlap_ratio_s3':  _r4(tb_s3),
+
+        # Throttle input variance: var(diff(throttle)) — higher = rougher inputs
+        'throttle_input_variance_lap': _r6(tv_lap),
+        'throttle_input_variance_s1':  _r6(tv_s1),
+        'throttle_input_variance_s2':  _r6(tv_s2),
+        'throttle_input_variance_s3':  _r6(tv_s3),
+
+        # DRS (lap-level only — no meaningful per-sector breakdown)
+        'drs_activation_count': drs_act_count,
+        'drs_distance_m':       _r1(drs_dist_m),
+
+        # Brake zones — contiguous windows where decel > _BRAKE_G_THRESHOLD
+        'brake_zone_count_lap':         bz_lap[0],
+        'brake_zone_count_s1':          bz_s1[0] if has_sectors else None,
+        'brake_zone_count_s2':          bz_s2[0] if has_sectors else None,
+        'brake_zone_count_s3':          bz_s3[0] if has_sectors else None,
+        'mean_peak_decel_g_lap':        _r4(bz_lap[1]),
+        'mean_peak_decel_g_s1':         _r4(bz_s1[1]) if has_sectors else None,
+        'mean_peak_decel_g_s2':         _r4(bz_s2[1]) if has_sectors else None,
+        'mean_peak_decel_g_s3':         _r4(bz_s3[1]) if has_sectors else None,
+        'speed_at_brake_start_kph_lap': _r1(bz_lap[2]),
+        'speed_at_brake_start_kph_s1':  _r1(bz_s1[2]) if has_sectors else None,
+        'speed_at_brake_start_kph_s2':  _r1(bz_s2[2]) if has_sectors else None,
+        'speed_at_brake_start_kph_s3':  _r1(bz_s3[2]) if has_sectors else None,
+    }
 
 
 def ingest_lap_metrics(
     client: Client,
     session_key: int,
     laps: list[dict],
-) -> dict[int, list[tuple[float, float]]]:
-    """Compute windowed peak g per lap and upsert into `lap_metrics`.
+) -> dict[int, dict[int, dict]]:
+    """Compute all car-data derived metrics per lap and upsert into ``lap_metrics``.
 
-    Uses a single get_car_data call per driver (full race window) and slices
-    client-side, matching the batch-fetch pattern used throughout the pipeline.
+    Fetches car_data once per driver (full session window) and slices
+    client-side — never loops per-lap over the API.
 
-    Returns a dict mapping driver_number → list of (peak_accel_g, peak_decel_g_abs)
-    for use by ingest_race_peak_g_summary.  Laps where _compute_peak_g returns None
-    or either channel is None are silently excluded from the dict (they are not
-    upserted to lap_metrics either).
+    Returns ``{driver_number: {lap_number: metrics_dict}}`` so callers can
+    look up any per-lap metric for a specific lap number without re-querying.
     """
     import pandas as pd
-
-    # Group non-pit-out laps by driver, sorted by date_start.
     from collections import defaultdict
+
     laps_by_driver: dict[int, list[dict]] = defaultdict(list)
     for lap in laps:
         dn = lap.get('driver_number')
@@ -711,7 +988,7 @@ def ingest_lap_metrics(
             laps_by_driver[dn].append(lap)
 
     rows: list[dict] = []
-    driver_stats: dict[int, list[tuple[float, float]]] = {}
+    driver_lap_metrics: dict[int, dict[int, dict]] = {}
 
     for dn, driver_laps in laps_by_driver.items():
         driver_laps = sorted(driver_laps, key=lambda x: x['date_start'])
@@ -730,87 +1007,164 @@ def ingest_lap_metrics(
         df_all['date'] = pd.to_datetime(df_all['date'])
         df_all = df_all.sort_values('date').reset_index(drop=True)
 
-        lap_stats: list[tuple[float, float]] = []
         for i in range(len(driver_laps) - 1):
-            lap      = driver_laps[i]
-            lap_num  = lap.get('lap_number', i + 1)
-            t0       = pd.to_datetime(lap['date_start'])
-            t1       = pd.to_datetime(driver_laps[i + 1]['date_start'])
+            lap     = driver_laps[i]
+            lap_num = lap.get('lap_number', i + 1)
+            t0      = pd.to_datetime(lap['date_start'])
+            t1      = pd.to_datetime(driver_laps[i + 1]['date_start'])
             lap_data = df_all[(df_all['date'] >= t0) & (df_all['date'] < t1)]
 
-            result = _compute_peak_g(lap_data.to_dict('records'))
+            # Sector boundary timestamps (absolute epoch seconds)
+            t0_epoch = t0.timestamp()
+            s1_dur   = lap.get('duration_sector_1')
+            s2_dur   = lap.get('duration_sector_2')
+            s1_end_t = (t0_epoch + float(s1_dur)) if s1_dur else None
+            s2_end_t = (t0_epoch + float(s1_dur) + float(s2_dur)) if (s1_dur and s2_dur) else None
+
+            result = _compute_lap_metrics(
+                lap_data.to_dict('records'),
+                s1_end_t=s1_end_t,
+                s2_end_t=s2_end_t,
+            )
             if result is None:
-                continue
-            peak_accel, peak_decel_abs = result
-            if peak_accel is None or peak_decel_abs is None:
                 continue
 
             rows.append({
-                'session_key':    session_key,
-                'driver_number':  dn,
-                'lap_number':     lap_num,
-                'peak_accel_g':   round(peak_accel,     4),
-                'peak_decel_g_abs': round(peak_decel_abs, 4),
+                'session_key':   session_key,
+                'driver_number': dn,
+                'lap_number':    lap_num,
+                **result,
             })
-            lap_stats.append((peak_accel, peak_decel_abs))
-
-        if lap_stats:
-            driver_stats[dn] = lap_stats
+            if dn not in driver_lap_metrics:
+                driver_lap_metrics[dn] = {}
+            driver_lap_metrics[dn][lap_num] = result
 
     _upsert(client, 'lap_metrics', rows)
-    return driver_stats
+    return driver_lap_metrics
 
 
 def ingest_race_peak_g_summary(
     client: Client,
     session_key: int,
-    driver_stats: dict[int, list[tuple[float, float]]],
+    driver_lap_metrics: dict[int, dict[int, dict]],
 ) -> None:
-    """Aggregate per-lap peak g into per-driver race means and upsert to `race_results`.
+    """Aggregate per-lap peak g into per-driver race means and upsert to ``race_results``.
 
     Two averages per channel:
-      mean_peak_*          — all laps (raw windowed values)
-      mean_peak_*_clean    — laps within plausibility bounds (accel ≤ 4 g, decel ≤ 8 g)
+      mean_peak_*        — all laps (raw windowed values, includes outliers)
+      mean_peak_*_clean  — laps within plausibility bounds (accel ≤ 4 g, decel ≤ 8 g)
 
-    Bounds are not applied at the lap_metrics level so outlier laps remain
-    inspectable in that table.
+    Outlier laps remain visible in ``lap_metrics``; the clean averages give a
+    reliable summary for the race results table.
     """
-    _ACCEL_BOUND = 4.0   # g — above this a lap is considered a noise artefact
-    _DECEL_BOUND = 8.0   # g — above this a lap is considered a noise artefact
+    _ACCEL_BOUND = 4.0
+    _DECEL_BOUND = 8.0
 
     rows: list[dict] = []
-    for dn, stats in driver_stats.items():
-        accels = [s[0] for s in stats]
-        decels = [s[1] for s in stats]
+    for dn, lap_metrics_by_num in driver_lap_metrics.items():
+        accels = [m['peak_accel_g']     for m in lap_metrics_by_num.values() if m.get('peak_accel_g')     is not None]
+        decels = [m['peak_decel_g_abs'] for m in lap_metrics_by_num.values() if m.get('peak_decel_g_abs') is not None]
+        if not accels or not decels:
+            continue
         accels_clean = [a for a in accels if a <= _ACCEL_BOUND]
         decels_clean = [d for d in decels if d <= _DECEL_BOUND]
 
         rows.append({
-            'session_key':              session_key,
-            'driver_number':            dn,
-            'mean_peak_accel_g':        round(sum(accels) / len(accels), 4),
-            'mean_peak_accel_g_clean':  round(sum(accels_clean) / len(accels_clean), 4) if accels_clean else None,
-            'mean_peak_decel_g_abs':    round(sum(decels) / len(decels), 4),
+            'session_key':                 session_key,
+            'driver_number':               dn,
+            'mean_peak_accel_g':           round(sum(accels) / len(accels), 4),
+            'mean_peak_accel_g_clean':     round(sum(accels_clean) / len(accels_clean), 4) if accels_clean else None,
+            'mean_peak_decel_g_abs':       round(sum(decels) / len(decels), 4),
             'mean_peak_decel_g_abs_clean': round(sum(decels_clean) / len(decels_clean), 4) if decels_clean else None,
         })
 
     _upsert(client, 'race_results', rows)
 
 
-def recompute_lap_metrics(client: Client, session_key: int, laps: list[dict], session_type: str) -> None:
-    """Regenerate derived metrics for a session.
+def ingest_qualifying_peak_g_summary(
+    client: Client,
+    session_key: int,
+    driver_lap_metrics: dict[int, dict[int, dict]],
+    best_per_phase: dict[int, dict[str, tuple[float, int]]],
+) -> None:
+    """Upsert peak G for each driver's best qualifying lap per phase to ``qualifying_results``.
 
-    Currently computes windowed peak longitudinal g per lap (lap_metrics table)
-    and per-driver race averages (race_results table).  Only runs for race/sprint
-    sessions — qualifying has no meaningful deceleration/acceleration comparison.
+    Uses the lap number that produced the best time in each phase (Q1/Q2/Q3) to
+    look up the pre-computed peak G from ``driver_lap_metrics``.  This links the
+    G-force metric to the driver's representative lap in each phase rather than
+    independently optimising for the highest-G lap.
     """
-    if session_type not in ('race', 'sprint'):
-        print(f"  [skip] lap_metrics: session type '{session_type}' — race/sprint only")
-        return
-    print("  computing windowed peak g per lap …")
-    driver_stats = ingest_lap_metrics(client, session_key, laps)
-    ingest_race_peak_g_summary(client, session_key, driver_stats)
-    print(f"  lap_metrics: {sum(len(v) for v in driver_stats.values())} laps across {len(driver_stats)} drivers")
+    rows: list[dict] = []
+    for dn, phase_best in best_per_phase.items():
+        lap_metrics = driver_lap_metrics.get(dn, {})
+
+        def _phase_g(phase):
+            pb = phase_best.get(phase)
+            if pb is None:
+                return None, None
+            _, lap_num = pb
+            if lap_num is None:
+                return None, None
+            m = lap_metrics.get(lap_num)
+            if m is None:
+                return None, None
+            return m.get('peak_accel_g'), m.get('peak_decel_g_abs')
+
+        q1_a, q1_d = _phase_g('Q1')
+        q2_a, q2_d = _phase_g('Q2')
+        q3_a, q3_d = _phase_g('Q3')
+
+        if all(v is None for v in (q1_a, q1_d, q2_a, q2_d, q3_a, q3_d)):
+            continue
+
+        rows.append({
+            'session_key':         session_key,
+            'driver_number':       dn,
+            'q1_peak_accel_g':     q1_a,
+            'q1_peak_decel_g_abs': q1_d,
+            'q2_peak_accel_g':     q2_a,
+            'q2_peak_decel_g_abs': q2_d,
+            'q3_peak_accel_g':     q3_a,
+            'q3_peak_decel_g_abs': q3_d,
+        })
+
+    _upsert(client, 'qualifying_results', rows)
+
+
+def recompute_lap_metrics(
+    client: Client,
+    session_key: int,
+    laps: list[dict],
+    session_type: str,
+    rc_rows: list[dict] | None = None,
+    stints_rows: list[dict] | None = None,
+) -> None:
+    """Regenerate derived metrics for a session without re-fetching raw data.
+
+    For race/sprint sessions: populates ``lap_metrics`` with all car-data metrics
+    and aggregates peak G means into ``race_results``.
+
+    For qualifying sessions: populates ``lap_metrics`` per lap and upserts peak G
+    for each driver's best lap per phase into ``qualifying_results``.
+
+    ``rc_rows`` is required for qualifying sessions to assign phase labels to laps.
+    """
+    if session_type in ('race', 'sprint'):
+        print("  computing lap metrics (race/sprint) …")
+        driver_lap_metrics = ingest_lap_metrics(client, session_key, laps)
+        ingest_race_peak_g_summary(client, session_key, driver_lap_metrics)
+        total = sum(len(v) for v in driver_lap_metrics.values())
+        print(f"  lap_metrics: {total} laps across {len(driver_lap_metrics)} drivers")
+    elif session_type in ('qualifying', 'sprint qualifying', 'sprint shootout'):
+        print("  computing lap metrics (qualifying) …")
+        laps_with_phases = _assign_qualifying_phases(laps, rc_rows or [])
+        best_per_phase   = _compute_qualifying_best_per_phase(laps_with_phases)
+        driver_lap_metrics = ingest_lap_metrics(client, session_key, laps_with_phases)
+        ingest_qualifying_peak_g_summary(client, session_key, driver_lap_metrics, best_per_phase)
+        total = sum(len(v) for v in driver_lap_metrics.values())
+        print(f"  lap_metrics: {total} laps across {len(driver_lap_metrics)} drivers")
+    else:
+        print(f"  [skip] lap_metrics: session type '{session_type}' not supported for recompute")
 
 
 # ---------------------------------------------------------------------------
@@ -865,7 +1219,8 @@ def process_session(client: Client, session_key: int, recompute: bool = False) -
         ingest_starting_grid(client, session_key)
 
     if recompute:
-        recompute_lap_metrics(client, session_key, laps, session_type)
+        recompute_lap_metrics(client, session_key, laps, session_type,
+                              rc_rows=rc_rows, stints_rows=stints_rows)
 
     elapsed = time.time() - t0
     stats = openf1.get_stats()

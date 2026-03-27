@@ -199,6 +199,31 @@ All tables populated correctly for meeting 1280 (2026 Chinese GP).
 
 ---
 
+### Lateral G Validation — Next (scoped 2026-03-27)
+
+**Research notebook to build:** `research/car_velocity/lateral_g_validation.py`
+
+**Part A — Cutoff frequency justification (spectral analysis)**
+- Residual analysis and spectral analysis (PSD via Welch's method) of raw XY position data to identify the noise floor and signal band
+- Compare residuals between raw PCHIP-resampled XY and filtered variants (0.3, 0.5 Hz) to quantify how much corner geometry is retained vs. lost at each cutoff
+- Produce a justification for the chosen cutoff (currently 0.3 Hz looks plausible based on visual assessment; 0.5 Hz is the longitudinal standard — spectral analysis will confirm which is more appropriate for the XY sensor)
+
+**Part B — Observational validation via tyre wear (Bayesian mixed model)**
+- Hypothesis: lateral G should on average decrease as a tyre ages — as rubber degrades, drivers manage grip by reducing corner entry speed and load
+- Dataset: join `lap_metrics` (peak/mean lateral G per sector) with `stints` (compound, tyre_age_at_start + lap_number_in_stint proxy) and `race_results`/`drivers` (constructor, driver)
+- Mixed model in **PyMC** pooling the following grouping factors:
+  - Tyre compound (Hard / Medium / Soft — different baseline grip and degradation curves)
+  - Driver (some drivers are more aggressive on tyres lap-to-lap)
+  - Constructor (cars differ in mechanical grip and tyre loading)
+  - Sector (S1/S2/S3 have different corner compositions; lateral G baseline differs)
+- Fixed effect of interest: tyre age (laps on tyre), expected negative coefficient
+- Validate for all three G measures: peak lateral G, peak accel G, peak decel G
+  - Accel/decel degradation with tyre age is less obvious but a plausible secondary finding
+- Expected output: posterior distribution of the tyre-age coefficient; if credible interval excludes zero in the negative direction, the metric is tracking something physically real
+- This serves as a ground-truth check before committing lateral G to the pipeline schema
+
+---
+
 ### Signal Processing Research — Complete (2026-03-26)
 
 **`research/car_velocity/noise.py`** — full signal processing pipeline validated across all 20 drivers for the 2026 Chinese GP race session.
@@ -212,6 +237,27 @@ All tables populated correctly for meeting 1280 (2026 Chinese GP).
 - Windowed approach (throttle/brake gating) is strictly better than global max/min for race averages
 - Brake is nearest-neighbour resampled (preserves binary 0/100 character); throttle is linearly interpolated
 - Left-edge alignment: `accel_g[i]` spans `[t_reg[i], t_reg[i+1]]` → masks use `throttle_reg[:-1]`
+
+---
+
+### Lateral G Research — Complete (2026-03-27)
+
+**`research/car_velocity/lateral_g.py`** — three-method comparison notebook validated across multiple drivers (2026 Chinese GP Race).
+
+**Method evaluated:** Three independent approaches — circumradius (3-point), yaw rate (heading derivative), and cross-track acceleration (double differentiation of position).
+
+**Finding:** Yaw-rate method selected as pipeline standard.
+- `lat_g = v_car × |dθ/dt| / 9.81` where θ = atan2(ẏ, ẋ) from PCHIP-differentiated XY
+- 0.3 Hz Butterworth cutoff on XY (0.5 Hz appears to over-smooth corner geometry; 0.3 Hz retains known high-G corners without anomalous noise spikes — to be confirmed by spectral analysis in validation notebook)
+- Speed sourced from `/car_data` sensor (not position-derived)
+- Known high-G corners at Shanghai (T1 hairpin, T14 hairpin, T3–T6 esses) correctly "lit up" in track map colour plots; absolute values in plausible 2–3 g range for those corners
+- Circumradius had a collinearity singularity bug (R→0 rather than R→∞ on straights); fixed but method still discarded in favour of yaw rate
+- Cross-track acceleration (Method 3) noisier due to double differentiation
+
+**Metrics to store (peak + mean per sector):**
+- `peak_lat_g_s1/s2/s3/lap`, `mean_lat_g_s1/s2/s3/lap`
+
+**Not yet pipeline-integrated** — validation notebook (spectral analysis + Bayesian tyre-wear model) required first.
 
 ---
 
@@ -263,7 +309,7 @@ Full scope documented in `product_roadmap.md`. Peak G (longitudinal) is the firs
 
 **Next pipeline work:**
 - Extend `recompute_lap_metrics` to qualifying sessions — per-lap peak G stored in `lap_metrics` using the same `_compute_peak_g` function; session-level aggregate to `qualifying_results` (best-lap peak G per phase, not an average). See roadmap Phase 5.
-- Cornering G estimation research — lateral G from XY location data + speed. Research notebook first, pipeline second. See roadmap Phase 5 for full scope.
+- Cornering G estimation research — **lateral G research complete** (see below). Next: validation notebook before pipeline integration.
 - Remaining car_data metrics: coasting ratio/distance, throttle/brake overlap, full throttle %, throttle input variance, DRS activation/distance, max speed per sector, brake zone count, mean peak decel per sector.
 - Battle states: gap_ahead/behind per sector from intervals × sector timestamps.
 - `pipeline/seed_circuits.py` — one-off script to populate `circuits` reference table.
