@@ -1,6 +1,7 @@
 """Comprehensive unit and integration tests for pipeline/ingest.py."""
 
 import unittest
+from contextlib import ExitStack
 from unittest.mock import MagicMock, call, patch
 
 import httpx
@@ -20,6 +21,10 @@ from ingest import (
     ingest_championship_drivers,
     ingest_championship_teams,
     ingest_drivers,
+    ingest_brake_entry_speed_ranks,
+    ingest_fastest_lap_flag,
+    ingest_lap_flags,
+    ingest_session_sector_bests,
     ingest_intervals,
     ingest_lap_metrics,
     ingest_laps,
@@ -559,6 +564,106 @@ class TestIngestRaceResults(unittest.TestCase):
 
 
 # ===========================================================================
+# ingest_fastest_lap_flag
+# ===========================================================================
+
+class TestIngestFastestLapFlag(unittest.TestCase):
+
+    def _result(self, dn, dnf=False, dns=False, dsq=False):
+        return {"driver_number": dn, "dnf": dnf, "dns": dns, "dsq": dsq}
+
+    def _lap(self, dn, duration):
+        return {"driver_number": dn, "lap_duration": duration}
+
+    @patch("ingest.openf1.get_session_result")
+    def test_correct_driver_gets_true(self, mock_result):
+        mock_result.return_value = [self._result(44), self._result(1)]
+        laps = [self._lap(44, 90.0), self._lap(1, 89.5)]  # driver 1 is faster
+        client = _mock_client()
+        ingest_fastest_lap_flag(client, 9000, laps)
+        upserted = client.table.return_value.upsert.call_args.args[0]
+        by_driver = {r["driver_number"]: r["fastest_lap_flag"] for r in upserted}
+        self.assertTrue(by_driver[1])
+        self.assertFalse(by_driver[44])
+
+    @patch("ingest.openf1.get_session_result")
+    def test_dnf_driver_excluded_from_consideration(self, mock_result):
+        mock_result.return_value = [self._result(44), self._result(1, dnf=True)]
+        # driver 1 has the fastest lap time but DNF → should not win
+        laps = [self._lap(44, 90.0), self._lap(1, 85.0)]
+        client = _mock_client()
+        ingest_fastest_lap_flag(client, 9000, laps)
+        upserted = client.table.return_value.upsert.call_args.args[0]
+        # only driver 44 is classified, so they get the flag
+        self.assertEqual(len(upserted), 1)
+        self.assertEqual(upserted[0]["driver_number"], 44)
+        self.assertTrue(upserted[0]["fastest_lap_flag"])
+
+    @patch("ingest.openf1.get_session_result")
+    def test_dns_driver_excluded(self, mock_result):
+        mock_result.return_value = [self._result(44), self._result(63, dns=True)]
+        laps = [self._lap(44, 90.0), self._lap(63, 88.0)]
+        client = _mock_client()
+        ingest_fastest_lap_flag(client, 9000, laps)
+        upserted = client.table.return_value.upsert.call_args.args[0]
+        self.assertEqual(len(upserted), 1)
+        self.assertTrue(upserted[0]["fastest_lap_flag"])
+
+    @patch("ingest.openf1.get_session_result")
+    def test_dsq_driver_excluded(self, mock_result):
+        mock_result.return_value = [self._result(44), self._result(16, dsq=True)]
+        laps = [self._lap(44, 90.0), self._lap(16, 87.0)]
+        client = _mock_client()
+        ingest_fastest_lap_flag(client, 9000, laps)
+        upserted = client.table.return_value.upsert.call_args.args[0]
+        self.assertEqual(len(upserted), 1)
+        self.assertTrue(upserted[0]["fastest_lap_flag"])
+
+    @patch("ingest.openf1.get_session_result")
+    def test_invalid_lap_durations_excluded(self, mock_result):
+        mock_result.return_value = [self._result(44), self._result(1)]
+        laps = [
+            self._lap(44, "INVALID"),
+            self._lap(44, 0.0),
+            self._lap(44, None),
+            self._lap(44, 91.0),   # only valid lap for driver 44
+            self._lap(1, "bad"),   # driver 1 has no valid laps
+        ]
+        client = _mock_client()
+        ingest_fastest_lap_flag(client, 9000, laps)
+        upserted = client.table.return_value.upsert.call_args.args[0]
+        by_driver = {r["driver_number"]: r["fastest_lap_flag"] for r in upserted}
+        self.assertTrue(by_driver[44])
+        self.assertFalse(by_driver[1])
+
+    @patch("ingest.openf1.get_session_result")
+    def test_empty_results_produces_no_upsert(self, mock_result):
+        mock_result.return_value = []
+        client = _mock_client()
+        ingest_fastest_lap_flag(client, 9000, [self._lap(44, 90.0)])
+        client.table.assert_not_called()
+
+    @patch("ingest.openf1.get_session_result")
+    def test_all_classified_drivers_receive_a_flag_row(self, mock_result):
+        mock_result.return_value = [self._result(44), self._result(1), self._result(63)]
+        laps = [self._lap(44, 91.0), self._lap(1, 90.0), self._lap(63, 92.0)]
+        client = _mock_client()
+        ingest_fastest_lap_flag(client, 9000, laps)
+        upserted = client.table.return_value.upsert.call_args.args[0]
+        self.assertEqual(len(upserted), 3)
+        flags = {r["driver_number"]: r["fastest_lap_flag"] for r in upserted}
+        self.assertEqual(sum(flags.values()), 1)   # exactly one True
+        self.assertTrue(flags[1])                  # driver 1 has shortest lap
+
+    @patch("ingest.openf1.get_session_result")
+    def test_no_valid_laps_produces_no_upsert(self, mock_result):
+        mock_result.return_value = [self._result(44)]
+        client = _mock_client()
+        ingest_fastest_lap_flag(client, 9000, [])   # no laps at all
+        client.table.assert_not_called()
+
+
+# ===========================================================================
 # _assign_qualifying_phases
 # ===========================================================================
 
@@ -1092,6 +1197,83 @@ class TestIngestStartingGrid(unittest.TestCase):
 
 
 # ===========================================================================
+# ingest_weather
+# ===========================================================================
+
+class TestIngestWeather(unittest.TestCase):
+
+    def _row(self, **overrides):
+        base = {
+            "session_key":       9000,
+            "date":              "2024-03-02T13:00:00Z",
+            "track_temperature": 45.2,
+            "air_temperature":   28.1,
+            "humidity":          42.0,
+            "pressure":          1012.3,
+            "rainfall":          False,
+            "wind_direction":    180,
+            "wind_speed":        3.5,
+        }
+        base.update(overrides)
+        return base
+
+    @patch("ingest.openf1.get_weather")
+    def test_all_fields_stored(self, mock_get_weather):
+        mock_get_weather.return_value = [self._row()]
+        client = _mock_client()
+        ingest_weather(client, 9000)
+        upserted = client.table.return_value.upsert.call_args.args[0]
+        row = upserted[0]
+        self.assertEqual(row["wind_speed"], 3.5)
+        self.assertEqual(row["wind_direction"], 180)
+        self.assertAlmostEqual(row["pressure"], 1012.3)
+        self.assertAlmostEqual(row["track_temperature"], 45.2)
+        self.assertAlmostEqual(row["air_temperature"], 28.1)
+        self.assertEqual(row["rainfall"], False)
+
+    @patch("ingest.openf1.get_weather")
+    def test_missing_wind_stored_as_none(self, mock_get_weather):
+        """wind_speed/wind_direction may be absent from some OpenF1 responses."""
+        mock_get_weather.return_value = [
+            self._row(wind_speed=None, wind_direction=None, pressure=None)
+        ]
+        client = _mock_client()
+        ingest_weather(client, 9000)
+        upserted = client.table.return_value.upsert.call_args.args[0]
+        self.assertIsNone(upserted[0]["wind_speed"])
+        self.assertIsNone(upserted[0]["wind_direction"])
+        self.assertIsNone(upserted[0]["pressure"])
+
+    @patch("ingest.openf1.get_weather")
+    def test_missing_session_key_filtered(self, mock_get_weather):
+        mock_get_weather.return_value = [self._row(session_key=None)]
+        client = _mock_client()
+        ingest_weather(client, 9000)
+        client.table.assert_not_called()
+
+    @patch("ingest.openf1.get_weather")
+    def test_missing_date_filtered(self, mock_get_weather):
+        mock_get_weather.return_value = [self._row(date=None)]
+        client = _mock_client()
+        ingest_weather(client, 9000)
+        client.table.assert_not_called()
+
+    @patch("ingest.openf1.get_weather")
+    def test_empty_response_no_upsert(self, mock_get_weather):
+        mock_get_weather.return_value = []
+        client = _mock_client()
+        ingest_weather(client, 9000)
+        client.table.assert_not_called()
+
+    @patch("ingest.openf1.get_weather")
+    def test_upserts_to_weather_table(self, mock_get_weather):
+        mock_get_weather.return_value = [self._row()]
+        client = _mock_client()
+        ingest_weather(client, 9000)
+        client.table.assert_called_with("weather")
+
+
+# ===========================================================================
 # process_session — integration tests
 # ===========================================================================
 
@@ -1207,18 +1389,20 @@ class TestProcessSessionRace(unittest.TestCase):
     @patch("ingest.ingest_championship_teams")
     @patch("ingest.ingest_qualifying_results")
     @patch("ingest.ingest_starting_grid")
+    @patch("ingest.ingest_fastest_lap_flag")
     def test_race_calls_race_specific_functions(
-        self, mock_starting_grid, mock_qual_results, mock_champ_teams,
-        mock_champ_drivers, mock_intervals, mock_overtakes, mock_race_results,
-        mock_race_control, mock_weather, mock_pit_stops, mock_stints,
-        mock_laps, mock_drivers, mock_session, mock_meeting, mock_get_session,
-        mock_reset_stats,
+        self, mock_fastest_lap_flag, mock_starting_grid, mock_qual_results,
+        mock_champ_teams, mock_champ_drivers, mock_intervals, mock_overtakes,
+        mock_race_results, mock_race_control, mock_weather, mock_pit_stops,
+        mock_stints, mock_laps, mock_drivers, mock_session, mock_meeting,
+        mock_get_session, mock_reset_stats,
     ):
         client = _mock_client()
 
         process_session(client, 9000)
 
         mock_race_results.assert_called_once()
+        mock_fastest_lap_flag.assert_called_once()
         mock_overtakes.assert_called_once()
         mock_intervals.assert_called_once()
         mock_champ_drivers.assert_called_once()
@@ -1241,12 +1425,13 @@ class TestProcessSessionRace(unittest.TestCase):
     @patch("ingest.ingest_championship_teams")
     @patch("ingest.ingest_qualifying_results")
     @patch("ingest.ingest_starting_grid")
+    @patch("ingest.ingest_fastest_lap_flag")
     def test_race_does_not_call_qualifying_functions(
-        self, mock_starting_grid, mock_qual_results, mock_champ_teams,
-        mock_champ_drivers, mock_intervals, mock_overtakes, mock_race_results,
-        mock_race_control, mock_weather, mock_pit_stops, mock_stints,
-        mock_laps, mock_drivers, mock_session, mock_meeting, mock_get_session,
-        mock_reset_stats,
+        self, mock_fastest_lap_flag, mock_starting_grid, mock_qual_results,
+        mock_champ_teams, mock_champ_drivers, mock_intervals, mock_overtakes,
+        mock_race_results, mock_race_control, mock_weather, mock_pit_stops,
+        mock_stints, mock_laps, mock_drivers, mock_session, mock_meeting,
+        mock_get_session, mock_reset_stats,
     ):
         client = _mock_client()
 
@@ -1272,12 +1457,13 @@ class TestProcessSessionRace(unittest.TestCase):
     @patch("ingest.ingest_championship_teams")
     @patch("ingest.ingest_qualifying_results")
     @patch("ingest.ingest_starting_grid")
+    @patch("ingest.ingest_fastest_lap_flag")
     def test_race_calls_common_functions(
-        self, mock_starting_grid, mock_qual_results, mock_champ_teams,
-        mock_champ_drivers, mock_intervals, mock_overtakes, mock_race_results,
-        mock_race_control, mock_weather, mock_pit_stops, mock_stints,
-        mock_laps, mock_drivers, mock_session, mock_meeting, mock_get_session,
-        mock_reset_stats,
+        self, mock_fastest_lap_flag, mock_starting_grid, mock_qual_results,
+        mock_champ_teams, mock_champ_drivers, mock_intervals, mock_overtakes,
+        mock_race_results, mock_race_control, mock_weather, mock_pit_stops,
+        mock_stints, mock_laps, mock_drivers, mock_session, mock_meeting,
+        mock_get_session, mock_reset_stats,
     ):
         client = _mock_client()
 
@@ -1342,18 +1528,20 @@ class TestProcessSessionQualifying(unittest.TestCase):
     @patch("ingest.ingest_championship_teams")
     @patch("ingest.ingest_qualifying_results")
     @patch("ingest.ingest_starting_grid")
+    @patch("ingest.ingest_fastest_lap_flag")
     def test_qualifying_does_not_call_race_functions(
-        self, mock_starting_grid, mock_qual_results, mock_champ_teams,
-        mock_champ_drivers, mock_intervals, mock_overtakes, mock_race_results,
-        mock_race_control, mock_weather, mock_pit_stops, mock_stints,
-        mock_laps, mock_drivers, mock_session, mock_meeting, mock_get_session,
-        mock_reset_stats,
+        self, mock_fastest_lap_flag, mock_starting_grid, mock_qual_results,
+        mock_champ_teams, mock_champ_drivers, mock_intervals, mock_overtakes,
+        mock_race_results, mock_race_control, mock_weather, mock_pit_stops,
+        mock_stints, mock_laps, mock_drivers, mock_session, mock_meeting,
+        mock_get_session, mock_reset_stats,
     ):
         client = _mock_client()
 
         process_session(client, 9001)
 
         mock_race_results.assert_not_called()
+        mock_fastest_lap_flag.assert_not_called()
         mock_overtakes.assert_not_called()
         mock_intervals.assert_not_called()
         mock_champ_drivers.assert_not_called()
@@ -1414,18 +1602,20 @@ class TestProcessSessionSprint(unittest.TestCase):
     @patch("ingest.ingest_championship_teams")
     @patch("ingest.ingest_qualifying_results")
     @patch("ingest.ingest_starting_grid")
+    @patch("ingest.ingest_fastest_lap_flag")
     def test_sprint_calls_race_specific_functions(
-        self, mock_starting_grid, mock_qual_results, mock_champ_teams,
-        mock_champ_drivers, mock_intervals, mock_overtakes, mock_race_results,
-        mock_race_control, mock_weather, mock_pit_stops, mock_stints,
-        mock_laps, mock_drivers, mock_session, mock_meeting, mock_get_session,
-        mock_reset_stats,
+        self, mock_fastest_lap_flag, mock_starting_grid, mock_qual_results,
+        mock_champ_teams, mock_champ_drivers, mock_intervals, mock_overtakes,
+        mock_race_results, mock_race_control, mock_weather, mock_pit_stops,
+        mock_stints, mock_laps, mock_drivers, mock_session, mock_meeting,
+        mock_get_session, mock_reset_stats,
     ):
         client = _mock_client()
 
         process_session(client, 9002)
 
         mock_race_results.assert_called_once()
+        mock_fastest_lap_flag.assert_called_once()
         mock_overtakes.assert_called_once()
         mock_intervals.assert_called_once()
         mock_champ_drivers.assert_called_once()
@@ -1813,6 +2003,211 @@ class TestComputeLapMetrics(unittest.TestCase):
         ]
         self.assertIsNone(_compute_lap_metrics(records))
 
+    def test_coasting_ratio_nonzero_when_coasting(self):
+        # throttle=0 (<1%), brake=0 → every sample is a coasting sample
+        result = _compute_lap_metrics(_make_car_data(n=80, throttle=0, brake=0))
+        self.assertIsNotNone(result)
+        self.assertGreater(result['coasting_ratio_lap'], 0.0)
+
+    def test_coasting_distance_nonzero_when_coasting(self):
+        result = _compute_lap_metrics(_make_car_data(n=80, throttle=0, brake=0))
+        self.assertIsNotNone(result)
+        self.assertGreater(result['coasting_distance_m_lap'], 0.0)
+
+    def test_coasting_ratio_zero_when_braking(self):
+        # brake=100 disqualifies from coasting even if throttle < 1%
+        result = _compute_lap_metrics(_make_car_data(n=80, throttle=0, brake=100))
+        self.assertIsNotNone(result)
+        self.assertEqual(result['coasting_ratio_lap'], 0.0)
+
+    def test_drs_activation_count_counts_open_transitions(self):
+        import datetime
+        base = datetime.datetime(2024, 3, 2, 13, 0, 0)
+        records = []
+        for i in range(80):
+            # DRS opens at i=20 and i=60, closes at i=40 → 2 open transitions
+            drs = 14 if (20 <= i < 40 or i >= 60) else 0
+            records.append({
+                'date':     (base + datetime.timedelta(seconds=i)).strftime('%Y-%m-%dT%H:%M:%SZ'),
+                'speed':    200.0 + 0.5 * i,
+                'throttle': 100,
+                'brake':    0,
+                'drs':      drs,
+            })
+        result = _compute_lap_metrics(records)
+        self.assertIsNotNone(result)
+        self.assertEqual(result['drs_activation_count'], 2)
+        self.assertGreater(result['drs_distance_m'], 0.0)
+
+    def test_drs_fields_none_when_no_drs_column(self):
+        import datetime
+        base = datetime.datetime(2024, 3, 2, 13, 0, 0)
+        records = [
+            {
+                'date':     (base + datetime.timedelta(seconds=i)).strftime('%Y-%m-%dT%H:%M:%SZ'),
+                'speed':    200.0 + 0.5 * i,
+                'throttle': 100,
+                'brake':    0,
+                # no 'drs' key
+            }
+            for i in range(80)
+        ]
+        result = _compute_lap_metrics(records)
+        self.assertIsNotNone(result)
+        self.assertIsNone(result['drs_activation_count'])
+        self.assertIsNone(result['drs_distance_m'])
+
+    def test_throttle_brake_overlap_ratio_nonzero(self):
+        # throttle=50 (>= 10%), brake=100 (> 0) → every sample is overlap
+        result = _compute_lap_metrics(_make_car_data(n=80, throttle=50, brake=100, speed_slope=-0.5))
+        self.assertIsNotNone(result)
+        self.assertGreater(result['throttle_brake_overlap_ratio_lap'], 0.0)
+
+    def test_throttle_brake_overlap_ratio_zero_when_no_brake(self):
+        result = _compute_lap_metrics(_make_car_data(n=80, throttle=100, brake=0))
+        self.assertIsNotNone(result)
+        self.assertEqual(result['throttle_brake_overlap_ratio_lap'], 0.0)
+
+    def test_max_speed_kph_captures_peak(self):
+        # speed ramps from 200 to ~279 with slope=1.0 and 80 records
+        result = _compute_lap_metrics(_make_car_data(n=80, throttle=100, brake=0, speed_slope=1.0))
+        self.assertIsNotNone(result)
+        self.assertGreater(result['max_speed_kph_lap'], 250.0)
+
+    def test_sector_splits_populated_with_sector_times(self):
+        import datetime
+        import pandas as pd
+        records = _make_car_data(n=80, throttle=0, brake=0)
+        # Parse the first record's date the same way _compute_lap_metrics does so
+        # the epoch is in UTC regardless of the local timezone on the test machine.
+        t0_epoch = pd.to_datetime(records[0]['date']).timestamp()
+        result = _compute_lap_metrics(
+            records,
+            s1_end_t=t0_epoch + 25,
+            s2_end_t=t0_epoch + 50,
+        )
+        self.assertIsNotNone(result)
+        self.assertIsNotNone(result['coasting_ratio_s1'])
+        self.assertIsNotNone(result['coasting_ratio_s2'])
+        self.assertIsNotNone(result['coasting_ratio_s3'])
+        self.assertIsNotNone(result['max_speed_kph_s1'])
+        self.assertIsNotNone(result['max_speed_kph_s2'])
+        self.assertIsNotNone(result['max_speed_kph_s3'])
+
+    def test_brake_zone_count_nonzero_when_hard_braking(self):
+        # Build records with a steep speed drop in the second half that produces
+        # deceleration well above the 0.5g brake-zone threshold.
+        # 50 records gently accelerating (avoids dedup), then 30 records braking
+        # from ~625 km/h at 25 km/h per step (~0.71g > 0.5g threshold).
+        # All speeds are distinct so dedup never removes them.
+        import datetime
+        base = datetime.datetime(2024, 3, 2, 13, 0, 0)
+        records = []
+        start_speed = 600.0
+        for i in range(50):
+            records.append({
+                'date':     (base + datetime.timedelta(seconds=i)).strftime('%Y-%m-%dT%H:%M:%SZ'),
+                'speed':    start_speed + 0.5 * i,
+                'throttle': 100,
+                'brake':    0,
+                'drs':      0,
+            })
+        phase2_start = start_speed + 0.5 * 49  # 624.5 km/h
+        for j in range(30):
+            records.append({
+                'date':     (base + datetime.timedelta(seconds=50 + j)).strftime('%Y-%m-%dT%H:%M:%SZ'),
+                'speed':    max(phase2_start - 25.0 * j, 1.0),
+                'throttle': 0,
+                'brake':    100,
+                'drs':      0,
+            })
+        result = _compute_lap_metrics(records)
+        self.assertIsNotNone(result)
+        self.assertIsNotNone(result['brake_zone_count_lap'])
+        self.assertGreater(result['brake_zone_count_lap'], 0)
+        self.assertIsNotNone(result['mean_peak_decel_g_lap'])
+
+    def test_estimated_superclipping_distance_zero_when_accelerating(self):
+        # throttle >= 10, brake == 0, but car accelerates → no superclipping
+        result = _compute_lap_metrics(_make_car_data(n=80, throttle=100, brake=0, speed_slope=0.5))
+        self.assertIsNotNone(result)
+        self.assertEqual(result['estimated_superclipping_distance_m_lap'], 0.0)
+
+    def test_estimated_superclipping_distance_nonzero_when_decelerating_under_throttle(self):
+        # throttle=50 (>= 10%), brake=0, speed decreasing → superclipping condition met
+        result = _compute_lap_metrics(_make_car_data(n=80, throttle=50, brake=0, speed_slope=-0.5))
+        self.assertIsNotNone(result)
+        self.assertGreater(result['estimated_superclipping_distance_m_lap'], 0.0)
+
+    def test_estimated_superclipping_zero_when_braking_with_throttle(self):
+        # brake=100 disqualifies from superclipping even if throttle >= 10%
+        result = _compute_lap_metrics(_make_car_data(n=80, throttle=50, brake=100, speed_slope=-0.5))
+        self.assertIsNotNone(result)
+        self.assertEqual(result['estimated_superclipping_distance_m_lap'], 0.0)
+
+    def test_all_expected_keys_present_in_output(self):
+        result = _compute_lap_metrics(_make_car_data(n=80, throttle=100, brake=0))
+        self.assertIsNotNone(result)
+        for key in _MOCK_METRICS:
+            self.assertIn(key, result, f"Missing key: {key}")
+
+
+# ===========================================================================
+# process_session — recompute flag
+# ===========================================================================
+
+class TestProcessSessionRecompute(unittest.TestCase):
+    """process_session recompute=True triggers recompute_lap_metrics."""
+
+    _COMMON_PATCHES = [
+        "ingest.openf1.reset_stats",
+        "ingest.ingest_meeting",
+        "ingest.ingest_drivers",
+        "ingest.ingest_stints",
+        "ingest.ingest_pit_stops",
+        "ingest.ingest_weather",
+        "ingest.ingest_race_results",
+        "ingest.ingest_fastest_lap_flag",
+        "ingest.ingest_overtakes",
+        "ingest.ingest_intervals",
+        "ingest.ingest_championship_drivers",
+        "ingest.ingest_championship_teams",
+        "ingest.ingest_starting_grid",
+        "ingest.ingest_position",
+        "ingest.ingest_team_radio",
+    ]
+
+    def _run_with_patches(self, session_fixture, recompute):
+        """Run process_session with all side-effect functions patched out.
+
+        Returns the mock for recompute_lap_metrics so callers can inspect calls.
+        """
+        with ExitStack() as stack:
+            for target in self._COMMON_PATCHES:
+                stack.enter_context(patch(target))
+            stack.enter_context(patch("ingest.openf1.get_session", return_value=[session_fixture]))
+            stack.enter_context(patch("ingest.ingest_session", return_value=session_fixture))
+            stack.enter_context(patch("ingest.ingest_laps", return_value=[]))
+            stack.enter_context(patch("ingest.ingest_race_control", return_value=[]))
+            stack.enter_context(patch("ingest.ingest_qualifying_results", return_value={}))
+            mock_recompute = stack.enter_context(patch("ingest.recompute_lap_metrics"))
+            process_session(_mock_client(), session_fixture["session_key"], recompute=recompute)
+        return mock_recompute
+
+    def test_race_with_recompute_true_calls_recompute_lap_metrics(self):
+        mock_recompute = self._run_with_patches(RACE_SESSION, recompute=True)
+        mock_recompute.assert_called_once()
+        self.assertEqual(mock_recompute.call_args.args[3], 'race')
+
+    def test_qualifying_with_recompute_true_calls_recompute_lap_metrics(self):
+        mock_recompute = self._run_with_patches(QUALIFYING_SESSION, recompute=True)
+        mock_recompute.assert_called_once()
+        self.assertEqual(mock_recompute.call_args.args[3], 'qualifying')
+
+    def test_recompute_false_does_not_call_recompute_lap_metrics(self):
+        mock_recompute = self._run_with_patches(RACE_SESSION, recompute=False)
+        mock_recompute.assert_not_called()
+
 
 # ===========================================================================
 # ingest_lap_metrics
@@ -1846,6 +2241,8 @@ _MOCK_METRICS = {
     'coasting_ratio_s2': None,  'coasting_ratio_s3': None,
     'coasting_distance_m_lap': 50.0, 'coasting_distance_m_s1': None,
     'coasting_distance_m_s2': None,  'coasting_distance_m_s3': None,
+    'estimated_superclipping_distance_m_lap': 0.0, 'estimated_superclipping_distance_m_s1': None,
+    'estimated_superclipping_distance_m_s2': None, 'estimated_superclipping_distance_m_s3': None,
     'full_throttle_pct_lap': 0.6, 'full_throttle_pct_s1': None,
     'full_throttle_pct_s2': None, 'full_throttle_pct_s3': None,
     'throttle_brake_overlap_ratio_lap': 0.02, 'throttle_brake_overlap_ratio_s1': None,
@@ -2072,12 +2469,15 @@ class TestIngestQualifyingPeakGSummary(unittest.TestCase):
 
 class TestRecomputeLapMetricsQualifyingPath(unittest.TestCase):
 
+    @patch("ingest.ingest_brake_entry_speed_ranks")
     @patch("ingest.ingest_qualifying_peak_g_summary")
     @patch("ingest.ingest_lap_metrics")
     @patch("ingest._compute_qualifying_best_per_phase")
     @patch("ingest._assign_qualifying_phases")
+    @patch("ingest.ingest_session_sector_bests")
+    @patch("ingest.ingest_lap_flags")
     def test_qualifying_calls_correct_functions(
-        self, mock_aqp, mock_cqbp, mock_ilm, mock_iqpg
+        self, mock_ilf, mock_issb, mock_aqp, mock_cqbp, mock_ilm, mock_iqpg, mock_besr
     ):
         from ingest import recompute_lap_metrics
         mock_aqp.return_value = []
@@ -2089,22 +2489,33 @@ class TestRecomputeLapMetricsQualifyingPath(unittest.TestCase):
 
         recompute_lap_metrics(client, 9000, laps, 'qualifying', rc_rows=rc_rows)
 
+        mock_ilf.assert_called_once()
+        mock_issb.assert_called_once()
         mock_aqp.assert_called_once_with(laps, rc_rows)
         mock_cqbp.assert_called_once()
         mock_ilm.assert_called_once()
         mock_iqpg.assert_called_once()
+        mock_besr.assert_called_once()
 
+    @patch("ingest.ingest_brake_entry_speed_ranks")
     @patch("ingest.ingest_race_peak_g_summary")
     @patch("ingest.ingest_lap_metrics")
-    def test_race_does_not_call_qualifying_functions(self, mock_ilm, mock_rpgs):
-        from ingest import recompute_lap_metrics, ingest_qualifying_peak_g_summary
+    @patch("ingest.ingest_session_sector_bests")
+    @patch("ingest.ingest_lap_flags")
+    def test_race_does_not_call_qualifying_functions(
+        self, mock_ilf, mock_issb, mock_ilm, mock_rpgs, mock_besr
+    ):
+        from ingest import recompute_lap_metrics
         mock_ilm.return_value = {}
         client = _mock_client()
 
         with patch("ingest.ingest_qualifying_peak_g_summary") as mock_iqpg:
             recompute_lap_metrics(client, 9000, [], 'race')
+            mock_ilf.assert_called_once()
+            mock_issb.assert_called_once()
             mock_iqpg.assert_not_called()
             mock_rpgs.assert_called_once()
+            mock_besr.assert_called_once()
 
     @patch("ingest.ingest_lap_metrics")
     def test_practice_session_skipped(self, mock_ilm):
@@ -2112,6 +2523,665 @@ class TestRecomputeLapMetricsQualifyingPath(unittest.TestCase):
         client = _mock_client()
         recompute_lap_metrics(client, 9000, [], 'practice')
         mock_ilm.assert_not_called()
+
+
+# ===========================================================================
+# ingest_session_sector_bests
+# ===========================================================================
+
+class TestIngestSessionSectorBests(unittest.TestCase):
+
+    def _lap(self, driver_number=44, lap_number=1,
+             s1=30.0, s2=40.0, s3=25.0):
+        return {
+            'driver_number':    driver_number,
+            'lap_number':       lap_number,
+            'duration_sector_1': s1,
+            'duration_sector_2': s2,
+            'duration_sector_3': s3,
+        }
+
+    def _bests_row(self, client):
+        """Return the row upserted to session_sector_bests."""
+        calls = client.table.return_value.upsert.call_args_list
+        # session_sector_bests is upserted first (single-row list)
+        for c in calls:
+            rows = c.args[0]
+            if len(rows) == 1 and 'best_s1' in rows[0]:
+                return rows[0]
+        return None
+
+    def _delta_rows(self, client):
+        """Return the rows upserted to lap_metrics for deltas."""
+        calls = client.table.return_value.upsert.call_args_list
+        for c in calls:
+            rows = c.args[0]
+            if rows and 'delta_to_session_best_s1' in rows[0]:
+                return rows
+        return []
+
+    def test_best_times_are_minimums_across_laps(self):
+        laps = [
+            self._lap(driver_number=44, s1=30.0, s2=40.0, s3=25.0),
+            self._lap(driver_number=63, s1=29.5, s2=41.0, s3=24.8),
+        ]
+        client = _mock_client()
+        ingest_session_sector_bests(client, 9000, laps)
+        row = self._bests_row(client)
+        self.assertAlmostEqual(row['best_s1'], 29.5)
+        self.assertAlmostEqual(row['best_s2'], 40.0)
+        self.assertAlmostEqual(row['best_s3'], 24.8)
+
+    def test_best_driver_correctly_identified(self):
+        laps = [
+            self._lap(driver_number=44, s1=30.0, s2=40.0, s3=25.0),
+            self._lap(driver_number=63, s1=29.5, s2=41.0, s3=24.8),
+        ]
+        client = _mock_client()
+        ingest_session_sector_bests(client, 9000, laps)
+        row = self._bests_row(client)
+        self.assertEqual(row['best_s1_driver'], 63)
+        self.assertEqual(row['best_s2_driver'], 44)
+        self.assertEqual(row['best_s3_driver'], 63)
+
+    def test_theoretical_best_is_sum_of_sector_bests(self):
+        laps = [
+            self._lap(driver_number=44, s1=30.0, s2=40.0, s3=25.0),
+            self._lap(driver_number=63, s1=29.5, s2=39.5, s3=24.8),
+        ]
+        client = _mock_client()
+        ingest_session_sector_bests(client, 9000, laps)
+        row = self._bests_row(client)
+        # theoretical = 29.5 + 39.5 + 24.8 = 93.8
+        self.assertAlmostEqual(row['theoretical_best_lap'], 93.8, places=3)
+
+    def test_theoretical_best_none_when_any_sector_missing(self):
+        laps = [self._lap(s1=30.0, s2=None, s3=25.0)]
+        client = _mock_client()
+        ingest_session_sector_bests(client, 9000, laps)
+        row = self._bests_row(client)
+        self.assertIsNone(row['theoretical_best_lap'])
+
+    def test_zero_sector_time_excluded_from_best(self):
+        """Zero and negative times are invalid (incomplete lap) — skip."""
+        laps = [
+            self._lap(driver_number=44, s1=0.0, s2=40.0, s3=25.0),
+            self._lap(driver_number=63, s1=30.0, s2=39.0, s3=24.0),
+        ]
+        client = _mock_client()
+        ingest_session_sector_bests(client, 9000, laps)
+        row = self._bests_row(client)
+        # zero s1 excluded → only driver 63's s1 counts
+        self.assertAlmostEqual(row['best_s1'], 30.0)
+        self.assertEqual(row['best_s1_driver'], 63)
+
+    def test_none_sector_time_excluded_from_best(self):
+        laps = [
+            self._lap(driver_number=44, s1=None, s2=40.0, s3=25.0),
+            self._lap(driver_number=63, s1=30.0, s2=39.0, s3=24.0),
+        ]
+        client = _mock_client()
+        ingest_session_sector_bests(client, 9000, laps)
+        row = self._bests_row(client)
+        self.assertAlmostEqual(row['best_s1'], 30.0)
+
+    def test_no_valid_laps_all_bests_none(self):
+        """All sector times missing → row still upserted with nulls."""
+        client = _mock_client()
+        ingest_session_sector_bests(client, 9000, [self._lap(s1=None, s2=None, s3=None)])
+        row = self._bests_row(client)
+        self.assertIsNone(row['best_s1'])
+        self.assertIsNone(row['best_s2'])
+        self.assertIsNone(row['best_s3'])
+        self.assertIsNone(row['theoretical_best_lap'])
+
+    def test_empty_laps_still_upserts_null_row(self):
+        client = _mock_client()
+        ingest_session_sector_bests(client, 9000, [])
+        row = self._bests_row(client)
+        self.assertIsNotNone(row)
+        self.assertEqual(row['session_key'], 9000)
+
+    def test_missing_driver_number_excluded_from_bests(self):
+        laps = [
+            self._lap(driver_number=None, s1=20.0, s2=30.0, s3=15.0),
+            self._lap(driver_number=44,   s1=30.0, s2=40.0, s3=25.0),
+        ]
+        client = _mock_client()
+        ingest_session_sector_bests(client, 9000, laps)
+        row = self._bests_row(client)
+        # the None-driver lap's suspiciously fast times must not win
+        self.assertAlmostEqual(row['best_s1'], 30.0)
+
+    def test_delta_zero_for_session_best_holder(self):
+        """Driver who set the session best has delta = 0."""
+        laps = [
+            self._lap(driver_number=44, lap_number=1, s1=29.5, s2=39.5, s3=24.8),
+            self._lap(driver_number=63, lap_number=1, s1=30.0, s2=40.0, s3=25.0),
+        ]
+        client = _mock_client()
+        ingest_session_sector_bests(client, 9000, laps)
+        deltas = self._delta_rows(client)
+        by_driver = {r['driver_number']: r for r in deltas}
+        self.assertAlmostEqual(by_driver[44]['delta_to_session_best_s1'], 0.0)
+        self.assertAlmostEqual(by_driver[44]['delta_to_session_best_s2'], 0.0)
+        self.assertAlmostEqual(by_driver[44]['delta_to_session_best_s3'], 0.0)
+
+    def test_delta_positive_for_slower_lap(self):
+        laps = [
+            self._lap(driver_number=44, lap_number=1, s1=29.5, s2=39.5, s3=24.8),
+            self._lap(driver_number=63, lap_number=1, s1=30.0, s2=40.0, s3=25.0),
+        ]
+        client = _mock_client()
+        ingest_session_sector_bests(client, 9000, laps)
+        deltas = self._delta_rows(client)
+        by_driver = {r['driver_number']: r for r in deltas}
+        self.assertAlmostEqual(by_driver[63]['delta_to_session_best_s1'], 0.5, places=3)
+        self.assertAlmostEqual(by_driver[63]['delta_to_session_best_s2'], 0.5, places=3)
+        self.assertAlmostEqual(by_driver[63]['delta_to_session_best_s3'], 0.2, places=3)
+
+    def test_delta_none_when_lap_sector_time_missing(self):
+        laps = [
+            self._lap(driver_number=44, lap_number=1, s1=None, s2=40.0, s3=25.0),
+            self._lap(driver_number=63, lap_number=1, s1=30.0, s2=39.0, s3=24.0),
+        ]
+        client = _mock_client()
+        ingest_session_sector_bests(client, 9000, laps)
+        deltas = self._delta_rows(client)
+        by_driver = {r['driver_number']: r for r in deltas}
+        self.assertIsNone(by_driver[44]['delta_to_session_best_s1'])
+        # s2 is present — delta should be non-None
+        self.assertIsNotNone(by_driver[44]['delta_to_session_best_s2'])
+
+    def test_upserts_to_correct_tables(self):
+        client = _mock_client()
+        laps = [self._lap(driver_number=44, lap_number=1)]
+        ingest_session_sector_bests(client, 9000, laps)
+        called_tables = [c.args[0] for c in client.table.call_args_list]
+        self.assertIn('session_sector_bests', called_tables)
+        self.assertIn('lap_metrics', called_tables)
+
+    def test_delta_row_count_matches_valid_laps(self):
+        laps = [
+            self._lap(driver_number=44, lap_number=1),
+            self._lap(driver_number=44, lap_number=2),
+            self._lap(driver_number=63, lap_number=1),
+        ]
+        client = _mock_client()
+        ingest_session_sector_bests(client, 9000, laps)
+        self.assertEqual(len(self._delta_rows(client)), 3)
+
+    def test_laps_missing_driver_excluded_from_delta_rows(self):
+        laps = [
+            self._lap(driver_number=None, lap_number=1),
+            self._lap(driver_number=44,   lap_number=2),
+        ]
+        client = _mock_client()
+        ingest_session_sector_bests(client, 9000, laps)
+        self.assertEqual(len(self._delta_rows(client)), 1)
+
+
+# ===========================================================================
+# ingest_lap_flags
+# ===========================================================================
+
+class TestIngestLapFlags(unittest.TestCase):
+    """Tests for is_neutralized and tyre_age_at_lap population."""
+
+    # ------------------------------------------------------------------
+    # helpers
+    # ------------------------------------------------------------------
+
+    def _lap(self, driver_number=44, lap_number=5,
+             date_start='2024-03-02T13:00:00Z', lap_duration=90.0):
+        return {
+            'driver_number': driver_number,
+            'lap_number':    lap_number,
+            'date_start':    date_start,
+            'lap_duration':  lap_duration,
+        }
+
+    def _rc(self, date, category='SafetyCar', flag=None):
+        return {'date': date, 'category': category, 'flag': flag}
+
+    def _stint(self, driver_number=44, lap_start=1, lap_end=20,
+               tyre_age_at_start=0):
+        return {
+            'driver_number':    driver_number,
+            'lap_start':        lap_start,
+            'lap_end':          lap_end,
+            'tyre_age_at_start': tyre_age_at_start,
+        }
+
+    def _upserted(self, client):
+        return client.table.return_value.upsert.call_args.args[0]
+
+    # ------------------------------------------------------------------
+    # is_neutralized
+    # ------------------------------------------------------------------
+
+    def test_sc_event_mid_lap_is_neutralized_true(self):
+        """SC event at t+30s inside a 90s lap → is_neutralized True."""
+        client = _mock_client()
+        ingest_lap_flags(
+            client, 9000,
+            laps=[self._lap()],
+            stints_rows=[],
+            rc_rows=[self._rc('2024-03-02T13:00:30Z', category='SafetyCar')],
+        )
+        row = self._upserted(client)[0]
+        self.assertTrue(row['is_neutralized'])
+
+    def test_vsc_event_mid_lap_is_neutralized_true(self):
+        """Virtual SC shares category='SafetyCar' — same detection path."""
+        client = _mock_client()
+        ingest_lap_flags(
+            client, 9000,
+            laps=[self._lap()],
+            stints_rows=[],
+            rc_rows=[self._rc('2024-03-02T13:00:45Z', category='SafetyCar')],
+        )
+        self.assertTrue(self._upserted(client)[0]['is_neutralized'])
+
+    def test_red_flag_mid_lap_is_neutralized_true(self):
+        """flag='RED' triggers neutralized regardless of category."""
+        client = _mock_client()
+        ingest_lap_flags(
+            client, 9000,
+            laps=[self._lap()],
+            stints_rows=[],
+            rc_rows=[self._rc('2024-03-02T13:00:10Z', category='Flag', flag='RED')],
+        )
+        self.assertTrue(self._upserted(client)[0]['is_neutralized'])
+
+    def test_sc_event_before_lap_not_neutralized(self):
+        """SC event 1s before lap start → not neutralized."""
+        client = _mock_client()
+        ingest_lap_flags(
+            client, 9000,
+            laps=[self._lap()],
+            stints_rows=[],
+            rc_rows=[self._rc('2024-03-02T12:59:59Z', category='SafetyCar')],
+        )
+        self.assertFalse(self._upserted(client)[0]['is_neutralized'])
+
+    def test_sc_event_after_lap_not_neutralized(self):
+        """SC event 1s after lap end → not neutralized."""
+        client = _mock_client()
+        # lap ends at 13:01:30Z; event at 13:01:31Z
+        ingest_lap_flags(
+            client, 9000,
+            laps=[self._lap()],
+            stints_rows=[],
+            rc_rows=[self._rc('2024-03-02T13:01:31Z', category='SafetyCar')],
+        )
+        self.assertFalse(self._upserted(client)[0]['is_neutralized'])
+
+    def test_no_neutralising_events_is_neutralized_false(self):
+        client = _mock_client()
+        ingest_lap_flags(
+            client, 9000,
+            laps=[self._lap()],
+            stints_rows=[],
+            rc_rows=[],
+        )
+        self.assertFalse(self._upserted(client)[0]['is_neutralized'])
+
+    def test_non_neutralising_category_ignored(self):
+        """DRS-enable or Flag/GREEN events must not trigger neutralized."""
+        client = _mock_client()
+        ingest_lap_flags(
+            client, 9000,
+            laps=[self._lap()],
+            stints_rows=[],
+            rc_rows=[
+                self._rc('2024-03-02T13:00:30Z', category='Drs', flag='ENABLED'),
+                self._rc('2024-03-02T13:00:40Z', category='Flag', flag='GREEN'),
+            ],
+        )
+        self.assertFalse(self._upserted(client)[0]['is_neutralized'])
+
+    def test_missing_lap_duration_is_neutralized_none(self):
+        """Cannot compute window without lap_duration → None."""
+        client = _mock_client()
+        ingest_lap_flags(
+            client, 9000,
+            laps=[self._lap(lap_duration=None)],
+            stints_rows=[],
+            rc_rows=[self._rc('2024-03-02T13:00:30Z')],
+        )
+        self.assertIsNone(self._upserted(client)[0]['is_neutralized'])
+
+    def test_missing_date_start_is_neutralized_none(self):
+        client = _mock_client()
+        ingest_lap_flags(
+            client, 9000,
+            laps=[self._lap(date_start=None)],
+            stints_rows=[],
+            rc_rows=[self._rc('2024-03-02T13:00:30Z')],
+        )
+        self.assertIsNone(self._upserted(client)[0]['is_neutralized'])
+
+    def test_sc_event_exactly_at_lap_start_is_neutralized_true(self):
+        """Boundary: event at exact lap start timestamp → neutralized."""
+        client = _mock_client()
+        ingest_lap_flags(
+            client, 9000,
+            laps=[self._lap()],
+            stints_rows=[],
+            rc_rows=[self._rc('2024-03-02T13:00:00Z', category='SafetyCar')],
+        )
+        self.assertTrue(self._upserted(client)[0]['is_neutralized'])
+
+    def test_sc_event_exactly_at_lap_end_is_neutralized_true(self):
+        """Boundary: event at exact lap end timestamp → neutralized."""
+        client = _mock_client()
+        # lap ends at 13:01:30Z
+        ingest_lap_flags(
+            client, 9000,
+            laps=[self._lap()],
+            stints_rows=[],
+            rc_rows=[self._rc('2024-03-02T13:01:30Z', category='SafetyCar')],
+        )
+        self.assertTrue(self._upserted(client)[0]['is_neutralized'])
+
+    # ------------------------------------------------------------------
+    # tyre_age_at_lap
+    # ------------------------------------------------------------------
+
+    def test_tyre_age_mid_stint(self):
+        """lap_num=8, lap_start=3, tyre_age_at_start=5 → age=10."""
+        client = _mock_client()
+        ingest_lap_flags(
+            client, 9000,
+            laps=[self._lap(lap_number=8, date_start=None, lap_duration=None)],
+            stints_rows=[self._stint(lap_start=3, lap_end=20, tyre_age_at_start=5)],
+            rc_rows=[],
+        )
+        self.assertEqual(self._upserted(client)[0]['tyre_age_at_lap'], 10)
+
+    def test_tyre_age_first_lap_of_stint(self):
+        """Lap exactly at stint start → tyre_age = tyre_age_at_start."""
+        client = _mock_client()
+        ingest_lap_flags(
+            client, 9000,
+            laps=[self._lap(lap_number=5, date_start=None, lap_duration=None)],
+            stints_rows=[self._stint(lap_start=5, lap_end=25, tyre_age_at_start=3)],
+            rc_rows=[],
+        )
+        self.assertEqual(self._upserted(client)[0]['tyre_age_at_lap'], 3)
+
+    def test_tyre_age_open_ended_stint(self):
+        """lap_end=None (last stint) — lap is still matched."""
+        client = _mock_client()
+        ingest_lap_flags(
+            client, 9000,
+            laps=[self._lap(lap_number=50, date_start=None, lap_duration=None)],
+            stints_rows=[self._stint(lap_start=30, lap_end=None, tyre_age_at_start=0)],
+            rc_rows=[],
+        )
+        self.assertEqual(self._upserted(client)[0]['tyre_age_at_lap'], 20)
+
+    def test_tyre_age_no_matching_stint_returns_none(self):
+        """Lap before any stint → None (e.g. OpenF1 sprint data gap)."""
+        client = _mock_client()
+        ingest_lap_flags(
+            client, 9000,
+            laps=[self._lap(lap_number=2, date_start=None, lap_duration=None)],
+            stints_rows=[self._stint(lap_start=5, lap_end=20, tyre_age_at_start=0)],
+            rc_rows=[],
+        )
+        self.assertIsNone(self._upserted(client)[0]['tyre_age_at_lap'])
+
+    def test_tyre_age_correct_stint_chosen_when_multiple(self):
+        """Driver has two stints — correct one is selected by lap_number."""
+        client = _mock_client()
+        stints = [
+            self._stint(lap_start=1,  lap_end=20, tyre_age_at_start=0),
+            self._stint(lap_start=21, lap_end=55, tyre_age_at_start=0),
+        ]
+        ingest_lap_flags(
+            client, 9000,
+            laps=[self._lap(lap_number=25, date_start=None, lap_duration=None)],
+            stints_rows=stints,
+            rc_rows=[],
+        )
+        # age = 0 + (25 - 21) = 4
+        self.assertEqual(self._upserted(client)[0]['tyre_age_at_lap'], 4)
+
+    def test_tyre_age_none_when_stint_missing_age_at_start(self):
+        """Matching stint exists but tyre_age_at_start is None → None."""
+        client = _mock_client()
+        ingest_lap_flags(
+            client, 9000,
+            laps=[self._lap(lap_number=5, date_start=None, lap_duration=None)],
+            stints_rows=[self._stint(lap_start=1, lap_end=20, tyre_age_at_start=None)],
+            rc_rows=[],
+        )
+        self.assertIsNone(self._upserted(client)[0]['tyre_age_at_lap'])
+
+    # ------------------------------------------------------------------
+    # row structure and filtering
+    # ------------------------------------------------------------------
+
+    def test_upserts_to_lap_metrics_table(self):
+        client = _mock_client()
+        ingest_lap_flags(client, 9000, laps=[self._lap()],
+                         stints_rows=[], rc_rows=[])
+        client.table.assert_called_with('lap_metrics')
+
+    def test_row_contains_required_keys(self):
+        client = _mock_client()
+        ingest_lap_flags(client, 9000, laps=[self._lap()],
+                         stints_rows=[], rc_rows=[])
+        row = self._upserted(client)[0]
+        for key in ('session_key', 'driver_number', 'lap_number',
+                    'is_neutralized', 'tyre_age_at_lap'):
+            self.assertIn(key, row)
+
+    def test_missing_driver_number_filtered(self):
+        client = _mock_client()
+        ingest_lap_flags(client, 9000,
+                         laps=[self._lap(driver_number=None)],
+                         stints_rows=[], rc_rows=[])
+        client.table.assert_not_called()
+
+    def test_missing_lap_number_filtered(self):
+        client = _mock_client()
+        ingest_lap_flags(client, 9000,
+                         laps=[self._lap(lap_number=None)],
+                         stints_rows=[], rc_rows=[])
+        client.table.assert_not_called()
+
+    def test_empty_laps_no_upsert(self):
+        client = _mock_client()
+        ingest_lap_flags(client, 9000, laps=[], stints_rows=[], rc_rows=[])
+        client.table.assert_not_called()
+
+    def test_row_count_matches_valid_laps(self):
+        client = _mock_client()
+        laps = [
+            self._lap(driver_number=44, lap_number=1),
+            self._lap(driver_number=44, lap_number=2),
+            self._lap(driver_number=63, lap_number=1),
+        ]
+        ingest_lap_flags(client, 9000, laps=laps, stints_rows=[], rc_rows=[])
+        self.assertEqual(len(self._upserted(client)), 3)
+
+
+# ===========================================================================
+# ingest_brake_entry_speed_ranks
+# ===========================================================================
+
+class TestIngestBrakeEntrySpeedRanks(unittest.TestCase):
+
+    def _make_dlm(self, driver_speeds):
+        """Build a driver_lap_metrics dict from {dn: [(lap_num, lap, s1, s2, s3), ...]}.
+
+        Pass None for any sector value to simulate missing data.
+        """
+        dlm = {}
+        for dn, laps in driver_speeds.items():
+            dlm[dn] = {}
+            for lap_num, lap, s1, s2, s3 in laps:
+                dlm[dn][lap_num] = {
+                    'speed_at_brake_start_kph_lap': lap,
+                    'speed_at_brake_start_kph_s1':  s1,
+                    'speed_at_brake_start_kph_s2':  s2,
+                    'speed_at_brake_start_kph_s3':  s3,
+                }
+        return dlm
+
+    def test_empty_dict_no_upsert(self):
+        client = _mock_client()
+        ingest_brake_entry_speed_ranks(client, 9000, {})
+        client.table.assert_not_called()
+
+    def test_single_entry_insufficient_stats_all_none(self):
+        """Only one value per sector → std undefined → all rank/z/category are None."""
+        dlm = self._make_dlm({44: [(1, 250.0, 180.0, 200.0, 220.0)]})
+        client = _mock_client()
+        ingest_brake_entry_speed_ranks(client, 9000, dlm)
+        upserted = client.table.return_value.upsert.call_args.args[0]
+        self.assertEqual(len(upserted), 1)
+        row = upserted[0]
+        self.assertIsNone(row['brake_entry_speed_pct_rank_lap'])
+        self.assertIsNone(row['brake_entry_speed_z_score_lap'])
+        self.assertIsNone(row['brake_entry_speed_category_lap'])
+
+    def test_row_contains_session_and_driver_keys(self):
+        dlm = self._make_dlm({44: [(1, 250.0, None, None, None)]})
+        client = _mock_client()
+        ingest_brake_entry_speed_ranks(client, 9999, dlm)
+        upserted = client.table.return_value.upsert.call_args.args[0]
+        row = upserted[0]
+        self.assertEqual(row['session_key'], 9999)
+        self.assertEqual(row['driver_number'], 44)
+        self.assertEqual(row['lap_number'], 1)
+
+    def test_three_drivers_correct_categories(self):
+        """Low speed → 'early', mid → 'average', high → 'late'."""
+        dlm = self._make_dlm({
+            1:  [(1, 100.0, None, None, None)],
+            44: [(1, 200.0, None, None, None)],
+            63: [(1, 300.0, None, None, None)],
+        })
+        client = _mock_client()
+        ingest_brake_entry_speed_ranks(client, 9000, dlm)
+        upserted = client.table.return_value.upsert.call_args.args[0]
+        by_driver = {r['driver_number']: r for r in upserted}
+        self.assertEqual(by_driver[1]['brake_entry_speed_category_lap'], 'early')
+        self.assertEqual(by_driver[44]['brake_entry_speed_category_lap'], 'average')
+        self.assertEqual(by_driver[63]['brake_entry_speed_category_lap'], 'late')
+
+    def test_three_drivers_ranks_ordered(self):
+        dlm = self._make_dlm({
+            1:  [(1, 100.0, None, None, None)],
+            44: [(1, 200.0, None, None, None)],
+            63: [(1, 300.0, None, None, None)],
+        })
+        client = _mock_client()
+        ingest_brake_entry_speed_ranks(client, 9000, dlm)
+        upserted = client.table.return_value.upsert.call_args.args[0]
+        by_driver = {r['driver_number']: r for r in upserted}
+        r1  = by_driver[1]['brake_entry_speed_pct_rank_lap']
+        r44 = by_driver[44]['brake_entry_speed_pct_rank_lap']
+        r63 = by_driver[63]['brake_entry_speed_pct_rank_lap']
+        self.assertLess(r1, r44)
+        self.assertLess(r44, r63)
+
+    def test_z_score_sign_correct(self):
+        """Driver with speed below mean has negative z-score; above mean positive."""
+        dlm = self._make_dlm({
+            1:  [(1, 100.0, None, None, None)],
+            44: [(1, 300.0, None, None, None)],
+        })
+        client = _mock_client()
+        ingest_brake_entry_speed_ranks(client, 9000, dlm)
+        upserted = client.table.return_value.upsert.call_args.args[0]
+        by_driver = {r['driver_number']: r for r in upserted}
+        self.assertLess(by_driver[1]['brake_entry_speed_z_score_lap'], 0)
+        self.assertGreater(by_driver[44]['brake_entry_speed_z_score_lap'], 0)
+
+    def test_z_score_symmetric_two_drivers(self):
+        """Two drivers equidistant from mean → z-scores should be equal in magnitude."""
+        dlm = self._make_dlm({
+            1:  [(1, 100.0, None, None, None)],
+            44: [(1, 300.0, None, None, None)],
+        })
+        client = _mock_client()
+        ingest_brake_entry_speed_ranks(client, 9000, dlm)
+        upserted = client.table.return_value.upsert.call_args.args[0]
+        by_driver = {r['driver_number']: r for r in upserted}
+        z1  = by_driver[1]['brake_entry_speed_z_score_lap']
+        z44 = by_driver[44]['brake_entry_speed_z_score_lap']
+        self.assertAlmostEqual(abs(z1), abs(z44), places=4)
+
+    def test_tied_values_same_rank(self):
+        """Tied brake entry speeds should produce the same percentile rank."""
+        dlm = self._make_dlm({
+            1:  [(1, 200.0, None, None, None)],
+            44: [(1, 200.0, None, None, None)],
+            63: [(1, 300.0, None, None, None)],
+        })
+        client = _mock_client()
+        ingest_brake_entry_speed_ranks(client, 9000, dlm)
+        upserted = client.table.return_value.upsert.call_args.args[0]
+        by_driver = {r['driver_number']: r for r in upserted}
+        self.assertEqual(
+            by_driver[1]['brake_entry_speed_pct_rank_lap'],
+            by_driver[44]['brake_entry_speed_pct_rank_lap'],
+        )
+
+    def test_none_sector_value_produces_none_outputs(self):
+        """If a driver's sector value is None, all three outputs are None for that sector."""
+        dlm = self._make_dlm({
+            1:  [(1, 200.0, None, None, None)],
+            44: [(1, 300.0, None, None, None)],
+        })
+        client = _mock_client()
+        ingest_brake_entry_speed_ranks(client, 9000, dlm)
+        upserted = client.table.return_value.upsert.call_args.args[0]
+        by_driver = {r['driver_number']: r for r in upserted}
+        for sector in ('s1', 's2', 's3'):
+            self.assertIsNone(by_driver[1][f'brake_entry_speed_pct_rank_{sector}'])
+            self.assertIsNone(by_driver[1][f'brake_entry_speed_z_score_{sector}'])
+            self.assertIsNone(by_driver[1][f'brake_entry_speed_category_{sector}'])
+
+    def test_all_sectors_computed_when_present(self):
+        """All four sector columns populated when valid data exists for two+ drivers."""
+        dlm = self._make_dlm({
+            1:  [(1, 200.0, 120.0, 150.0, 180.0)],
+            44: [(1, 300.0, 140.0, 170.0, 200.0)],
+        })
+        client = _mock_client()
+        ingest_brake_entry_speed_ranks(client, 9000, dlm)
+        upserted = client.table.return_value.upsert.call_args.args[0]
+        by_driver = {r['driver_number']: r for r in upserted}
+        for sector in ('lap', 's1', 's2', 's3'):
+            self.assertIsNotNone(by_driver[1][f'brake_entry_speed_pct_rank_{sector}'])
+            self.assertIsNotNone(by_driver[1][f'brake_entry_speed_z_score_{sector}'])
+            self.assertIsNotNone(by_driver[1][f'brake_entry_speed_category_{sector}'])
+
+    def test_upserts_to_lap_metrics_table(self):
+        dlm = self._make_dlm({
+            1:  [(1, 200.0, None, None, None)],
+            44: [(1, 300.0, None, None, None)],
+        })
+        client = _mock_client()
+        ingest_brake_entry_speed_ranks(client, 9000, dlm)
+        client.table.assert_called_with('lap_metrics')
+
+    def test_row_count_matches_total_laps(self):
+        """One row per driver-lap pair."""
+        dlm = self._make_dlm({
+            1:  [(1, 200.0, None, None, None), (2, 210.0, None, None, None)],
+            44: [(1, 300.0, None, None, None), (2, 310.0, None, None, None)],
+        })
+        client = _mock_client()
+        ingest_brake_entry_speed_ranks(client, 9000, dlm)
+        upserted = client.table.return_value.upsert.call_args.args[0]
+        self.assertEqual(len(upserted), 4)
 
 
 if __name__ == "__main__":

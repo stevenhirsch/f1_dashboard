@@ -89,7 +89,7 @@ def _(sessions):
 def _(SESSION_KEY, get_drivers):
     drivers = get_drivers(SESSION_KEY)
     DRIVER_NUMBER = None
-    DRIVER_NAME = 'LEC'
+    DRIVER_NAME = 'LIN'
     for _d in drivers:
         if _d["name_acronym"] == DRIVER_NAME:
             DRIVER_NUMBER = _d["driver_number"]
@@ -124,7 +124,7 @@ def _(mo):
 @app.cell
 def _(DRIVER_NUMBER, SESSION_KEY, get_car_data, get_location, lap_df):
     LAP_START_IDX = 2   # 0-indexed → lap 3
-    LAP_END_IDX   = 55
+    LAP_END_IDX   = 19
 
     _t_start = lap_df.iloc[LAP_START_IDX]['date_start'].strftime('%Y-%m-%dT%H:%M:%S')
     _t_end   = lap_df.iloc[LAP_END_IDX]['date_start'].strftime('%Y-%m-%dT%H:%M:%S')
@@ -191,12 +191,12 @@ def _(lap_df, loc_df, np):
 
 
 @app.cell
-def _(loc_lap, plt):
+def _(DRIVER_NAME, loc_lap, plt):
     _fig, _ax = plt.subplots(figsize=(8, 6))
     _ax.plot(loc_lap['x'], loc_lap['y'], 'b-', linewidth=0.8, alpha=0.7)
     _ax.scatter(loc_lap['x'].iloc[0], loc_lap['y'].iloc[0], color='green', zorder=5, label='Lap start')
     _ax.set_aspect('equal')
-    _ax.set_title('Raw XY track map — one lap (HAM, 2026 China Race)')
+    _ax.set_title(f'Raw XY track map — one lap ({DRIVER_NAME}, 2026 China Race)')
     _ax.set_xlabel('X (metres)')
     _ax.set_ylabel('Y (metres)')
     _ax.legend()
@@ -276,7 +276,7 @@ def _(FS, butter, filtfilt, x_reg, y_reg):
         padlen = min(len(x) // 4, int(5 * fs))
         return filtfilt(b, a, x, padlen=padlen), filtfilt(b, a, y, padlen=padlen)
 
-    CUTOFFS = ["raw", 0.3, 0.5, 1.0]
+    CUTOFFS = ["raw", 0.15, 0.3, 0.5, 1.0]
 
     filtered = {"raw": (x_reg, y_reg)}
     for _cutoff in CUTOFFS[1:]:
@@ -629,7 +629,7 @@ def _(mo):
 
 @app.cell
 def _():
-    filter_cutoff_options = ["raw", 0.3, 0.5, 1.0]
+    filter_cutoff_options = ["raw", 0.15, 0.3, 0.5, 1.0]
     return (filter_cutoff_options,)
 
 

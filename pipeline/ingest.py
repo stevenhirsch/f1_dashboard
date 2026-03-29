@@ -470,6 +470,56 @@ def ingest_qualifying_results(
     return best_per_phase
 
 
+def ingest_fastest_lap_flag(client: Client, session_key: int, laps: list[dict]) -> None:
+    """Set fastest_lap_flag on race_results for the driver with the shortest valid lap.
+
+    Only classified finishers (not DNF/DNS/DSQ) are considered.  The results
+    endpoint is already cached from ingest_race_results, so this costs no
+    additional API calls.
+    """
+    results = openf1.get_session_result(session_key)
+    classified = {
+        r["driver_number"]
+        for r in results
+        if r.get("driver_number") is not None
+        and not r.get("dnf") and not r.get("dns") and not r.get("dsq")
+    }
+    if not classified:
+        return
+
+    best_time: float | None = None
+    best_driver: int | None = None
+    for lap in laps:
+        dn = lap.get("driver_number")
+        if dn not in classified:
+            continue
+        dur = lap.get("lap_duration")
+        if not dur:
+            continue
+        try:
+            t = float(dur)
+        except (TypeError, ValueError):
+            continue
+        if t <= 0:
+            continue
+        if best_time is None or t < best_time:
+            best_time = t
+            best_driver = dn
+
+    if best_driver is None:
+        return
+
+    rows = [
+        {
+            "session_key":      session_key,
+            "driver_number":    dn,
+            "fastest_lap_flag": dn == best_driver,
+        }
+        for dn in classified
+    ]
+    _upsert(client, "race_results", rows)
+
+
 def ingest_overtakes(client: Client, session_key: int) -> None:
     """Upsert overtake events into `overtakes`."""
     overtakes = openf1.get_overtakes(session_key)
@@ -879,6 +929,12 @@ def _compute_lap_metrics(
 
     tv_lap, tv_s1, tv_s2, tv_s3 = _thr_var_splits()
 
+    # Superclipping: throttle >= 10% AND brake == 0 AND car decelerating
+    # accel_g is length N-1 (left-edge); pad to N with False for the last sample
+    decel_padded = np.append(accel_g < 0, False)
+    superclip_mask = (throttle_reg >= 10) & (brake_reg == 0) & decel_padded
+    scd_lap, scd_s1, scd_s2, scd_s3 = _dist_splits(superclip_mask)
+
     if drs_reg is not None:
         drs_open      = drs_reg >= _DRS_OPEN_THRESHOLD
         drs_act_count = int(np.sum(np.diff(drs_open.astype(int)) > 0))
@@ -926,6 +982,13 @@ def _compute_lap_metrics(
         'coasting_distance_m_s1':  _r1(cd_s1),
         'coasting_distance_m_s2':  _r1(cd_s2),
         'coasting_distance_m_s3':  _r1(cd_s3),
+
+        # Estimated superclipping: throttle >= 10% AND brake == 0 AND decelerating
+        # In 2026+ regulations this is a battery-harvest proxy (car brakes via MGU-K under throttle)
+        'estimated_superclipping_distance_m_lap': _r1(scd_lap),
+        'estimated_superclipping_distance_m_s1':  _r1(scd_s1),
+        'estimated_superclipping_distance_m_s2':  _r1(scd_s2),
+        'estimated_superclipping_distance_m_s3':  _r1(scd_s3),
 
         # Full throttle: throttle >= 99%
         'full_throttle_pct_lap': _r4(ft_lap),
@@ -1131,6 +1194,252 @@ def ingest_qualifying_peak_g_summary(
     _upsert(client, 'qualifying_results', rows)
 
 
+def ingest_lap_flags(
+    client: Client,
+    session_key: int,
+    laps: list[dict],
+    stints_rows: list[dict],
+    rc_rows: list[dict],
+) -> None:
+    """Populate ``is_neutralized`` and ``tyre_age_at_lap`` in ``lap_metrics``.
+
+    ``is_neutralized``: True when any Safety Car, Virtual Safety Car, or Red
+    Flag race-control event falls within the lap's UTC time window
+    ``[date_start, date_start + lap_duration]``.  None when the lap's start
+    time or duration is missing.
+
+    ``tyre_age_at_lap``: ``tyre_age_at_start + (lap_number − stint.lap_start)``
+    for the matching stint.  None when no matching stint is found (e.g. OpenF1
+    data gaps on sprint stints).
+    """
+    import pandas as pd
+
+    # Build sorted list of neutralising event timestamps (UTC epoch seconds).
+    neutralising_ts: list[float] = []
+    for r in rc_rows:
+        if r.get('category') == 'SafetyCar' or r.get('flag') == 'RED':
+            d = r.get('date')
+            if d:
+                try:
+                    neutralising_ts.append(pd.to_datetime(d).timestamp())
+                except Exception:
+                    pass
+
+    # Stint index: {driver_number: [stints sorted ascending by lap_start]}.
+    stints_by_driver: dict[int, list[dict]] = {}
+    for s in stints_rows:
+        dn = s.get('driver_number')
+        if dn is None:
+            continue
+        stints_by_driver.setdefault(dn, []).append(s)
+    for dn in stints_by_driver:
+        stints_by_driver[dn].sort(key=lambda s: s.get('lap_start') or 0)
+
+    rows: list[dict] = []
+    for lap in laps:
+        dn = lap.get('driver_number')
+        lap_num = lap.get('lap_number')
+        if dn is None or lap_num is None:
+            continue
+
+        # is_neutralized -------------------------------------------------------
+        is_neutralized: bool | None = None
+        date_start = lap.get('date_start')
+        lap_dur = lap.get('lap_duration')
+        if date_start and lap_dur:
+            try:
+                t_start = pd.to_datetime(date_start).timestamp()
+                t_end = t_start + float(lap_dur)
+                is_neutralized = any(t_start <= t <= t_end for t in neutralising_ts)
+            except Exception:
+                pass
+
+        # tyre_age_at_lap ------------------------------------------------------
+        tyre_age: int | None = None
+        for s in stints_by_driver.get(dn, []):
+            lap_start = s.get('lap_start')
+            lap_end = s.get('lap_end')
+            if lap_start is None:
+                continue
+            if lap_num < lap_start:
+                continue
+            if lap_end is not None and lap_num > lap_end:
+                continue
+            age_at_start = s.get('tyre_age_at_start')
+            if age_at_start is not None:
+                tyre_age = age_at_start + (lap_num - lap_start)
+            break
+
+        rows.append({
+            'session_key':     session_key,
+            'driver_number':   dn,
+            'lap_number':      lap_num,
+            'is_neutralized':  is_neutralized,
+            'tyre_age_at_lap': tyre_age,
+        })
+
+    _upsert(client, 'lap_metrics', rows)
+
+
+def ingest_session_sector_bests(
+    client: Client,
+    session_key: int,
+    laps: list[dict],
+) -> None:
+    """Compute session-best sector times and per-lap deltas.
+
+    Upserts one row to ``session_sector_bests`` containing the fastest S1/S2/S3
+    time set by any driver, the driver who set each, and the theoretical best
+    lap (sum of the three sector bests).
+
+    Also upserts ``delta_to_session_best_s1/s2/s3`` back to ``lap_metrics``
+    for every lap where the sector time is available.  Zero-or-negative sector
+    times are excluded from best computation (incomplete/aborted laps).
+    """
+    _SECTORS = (
+        ('s1', 'duration_sector_1'),
+        ('s2', 'duration_sector_2'),
+        ('s3', 'duration_sector_3'),
+    )
+
+    # best[sector] = (time_float, driver_number) or None
+    best: dict[str, tuple[float, int] | None] = {s: None for s, _ in _SECTORS}
+
+    for lap in laps:
+        dn = lap.get('driver_number')
+        if dn is None:
+            continue
+        for sector, key in _SECTORS:
+            t = lap.get(key)
+            if t is None:
+                continue
+            try:
+                t = float(t)
+            except (TypeError, ValueError):
+                continue
+            if t <= 0:
+                continue
+            if best[sector] is None or t < best[sector][0]:
+                best[sector] = (t, dn)
+
+    best_s1 = best['s1'][0] if best['s1'] else None
+    best_s2 = best['s2'][0] if best['s2'] else None
+    best_s3 = best['s3'][0] if best['s3'] else None
+    theoretical = (
+        round(best_s1 + best_s2 + best_s3, 3)
+        if best_s1 is not None and best_s2 is not None and best_s3 is not None
+        else None
+    )
+
+    _upsert(client, 'session_sector_bests', [{
+        'session_key':          session_key,
+        'best_s1':              best_s1,
+        'best_s1_driver':       best['s1'][1] if best['s1'] else None,
+        'best_s2':              best_s2,
+        'best_s2_driver':       best['s2'][1] if best['s2'] else None,
+        'best_s3':              best_s3,
+        'best_s3_driver':       best['s3'][1] if best['s3'] else None,
+        'theoretical_best_lap': theoretical,
+    }])
+
+    # Per-lap deltas back to lap_metrics
+    def _delta(sector_val, session_best: float | None) -> float | None:
+        if sector_val is None or session_best is None:
+            return None
+        try:
+            return round(float(sector_val) - session_best, 3)
+        except (TypeError, ValueError):
+            return None
+
+    rows: list[dict] = []
+    for lap in laps:
+        dn = lap.get('driver_number')
+        lap_num = lap.get('lap_number')
+        if dn is None or lap_num is None:
+            continue
+        rows.append({
+            'session_key':              session_key,
+            'driver_number':            dn,
+            'lap_number':               lap_num,
+            'delta_to_session_best_s1': _delta(lap.get('duration_sector_1'), best_s1),
+            'delta_to_session_best_s2': _delta(lap.get('duration_sector_2'), best_s2),
+            'delta_to_session_best_s3': _delta(lap.get('duration_sector_3'), best_s3),
+        })
+
+    if rows:
+        _upsert(client, 'lap_metrics', rows)
+
+
+def ingest_brake_entry_speed_ranks(
+    client: Client,
+    session_key: int,
+    driver_lap_metrics: dict[int, dict[int, dict]],
+) -> None:
+    """Compute cross-driver brake entry speed percentile ranks for the session.
+
+    Pools all driver-lap ``speed_at_brake_start_kph_{sector}`` values per sector,
+    then upserts ``brake_entry_speed_pct_rank_{sector}``,
+    ``brake_entry_speed_z_score_{sector}``, and
+    ``brake_entry_speed_category_{sector}`` back to ``lap_metrics``.
+
+    Category thresholds (percentile rank):
+      'early'   rank < 33.3  — driver braked before the typical session point
+      'average' rank < 66.7  — mid-pack braking point
+      'late'    rank >= 66.7 — driver braked later than typical
+    """
+    import numpy as np
+
+    sectors = ('lap', 's1', 's2', 's3')
+
+    entries: list[tuple[int, int, dict]] = []
+    for dn, laps_by_num in driver_lap_metrics.items():
+        for lap_num, metrics in laps_by_num.items():
+            vals = {s: metrics.get(f'speed_at_brake_start_kph_{s}') for s in sectors}
+            entries.append((dn, lap_num, vals))
+
+    if not entries:
+        return
+
+    sector_stats: dict[str, tuple | None] = {}
+    for sector in sectors:
+        raw = [e[2][sector] for e in entries if e[2][sector] is not None]
+        if len(raw) < 2:
+            sector_stats[sector] = None
+            continue
+        arr = np.array(raw, dtype=float)
+        mean = float(np.mean(arr))
+        std = float(np.std(arr, ddof=0))
+        sector_stats[sector] = (mean, std, sorted(raw))
+
+    rows: list[dict] = []
+    for dn, lap_num, vals in entries:
+        row: dict = {'session_key': session_key, 'driver_number': dn, 'lap_number': lap_num}
+        for sector in sectors:
+            v = vals[sector]
+            stats = sector_stats.get(sector)
+            if v is None or stats is None:
+                pct_rank = z_score = category = None
+            else:
+                mean, std, sorted_vals = stats
+                n = len(sorted_vals)
+                n_below = sum(1 for x in sorted_vals if x < v)
+                n_equal = sum(1 for x in sorted_vals if x == v)
+                pct_rank = round((n_below + 0.5 * n_equal) / n * 100, 1)
+                z_score = round((v - mean) / std, 4) if std > 0 else 0.0
+                if pct_rank < 100 / 3:
+                    category = 'early'
+                elif pct_rank < 200 / 3:
+                    category = 'average'
+                else:
+                    category = 'late'
+            row[f'brake_entry_speed_pct_rank_{sector}'] = pct_rank
+            row[f'brake_entry_speed_z_score_{sector}'] = z_score
+            row[f'brake_entry_speed_category_{sector}'] = category
+        rows.append(row)
+
+    _upsert(client, 'lap_metrics', rows)
+
+
 def recompute_lap_metrics(
     client: Client,
     session_key: int,
@@ -1151,16 +1460,22 @@ def recompute_lap_metrics(
     """
     if session_type in ('race', 'sprint'):
         print("  computing lap metrics (race/sprint) …")
+        ingest_lap_flags(client, session_key, laps, stints_rows or [], rc_rows or [])
+        ingest_session_sector_bests(client, session_key, laps)
         driver_lap_metrics = ingest_lap_metrics(client, session_key, laps)
         ingest_race_peak_g_summary(client, session_key, driver_lap_metrics)
+        ingest_brake_entry_speed_ranks(client, session_key, driver_lap_metrics)
         total = sum(len(v) for v in driver_lap_metrics.values())
         print(f"  lap_metrics: {total} laps across {len(driver_lap_metrics)} drivers")
     elif session_type in ('qualifying', 'sprint qualifying', 'sprint shootout'):
         print("  computing lap metrics (qualifying) …")
+        ingest_lap_flags(client, session_key, laps, stints_rows or [], rc_rows or [])
+        ingest_session_sector_bests(client, session_key, laps)
         laps_with_phases = _assign_qualifying_phases(laps, rc_rows or [])
         best_per_phase   = _compute_qualifying_best_per_phase(laps_with_phases)
         driver_lap_metrics = ingest_lap_metrics(client, session_key, laps_with_phases)
         ingest_qualifying_peak_g_summary(client, session_key, driver_lap_metrics, best_per_phase)
+        ingest_brake_entry_speed_ranks(client, session_key, driver_lap_metrics)
         total = sum(len(v) for v in driver_lap_metrics.values())
         print(f"  lap_metrics: {total} laps across {len(driver_lap_metrics)} drivers")
     else:
@@ -1208,6 +1523,7 @@ def process_session(client: Client, session_key: int, recompute: bool = False) -
 
     if session_type in ("race", "sprint"):
         ingest_race_results(client, session_key, pit)
+        ingest_fastest_lap_flag(client, session_key, laps)
         ingest_overtakes(client, session_key)
         ingest_intervals(client, session_key)
         ingest_position(client, session_key)
@@ -1293,10 +1609,7 @@ def main() -> None:
     client = create_client(url, key)
 
     if args.session:
-        if args.recompute:
-            recompute_lap_metrics(client, args.session)
-        else:
-            process_session(client, args.session, recompute=False)
+        process_session(client, args.session, recompute=args.recompute)
     elif args.meeting:
         process_meeting(client, args.meeting, recompute=args.recompute)
     elif args.year:

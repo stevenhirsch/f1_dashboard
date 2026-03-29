@@ -1,7 +1,7 @@
 # F1 Dashboard — Progress Log
 
 ## Current Status
-**Phase 4 complete. Phase 5 (Derived Metrics Pipeline) scoped and ready to implement. Backfill ingestion ongoing in background.**
+**Phase 4 complete. Phase 5 (Derived Metrics Pipeline) in progress — peak longitudinal G implemented for race/sprint. Lateral G permanently abandoned (OpenF1 XY is reference-path progression, not driving-line position). Next: qualifying G extension + remaining car_data metrics. Backfill ingestion ongoing in background.**
 
 ---
 
@@ -199,28 +199,9 @@ All tables populated correctly for meeting 1280 (2026 Chinese GP).
 
 ---
 
-### Lateral G Validation — Next (scoped 2026-03-27)
+### Lateral G — Abandoned (2026-03-29)
 
-**Research notebook to build:** `research/car_velocity/lateral_g_validation.py`
-
-**Part A — Cutoff frequency justification (spectral analysis)**
-- Residual analysis and spectral analysis (PSD via Welch's method) of raw XY position data to identify the noise floor and signal band
-- Compare residuals between raw PCHIP-resampled XY and filtered variants (0.3, 0.5 Hz) to quantify how much corner geometry is retained vs. lost at each cutoff
-- Produce a justification for the chosen cutoff (currently 0.3 Hz looks plausible based on visual assessment; 0.5 Hz is the longitudinal standard — spectral analysis will confirm which is more appropriate for the XY sensor)
-
-**Part B — Observational validation via tyre wear (Bayesian mixed model)**
-- Hypothesis: lateral G should on average decrease as a tyre ages — as rubber degrades, drivers manage grip by reducing corner entry speed and load
-- Dataset: join `lap_metrics` (peak/mean lateral G per sector) with `stints` (compound, tyre_age_at_start + lap_number_in_stint proxy) and `race_results`/`drivers` (constructor, driver)
-- Mixed model in **PyMC** pooling the following grouping factors:
-  - Tyre compound (Hard / Medium / Soft — different baseline grip and degradation curves)
-  - Driver (some drivers are more aggressive on tyres lap-to-lap)
-  - Constructor (cars differ in mechanical grip and tyre loading)
-  - Sector (S1/S2/S3 have different corner compositions; lateral G baseline differs)
-- Fixed effect of interest: tyre age (laps on tyre), expected negative coefficient
-- Validate for all three G measures: peak lateral G, peak accel G, peak decel G
-  - Accel/decel degradation with tyre age is less obvious but a plausible secondary finding
-- Expected output: posterior distribution of the tyre-age coefficient; if credible interval excludes zero in the negative direction, the metric is tracking something physically real
-- This serves as a ground-truth check before committing lateral G to the pipeline schema
+**Research conclusion:** Lateral G estimation is not feasible with OpenF1 location data. The XY coordinates represent a car's progression along the track centre line (or a similar reference path), not the car's actual 2D position on the circuit. Without true driving-line position data, yaw rate computed from XY derivatives does not reflect real heading changes — it reflects track curvature at a fixed path, which is the same for every driver. The `lateral_g_validation.py` notebook was scoped but will not be built. All `peak_lat_g_*`, `mean_lat_g_*`, and `accumulated_lateral_g_*` columns are permanently removed from scope. See `product_roadmap.md` for updated Phase 5 column list.
 
 ---
 
@@ -240,40 +221,64 @@ All tables populated correctly for meeting 1280 (2026 Chinese GP).
 
 ---
 
-### Lateral G Research — Complete (2026-03-27)
+### Lateral G Research — Abandoned (2026-03-29)
 
-**`research/car_velocity/lateral_g.py`** — three-method comparison notebook validated across multiple drivers (2026 Chinese GP Race).
+**`research/car_velocity/lateral_g.py`** — three-method comparison notebook explored circumradius, yaw rate, and cross-track acceleration methods.
 
-**Method evaluated:** Three independent approaches — circumradius (3-point), yaw rate (heading derivative), and cross-track acceleration (double differentiation of position).
+**Initial finding (later invalidated):** Yaw-rate method appeared promising — known high-G corners at Shanghai lit up in track map colour plots and absolute values were in a plausible 2–3 g range.
 
-**Finding:** Yaw-rate method selected as pipeline standard.
-- `lat_g = v_car × |dθ/dt| / 9.81` where θ = atan2(ẏ, ẋ) from PCHIP-differentiated XY
-- 0.3 Hz Butterworth cutoff on XY (0.5 Hz appears to over-smooth corner geometry; 0.3 Hz retains known high-G corners without anomalous noise spikes — to be confirmed by spectral analysis in validation notebook)
-- Speed sourced from `/car_data` sensor (not position-derived)
-- Known high-G corners at Shanghai (T1 hairpin, T14 hairpin, T3–T6 esses) correctly "lit up" in track map colour plots; absolute values in plausible 2–3 g range for those corners
-- Circumradius had a collinearity singularity bug (R→0 rather than R→∞ on straights); fixed but method still discarded in favour of yaw rate
-- Cross-track acceleration (Method 3) noisier due to double differentiation
-
-**Metrics to store (peak + mean per sector):**
-- `peak_lat_g_s1/s2/s3/lap`, `mean_lat_g_s1/s2/s3/lap`
-
-**Not yet pipeline-integrated** — validation notebook (spectral analysis + Bayesian tyre-wear model) required first.
+**Final conclusion:** All three methods are fundamentally infeasible. OpenF1 XY coordinates represent progression along a fixed reference path (track centre line or similar), not the car's actual 2D position on circuit. This means heading θ = atan2(ẏ, ẋ) computed from these coordinates reflects track curvature at the reference path — the same for every driver regardless of their actual line. The apparent signal in the track map was track geometry, not driver-specific lateral load. No physically meaningful lateral G can be derived from this data source. All lateral G columns are permanently dropped from the Phase 5 scope.
 
 ---
 
-### Phase 5 — Derived Metrics Pipeline (Partial) — In Progress (2026-03-26)
+### Phase 5 — Derived Metrics Pipeline (Partial) — In Progress (2026-03-29)
 
-**Implemented:**
-- `_compute_peak_g(car_data_records)` in `ingest.py` — validated windowed pipeline: dedup → PCHIP → 0.5 Hz Butterworth → diff → throttle/brake gating. Returns `(peak_accel_g, peak_decel_g_abs)` (both positive floats, either can be `None`), or `None` for insufficient data.
-- `ingest_lap_metrics(client, session_key, laps)` — one `get_car_data` call per driver for the full race window, sliced client-side per lap. Upserts `peak_accel_g` and `peak_decel_g_abs` to `lap_metrics`.
-- `ingest_race_peak_g_summary(client, session_key, driver_stats)` — aggregates per-driver race-level means and upserts four new columns to `race_results`: `mean_peak_accel_g`, `mean_peak_accel_g_clean` (≤4 g laps only), `mean_peak_decel_g_abs`, `mean_peak_decel_g_abs_clean` (≤8 g laps only). The split between raw and clean averages preserves outlier visibility in `lap_metrics` while giving clean summary values for the race table.
-- `recompute_lap_metrics` now fully functional for race/sprint sessions. Invoked via `ingest.py --session <key> --recompute`.
-- numpy, scipy, pandas added to `[feature.pipeline.dependencies]` in `pixi.toml`.
-- 12 new tests; total now 156 (all passing).
+**Implemented (all in `ingest.py`):**
+
+**Signal processing core:**
+- `_compute_lap_metrics(car_data_records, s1_end_t, s2_end_t)` — full car-data derived metrics for one lap. Pipeline: dedup → PCHIP resample to 4 Hz → 0.5 Hz Butterworth → diff → metric extraction. All metrics computed per sector (s1/s2/s3) when sector timestamps are provided.
+- `_windowed_peak_g(accel_g, thr, brk)` — windowed peak accel/decel; throttle > 20% gate for accel, throttle < 20% OR brake > 0 for decel.
+- `_find_brake_zones(accel_g, v_filt)` — contiguous windows where decel > 0.5g; returns (peak_decel_g, speed_at_entry) per zone.
+- `_brake_zone_stats(zones)` — count, mean peak decel, entry speed of primary (hardest) zone.
+
+**Metrics computed per lap (all output by `_compute_lap_metrics`):**
+- `peak_accel_g`, `peak_decel_g_abs` — lap-level peak G (backward-compatible names)
+- `max_linear_acceleration_g_lap/s1/s2/s3` — same values via per-sector splits
+- `max_linear_deceleration_g_lap/s1/s2/s3` — per-sector peak decel
+- `max_speed_kph_lap/s1/s2/s3` — max speed from resampled (unfiltered) signal
+- `coasting_ratio_lap/s1/s2/s3` — proportion where throttle < 1% AND brake == 0
+- `coasting_distance_m_lap/s1/s2/s3` — metres accumulated under coasting condition
+- `estimated_superclipping_distance_m_lap/s1/s2/s3` — metres where throttle ≥ 10% AND brake == 0 AND decelerating (2026+ battery-harvest proxy)
+- `full_throttle_pct_lap/s1/s2/s3` — proportion where throttle ≥ 99%
+- `throttle_brake_overlap_ratio_lap/s1/s2/s3` — proportion where brake > 0 AND throttle ≥ 10% (trail braking proxy)
+- `throttle_input_variance_lap/s1/s2/s3` — var(diff(throttle)); higher = rougher inputs
+- `drs_activation_count`, `drs_distance_m` — lap-level DRS open transitions and distance; None when no DRS column in data
+- `brake_zone_count_lap/s1/s2/s3` — number of distinct braking events per sector
+- `mean_peak_decel_g_lap/s1/s2/s3` — mean of peak decel across all braking events
+- `speed_at_brake_start_kph_lap/s1/s2/s3` — entry speed of the hardest braking event per sector
+
+**Ingestion and aggregation:**
+- `ingest_lap_metrics(client, session_key, laps)` — one `get_car_data` call per driver for the full session window, sliced client-side per lap. Upserts all metrics to `lap_metrics`.
+- `ingest_race_peak_g_summary(client, session_key, driver_lap_metrics)` — race-level mean G summary to `race_results`; raw + clean (plausibility-bounded) variants.
+- `ingest_qualifying_peak_g_summary(client, session_key, driver_lap_metrics, best_per_phase)` — peak G keyed to each driver's best lap per Q1/Q2/Q3.
+- `ingest_fastest_lap_flag(client, session_key, laps)` — sets `fastest_lap_flag` on `race_results`; min `lap_duration` among classified finishers; reuses cached `get_session_result` call. Race and sprint sessions only.
+- `ingest_brake_entry_speed_ranks(client, session_key, driver_lap_metrics)` — session-level pass computing percentile rank (midpoint formula), z-score (population std), and category ('early'/'average'/'late') for `speed_at_brake_start_kph_*` across all drivers. Upserts `brake_entry_speed_pct_rank/z_score/category_lap/s1/s2/s3` to `lap_metrics`.
+- `ingest_lap_flags(client, session_key, laps, stints_rows, rc_rows)` — upserts `is_neutralized` (any SC/VSC/red flag RC event within the lap's UTC window) and `tyre_age_at_lap` (`tyre_age_at_start + lap_number − stint.lap_start`) to `lap_metrics`. Both are `None` when source data is missing.
+- `ingest_session_sector_bests(client, session_key, laps)` — upserts one row to `session_sector_bests` with best S1/S2/S3 time + driver + theoretical best lap; also upserts `delta_to_session_best_s1/s2/s3` per driver/lap to `lap_metrics`. Zero/negative/null sector times excluded from best computation.
+- `recompute_lap_metrics(client, session_key, laps, session_type, rc_rows, stints_rows)` — fully functional for race, sprint, qualifying, sprint qualifying, sprint shootout sessions. Call order: `ingest_lap_flags` → `ingest_session_sector_bests` → `ingest_lap_metrics` → G summary → `ingest_brake_entry_speed_ranks`.
+
+**Weather fields (2026-03-29):** `wind_speed`, `wind_direction`, `pressure` were already being fetched and included in `ingest_weather` row mapping — pipeline code was already correct. Schema migration (adding 3 columns to `weather` table) pending. 6 `TestIngestWeather` tests added to document the field mapping.
+
+**CLI fix (2026-03-29):** `ingest.py --session <key> --recompute` was broken (called `recompute_lap_metrics` with missing required args). Fixed to route through `process_session(recompute=True)`.
+
+**Tests: 258 total (all passing). Run with `pixi run -e pipeline test`.**
 
 **Schema changes required in Supabase before running `--recompute`:**
-- `lap_metrics`: add `peak_accel_g float`, `peak_decel_g_abs float` columns
-- `race_results`: add `mean_peak_accel_g float`, `mean_peak_accel_g_clean float`, `mean_peak_decel_g_abs float`, `mean_peak_decel_g_abs_clean float` columns
+- `lap_metrics`: full column set — all car-data metrics above + `is_neutralized bool`, `tyre_age_at_lap int`, `delta_to_session_best_s1/s2/s3 float`, `brake_entry_speed_pct_rank_lap/s1/s2/s3 float`, `brake_entry_speed_z_score_lap/s1/s2/s3 float`, `brake_entry_speed_category_lap/s1/s2/s3 text`
+- `race_results`: `mean_peak_accel_g float`, `mean_peak_accel_g_clean float`, `mean_peak_decel_g_abs float`, `mean_peak_decel_g_abs_clean float`, `fastest_lap_flag bool`
+- `qualifying_results`: `q1_peak_accel_g float`, `q1_peak_decel_g_abs float`, `q2_*`, `q3_*` (6 columns)
+- `weather`: `wind_speed float`, `wind_direction int`, `pressure float`
+- **New tables**: `session_sector_bests` — `(session_key int PK, best_s1/s2/s3 float, best_s1/s2/s3_driver int, theoretical_best_lap float)`
 
 ---
 
@@ -300,20 +305,22 @@ All tables populated correctly for meeting 1280 (2026 Chinese GP).
 
 ### Phase 5 — Derived Metrics Pipeline (continuing)
 
-Full scope documented in `product_roadmap.md`. Peak G (longitudinal) is the first metric implemented. Next steps:
+Full scope documented in `product_roadmap.md`. All pipeline code is written and tested — the next session should begin with schema migrations, then run `--recompute` to populate Supabase.
 
-**Immediate — schema migrations needed in Supabase:**
-- `lap_metrics`: add `peak_accel_g float`, `peak_decel_g_abs float`
-- `race_results`: add `mean_peak_accel_g float`, `mean_peak_accel_g_clean float`, `mean_peak_decel_g_abs float`, `mean_peak_decel_g_abs_clean float`
-- Still needed for remaining Phase 5 metrics: `wind_speed`/`wind_direction`/`pressure` in `weather`; `circuit_length_km` in `races`; full `lap_metrics` column set; `session_sector_bests`, `stint_metrics`, `season_driver_stats`, `season_constructor_stats`, `circuits` tables
+**Completed pipeline functions (all tested, pending schema migration to run):**
+- ✅ `ingest_fastest_lap_flag` — race/sprint only, race_results table
+- ✅ `ingest_brake_entry_speed_ranks` — pct_rank/z_score/category per sector, lap_metrics table
+- ✅ `ingest_lap_flags` — is_neutralized + tyre_age_at_lap, lap_metrics table
+- ✅ `ingest_session_sector_bests` — session_sector_bests table + delta_to_session_best_s1/s2/s3 in lap_metrics
+- ✅ `ingest_weather` wind/pressure fields — already in pipeline code, just needs schema columns added
 
-**Next pipeline work:**
-- Extend `recompute_lap_metrics` to qualifying sessions — per-lap peak G stored in `lap_metrics` using the same `_compute_peak_g` function; session-level aggregate to `qualifying_results` (best-lap peak G per phase, not an average). See roadmap Phase 5.
-- Cornering G estimation research — **lateral G research complete** (see below). Next: validation notebook before pipeline integration.
-- Remaining car_data metrics: coasting ratio/distance, throttle/brake overlap, full throttle %, throttle input variance, DRS activation/distance, max speed per sector, brake zone count, mean peak decel per sector.
-- Battle states: gap_ahead/behind per sector from intervals × sector timestamps.
-- `pipeline/seed_circuits.py` — one-off script to populate `circuits` reference table.
-- `race_results.fastest_lap_flag` — derive from min `lap_duration` among classified finishers.
+**Next pipeline work (priority order):**
+
+1. **Schema migrations** — apply the Supabase DDL listed in the Phase 5 section above. Once done, run `python pipeline/ingest.py --session <key> --recompute` on 2026 Chinese GP sessions to validate.
+2. **Battle states** (`ingest_battle_states`) — `gap_ahead/behind_s1/s2/s3` from intervals × sector boundary timestamps; `is_estimated_clean_air` (gap_ahead > 2s across all sectors); `overtakes_s1/s2/s3` / `overtaken_s1/s2/s3` matched to sector UTC windows. New function wired into `recompute_lap_metrics`.
+3. **`stint_metrics`** (`ingest_stint_metrics`) — clean/dirty air pace, representative pace, racing lap count per stint. Requires `is_estimated_clean_air` (from battle states) and `is_neutralized` (already implemented).
+4. **`season_driver_stats` / `season_constructor_stats`** — cumulative per-round rows; requires backfill ingestion to be substantially complete.
+5. **`pipeline/seed_circuits.py`** — one-off script to populate `circuits` reference table (needed for `distance_km` in season stats).
 
 **API efficiency rule (established, do not regress):**
 Always fetch the broadest useful time window in a single call and segment client-side. Per-lap loops (20 drivers × 55 laps = 1,100 calls) reliably hit the OpenF1 sustained limit. Learned during `research/car_velocity/noise.py` Section 9, implemented in `ingest_lap_metrics`.
