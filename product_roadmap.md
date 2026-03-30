@@ -335,20 +335,25 @@ circuits             — static reference table: circuit_key, name, location, co
 - ~~`accumulated_linear_deceleration_g_*`~~ — removed: same reason
 - ~~`peak/mean/accumulated_lat_g_*`~~ — removed: OpenF1 XY is reference-path, not driving-line position
 
-**`lap_metrics` — battle and proximity states (per sector per lap)**
+**`lap_metrics` — battle and proximity states (per sector per lap) ✅ Implemented (2026-03-30)**
 Derived from intervals timestamps cross-referenced with sector boundary times from `laps`.
-- `gap_ahead_s1/s2/s3` — gap to car ahead at end of each sector (seconds)
-- `gap_behind_s1/s2/s3` — gap to car behind at end of each sector
-- `battle_ahead_s1/s2/s3_driver` — driver number of car < 1s ahead at sector end (nullable)
-- `battle_behind_s1/s2/s3_driver` — driver number of car < 1s behind (nullable)
-- `is_estimated_clean_air` — gap_ahead > 2s across all sectors (estimation of clean air subject to refinement)
-- `overtakes_s1/s2/s3` - number of times a driver overtook another driver in each sector
-- `overtaken_s1/s2/s3` - number of times a driver was overtaken by another driver in each sector
-  - need to match overtake UTC time to the sector utc time (i.e., take lap start UTC time, add sector times)
-- `lap_overtakes` - total overtakes in a lap (sum of s1/s2/s3)
-- `lap_overtaken` - total times overtaken in a lap (sum of s1/s2/s3)
-- `i1_speed` - speed of car in first intermediate point (from openf1 api)
-- `i2_speed` - speed of car in second intermediate point (from openf1 api)
+- `gap_ahead_s1/s2/s3` ✅ — gap to car ahead at end of each sector (seconds); None for race leader
+- `gap_behind_s1/s2/s3` ✅ — gap to car behind at end of each sector
+- `battle_ahead_s1/s2/s3_driver` ✅ — driver number of car < 1s ahead at sector end (nullable)
+- `battle_behind_s1/s2/s3_driver` ✅ — driver number of car < 1s behind (nullable)
+- `is_estimated_clean_air` ✅ — gap_ahead > 2s across all sectors; None when no interval data; leader always True
+- `overtakes_s1/s2/s3` ✅ — times driver overtook another driver in each sector window
+- `overtaken_s1/s2/s3` ✅ — times driver was overtaken in each sector window
+- `lap_overtakes` ✅ — sum of s1+s2+s3 overtakes
+- `lap_overtaken` ✅ — sum of s1+s2+s3 overtaken
+- `i1_speed` ✅ — speed at first intermediate point (from OpenF1 laps)
+- `i2_speed` ✅ — speed at second intermediate point (from OpenF1 laps)
+- `sector_context_s1/s2/s3` ✅ — mini-sector segment lists (`segments_sector_1/2/3` from OpenF1 laps)
+
+**OpenF1 data artifact (documented):** Race leader returns `interval=0.0`/`gap_to_leader=0.0` instead of null/null. Pipeline treats `interval==0.0 AND gap_to_leader==0.0` as the leader sentinel; `gap_ahead` set to None, `is_estimated_clean_air=True`. Validated against 2026 Chinese GP: driver 12 shows gap_ahead=null from lap 3 onward (took lead after lap 2).
+
+**Position snapshot algorithm:** At each sector end time `t`, build position order by nearest-neighbour lookup (bisect) in the intervals index per driver, then sort lead-lap drivers by `gap_to_leader`, lapped drivers by `laps_down`. `gap_ahead` = driver's own `interval`; `gap_behind` = following driver's `interval`.
+
 - `sector_context` - uses the `segments_sector_1/2/3` key to return a list of mini sectors. Mini sectors are defined as:
 |value | colour |
 | ---- | ------ |
@@ -419,7 +424,7 @@ One row per driver per round; full table gives season progression plottable over
 ✅ 5. ingest_race/qualifying_peak_g_summary — G summary to race_results / qualifying_results
 ✅ 6. ingest_brake_entry_speed_ranks — session-level pct_rank/z_score/category
 ✅ 7. race_results.fastest_lap_flag — ingest_fastest_lap_flag (called in process_session, not recompute)
-   8. ingest_battle_states — gap/battle states per sector (intervals × sector timestamps)
+✅ 8. ingest_battle_states — gap/battle states per sector (intervals × sector timestamps)
    9. ingest_stint_metrics — requires is_estimated_clean_air + is_neutralized
   10. season_driver_stats + season_constructor_stats (cumulative row; reads prior round, adds delta)
 ```

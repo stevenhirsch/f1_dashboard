@@ -23,6 +23,7 @@ Environment variables (required):
 """
 
 import argparse
+import bisect
 import os
 import sys
 import time
@@ -520,8 +521,8 @@ def ingest_fastest_lap_flag(client: Client, session_key: int, laps: list[dict]) 
     _upsert(client, "race_results", rows)
 
 
-def ingest_overtakes(client: Client, session_key: int) -> None:
-    """Upsert overtake events into `overtakes`."""
+def ingest_overtakes(client: Client, session_key: int) -> list[dict]:
+    """Upsert overtake events into `overtakes`. Returns raw API rows."""
     overtakes = openf1.get_overtakes(session_key)
     rows = [
         {
@@ -538,6 +539,7 @@ def ingest_overtakes(client: Client, session_key: int) -> None:
         and o.get("overtaken_driver_number") is not None
     ]
     _upsert(client, "overtakes", rows)
+    return overtakes
 
 
 def _parse_gap(value) -> tuple[float | None, int | None]:
@@ -562,8 +564,9 @@ def _parse_gap(value) -> tuple[float | None, int | None]:
         return None, None
 
 
-def ingest_intervals(client: Client, session_key: int) -> None:
-    """Upsert gap-to-leader and interval data into `intervals` (race/sprint only)."""
+def ingest_intervals(client: Client, session_key: int) -> list[dict]:
+    """Upsert gap-to-leader and interval data into `intervals` (race/sprint only).
+    Returns raw API rows."""
     intervals = openf1.get_intervals(session_key)
     rows = []
     for i in intervals:
@@ -580,6 +583,7 @@ def ingest_intervals(client: Client, session_key: int) -> None:
             "laps_down":     laps_down,
         })
     _upsert(client, "intervals", rows)
+    return intervals
 
 
 def ingest_starting_grid(client: Client, session_key: int) -> None:
@@ -1067,7 +1071,7 @@ def ingest_lap_metrics(
             continue
 
         df_all = pd.DataFrame(raw)
-        df_all['date'] = pd.to_datetime(df_all['date'])
+        df_all['date'] = pd.to_datetime(df_all['date'], format='ISO8601')
         df_all = df_all.sort_values('date').reset_index(drop=True)
 
         for i in range(len(driver_laps) - 1):
@@ -1440,6 +1444,309 @@ def ingest_brake_entry_speed_ranks(
     _upsert(client, 'lap_metrics', rows)
 
 
+def _parse_intervals_index(
+    intervals_rows: list[dict],
+) -> dict[int, list[tuple[float, float | None, float | None, int | None]]]:
+    """Build a per-driver sorted index of interval records.
+
+    Returns {driver_number: [(timestamp_epoch, interval, gap_to_leader, laps_down), ...]}.
+    Each entry is sorted ascending by timestamp for binary-search lookups.
+    ``interval`` and ``gap_to_leader`` are parsed through ``_parse_gap``.
+    """
+    import pandas as pd
+
+    index: dict[int, list] = {}
+    for row in intervals_rows:
+        dn = row.get('driver_number')
+        date = row.get('date')
+        if dn is None or date is None:
+            continue
+        try:
+            t = pd.to_datetime(date).timestamp()
+        except Exception:
+            continue
+        interval, _ = _parse_gap(row.get('interval'))
+        gap, laps_down = _parse_gap(row.get('gap_to_leader'))
+        index.setdefault(dn, []).append((t, interval, gap, laps_down))
+    for dn in index:
+        index[dn].sort(key=lambda x: x[0])
+    return index
+
+
+def _nearest_interval_entry(
+    index: dict[int, list],
+    dn: int,
+    t: float,
+) -> tuple[float | None, float | None, int | None]:
+    """Return (interval, gap_to_leader, laps_down) for driver ``dn`` at time ``t``.
+
+    Uses bisect to find the nearest timestamp. Returns (None, None, None) when no
+    records exist for this driver.
+    """
+    entries = index.get(dn)
+    if not entries:
+        return None, None, None
+    timestamps = [e[0] for e in entries]
+    idx = bisect.bisect_left(timestamps, t)
+    if idx == 0:
+        e = entries[0]
+    elif idx == len(entries):
+        e = entries[-1]
+    else:
+        before = entries[idx - 1]
+        after = entries[idx]
+        e = after if abs(after[0] - t) <= abs(before[0] - t) else before
+    return e[1], e[2], e[3]
+
+
+def _position_snapshot(
+    index: dict[int, list],
+    t: float,
+) -> list[tuple[int, float | None, float | None]]:
+    """Return a position-ordered list of (driver_number, interval, gap_to_leader) at time ``t``.
+
+    Ordering: lead-lap drivers sorted by gap_to_leader ascending (leader first, None = 0.0),
+    then lapped drivers sorted by laps_down ascending.
+    """
+    lead_lap: list[tuple[float, int, float | None, float | None]] = []
+    lapped: list[tuple[int, int, float | None, float | None]] = []
+
+    for dn in index:
+        interval, gap, laps_down = _nearest_interval_entry(index, dn, t)
+        if laps_down is not None and laps_down > 0:
+            lapped.append((laps_down, dn, interval, gap))
+        else:
+            gtl_sort = gap if gap is not None else 0.0
+            lead_lap.append((gtl_sort, dn, interval, gap))
+
+    lead_lap.sort(key=lambda x: x[0])
+    lapped.sort(key=lambda x: x[0])
+
+    result = [(dn, interval, gap) for _, dn, interval, gap in lead_lap]
+    for _, dn, interval, gap in lapped:
+        result.append((dn, interval, gap))
+    return result
+
+
+def ingest_battle_states(
+    client: Client,
+    session_key: int,
+    laps: list[dict],
+    intervals_rows: list[dict],
+    overtakes_rows: list[dict],
+) -> None:
+    """Populate gap, battle, overtake, and lap-context fields in ``lap_metrics``.
+
+    Gap and battle fields (gap_ahead_s1/s2/s3, gap_behind_s1/s2/s3,
+    battle_ahead/behind_s1/s2/s3_driver, is_estimated_clean_air) are derived from
+    the intervals table by computing a position snapshot at each sector end timestamp.
+
+    Overtake fields (overtakes_s1/s2/s3, overtaken_s1/s2/s3, lap_overtakes,
+    lap_overtaken) count OpenF1 overtake events within each sector's UTC window.
+
+    i1_speed, i2_speed, and sector_context_s1/s2/s3 are copied directly from
+    the laps table (available for all session types).
+
+    All fields are None when source data is missing or sector timestamps are unavailable.
+    """
+    import pandas as pd
+
+    if not laps:
+        return
+
+    has_intervals = bool(intervals_rows)
+    index = _parse_intervals_index(intervals_rows) if has_intervals else {}
+
+    # Build overtake timestamp indexes.
+    overtakes_made: dict[int, list[float]] = {}
+    overtakes_suffered: dict[int, list[float]] = {}
+    for row in overtakes_rows:
+        date = row.get('date')
+        if date is None:
+            continue
+        try:
+            t = pd.to_datetime(date).timestamp()
+        except Exception:
+            continue
+        dn_over = row.get('driver_number_overtaking') or row.get('overtaking_driver_number')
+        dn_under = row.get('driver_number_overtaken') or row.get('overtaken_driver_number')
+        if dn_over is not None:
+            overtakes_made.setdefault(dn_over, []).append(t)
+        if dn_under is not None:
+            overtakes_suffered.setdefault(dn_under, []).append(t)
+    for lst in overtakes_made.values():
+        lst.sort()
+    for lst in overtakes_suffered.values():
+        lst.sort()
+
+    def _count_in_window(ts_list: list[float], t_start: float, t_end: float) -> int:
+        lo = bisect.bisect_left(ts_list, t_start)
+        hi = bisect.bisect_right(ts_list, t_end)
+        return hi - lo
+
+    rows: list[dict] = []
+    for lap in laps:
+        dn = lap.get('driver_number')
+        lap_num = lap.get('lap_number')
+        if dn is None or lap_num is None:
+            continue
+
+        # Sector end timestamps.
+        t0: float | None = None
+        date_start = lap.get('date_start')
+        if date_start:
+            try:
+                t0 = pd.to_datetime(date_start).timestamp()
+            except Exception:
+                pass
+
+        s1_dur = lap.get('duration_sector_1')
+        s2_dur = lap.get('duration_sector_2')
+        lap_dur = lap.get('lap_duration')
+
+        s1_end: float | None = (t0 + float(s1_dur)) if (t0 and s1_dur) else None
+        s2_end: float | None = (t0 + float(s1_dur) + float(s2_dur)) if (t0 and s1_dur and s2_dur) else None
+        s3_end: float | None = (t0 + float(lap_dur)) if (t0 and lap_dur) else None
+
+        sector_ends = {'s1': s1_end, 's2': s2_end, 's3': s3_end}
+
+        # Gap and battle state per sector.
+        gap_ahead: dict[str, float | None] = {}
+        gap_behind: dict[str, float | None] = {}
+        battle_ahead_drv: dict[str, int | None] = {}
+        battle_behind_drv: dict[str, int | None] = {}
+
+        # Track clean-air status: True only if confirmed clean in all sectors.
+        # None if no intervals data or any sector time is missing.
+        clean_sectors: list[bool | None] = []
+
+        for sector, t_sec in sector_ends.items():
+            if t_sec is None or not has_intervals:
+                gap_ahead[sector] = None
+                gap_behind[sector] = None
+                battle_ahead_drv[sector] = None
+                battle_behind_drv[sector] = None
+                clean_sectors.append(None)
+                continue
+
+            snapshot = _position_snapshot(index, t_sec)
+            pos_map = {entry[0]: i for i, entry in enumerate(snapshot)}
+            p = pos_map.get(dn)
+
+            if p is None:
+                # Driver not found in intervals for this session.
+                gap_ahead[sector] = None
+                gap_behind[sector] = None
+                battle_ahead_drv[sector] = None
+                battle_behind_drv[sector] = None
+                clean_sectors.append(None)
+                continue
+
+            this_interval = snapshot[p][1]
+            this_gap = snapshot[p][2]
+
+            # OpenF1 artifact: the race leader sometimes returns interval=0.0 and
+            # gap_to_leader=0.0 instead of null/null. Treat as leader (no car ahead).
+            # Safe to condition on gap_to_leader=0.0 because a non-leader driver who is
+            # genuinely 0.0s alongside the car ahead still has a positive gap_to_leader.
+            is_leader = (this_interval is None and this_gap is None) or \
+                        (this_interval == 0.0 and (this_gap is None or this_gap == 0.0))
+
+            gap_ahead[sector] = None if is_leader else this_interval
+            if is_leader:
+                clean_sectors.append(True)
+            elif this_interval is not None and this_interval > 2.0:
+                clean_sectors.append(True)
+            else:
+                clean_sectors.append(False)
+
+            # Battle ahead.
+            if this_interval is not None and this_interval < 1.0 and p > 0:
+                battle_ahead_drv[sector] = snapshot[p - 1][0]
+            else:
+                battle_ahead_drv[sector] = None
+
+            # Gap behind: the driver at p+1's interval = their gap to driver at p (this driver).
+            if p + 1 < len(snapshot):
+                behind_entry = snapshot[p + 1]
+                gap_behind[sector] = behind_entry[1]
+                if behind_entry[1] is not None and behind_entry[1] < 1.0:
+                    battle_behind_drv[sector] = behind_entry[0]
+                else:
+                    battle_behind_drv[sector] = None
+            else:
+                gap_behind[sector] = None
+                battle_behind_drv[sector] = None
+
+        # is_estimated_clean_air.
+        if not has_intervals or None in clean_sectors:
+            is_clean_air: bool | None = None
+        else:
+            is_clean_air = all(clean_sectors)
+
+        # Overtakes per sector.
+        made_list = overtakes_made.get(dn, [])
+        suffered_list = overtakes_suffered.get(dn, [])
+
+        if t0 is not None and s1_end is not None:
+            ov_s1: int | None = _count_in_window(made_list, t0, s1_end)
+            odn_s1: int | None = _count_in_window(suffered_list, t0, s1_end)
+        else:
+            ov_s1 = odn_s1 = None
+
+        if s1_end is not None and s2_end is not None:
+            ov_s2: int | None = _count_in_window(made_list, s1_end, s2_end)
+            odn_s2: int | None = _count_in_window(suffered_list, s1_end, s2_end)
+        else:
+            ov_s2 = odn_s2 = None
+
+        if s2_end is not None and s3_end is not None:
+            ov_s3: int | None = _count_in_window(made_list, s2_end, s3_end)
+            odn_s3: int | None = _count_in_window(suffered_list, s2_end, s3_end)
+        else:
+            ov_s3 = odn_s3 = None
+
+        if ov_s1 is not None or ov_s2 is not None or ov_s3 is not None:
+            lap_ov: int | None = (ov_s1 or 0) + (ov_s2 or 0) + (ov_s3 or 0)
+            lap_odn: int | None = (odn_s1 or 0) + (odn_s2 or 0) + (odn_s3 or 0)
+        else:
+            lap_ov = lap_odn = None
+
+        rows.append({
+            'session_key':              session_key,
+            'driver_number':            dn,
+            'lap_number':               lap_num,
+            'gap_ahead_s1':             gap_ahead['s1'],
+            'gap_ahead_s2':             gap_ahead['s2'],
+            'gap_ahead_s3':             gap_ahead['s3'],
+            'gap_behind_s1':            gap_behind['s1'],
+            'gap_behind_s2':            gap_behind['s2'],
+            'gap_behind_s3':            gap_behind['s3'],
+            'battle_ahead_s1_driver':   battle_ahead_drv['s1'],
+            'battle_ahead_s2_driver':   battle_ahead_drv['s2'],
+            'battle_ahead_s3_driver':   battle_ahead_drv['s3'],
+            'battle_behind_s1_driver':  battle_behind_drv['s1'],
+            'battle_behind_s2_driver':  battle_behind_drv['s2'],
+            'battle_behind_s3_driver':  battle_behind_drv['s3'],
+            'is_estimated_clean_air':   is_clean_air,
+            'overtakes_s1':             ov_s1,
+            'overtakes_s2':             ov_s2,
+            'overtakes_s3':             ov_s3,
+            'overtaken_s1':             odn_s1,
+            'overtaken_s2':             odn_s2,
+            'overtaken_s3':             odn_s3,
+            'lap_overtakes':            lap_ov,
+            'lap_overtaken':            lap_odn,
+            'i1_speed':                 lap.get('i1_speed'),
+            'i2_speed':                 lap.get('i2_speed'),
+            'sector_context_s1':        lap.get('segments_sector_1'),
+            'sector_context_s2':        lap.get('segments_sector_2'),
+            'sector_context_s3':        lap.get('segments_sector_3'),
+        })
+
+    _upsert(client, 'lap_metrics', rows)
+
+
 def recompute_lap_metrics(
     client: Client,
     session_key: int,
@@ -1447,6 +1754,8 @@ def recompute_lap_metrics(
     session_type: str,
     rc_rows: list[dict] | None = None,
     stints_rows: list[dict] | None = None,
+    intervals_rows: list[dict] | None = None,
+    overtakes_rows: list[dict] | None = None,
 ) -> None:
     """Regenerate derived metrics for a session without re-fetching raw data.
 
@@ -1457,6 +1766,8 @@ def recompute_lap_metrics(
     for each driver's best lap per phase into ``qualifying_results``.
 
     ``rc_rows`` is required for qualifying sessions to assign phase labels to laps.
+    ``intervals_rows`` and ``overtakes_rows`` are used for battle state metrics
+    (race/sprint only; qualifying will still populate i1/i2/sector_context from laps).
     """
     if session_type in ('race', 'sprint'):
         print("  computing lap metrics (race/sprint) …")
@@ -1465,6 +1776,8 @@ def recompute_lap_metrics(
         driver_lap_metrics = ingest_lap_metrics(client, session_key, laps)
         ingest_race_peak_g_summary(client, session_key, driver_lap_metrics)
         ingest_brake_entry_speed_ranks(client, session_key, driver_lap_metrics)
+        ingest_battle_states(client, session_key, laps,
+                             intervals_rows or [], overtakes_rows or [])
         total = sum(len(v) for v in driver_lap_metrics.values())
         print(f"  lap_metrics: {total} laps across {len(driver_lap_metrics)} drivers")
     elif session_type in ('qualifying', 'sprint qualifying', 'sprint shootout'):
@@ -1476,6 +1789,8 @@ def recompute_lap_metrics(
         driver_lap_metrics = ingest_lap_metrics(client, session_key, laps_with_phases)
         ingest_qualifying_peak_g_summary(client, session_key, driver_lap_metrics, best_per_phase)
         ingest_brake_entry_speed_ranks(client, session_key, driver_lap_metrics)
+        ingest_battle_states(client, session_key, laps_with_phases,
+                             intervals_rows or [], overtakes_rows or [])
         total = sum(len(v) for v in driver_lap_metrics.values())
         print(f"  lap_metrics: {total} laps across {len(driver_lap_metrics)} drivers")
     else:
@@ -1521,11 +1836,14 @@ def process_session(client: Client, session_key: int, recompute: bool = False) -
     ingest_weather(client, session_key)
     rc_rows = ingest_race_control(client, session_key)
 
+    intervals_rows: list[dict] = []
+    overtakes_rows: list[dict] = []
+
     if session_type in ("race", "sprint"):
         ingest_race_results(client, session_key, pit)
         ingest_fastest_lap_flag(client, session_key, laps)
-        ingest_overtakes(client, session_key)
-        ingest_intervals(client, session_key)
+        overtakes_rows = ingest_overtakes(client, session_key)
+        intervals_rows = ingest_intervals(client, session_key)
         ingest_position(client, session_key)
         ingest_team_radio(client, session_key)
         ingest_championship_drivers(client, session_key)
@@ -1536,7 +1854,8 @@ def process_session(client: Client, session_key: int, recompute: bool = False) -
 
     if recompute:
         recompute_lap_metrics(client, session_key, laps, session_type,
-                              rc_rows=rc_rows, stints_rows=stints_rows)
+                              rc_rows=rc_rows, stints_rows=stints_rows,
+                              intervals_rows=intervals_rows, overtakes_rows=overtakes_rows)
 
     elapsed = time.time() - t0
     stats = openf1.get_stats()

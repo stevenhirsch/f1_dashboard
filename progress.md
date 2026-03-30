@@ -1,7 +1,7 @@
 # F1 Dashboard — Progress Log
 
 ## Current Status
-**Phase 4 complete. Phase 5 (Derived Metrics Pipeline) in progress — peak longitudinal G implemented for race/sprint. Lateral G permanently abandoned (OpenF1 XY is reference-path progression, not driving-line position). Next: qualifying G extension + remaining car_data metrics. Backfill ingestion ongoing in background.**
+**Phase 4 complete. Phase 5 (Derived Metrics Pipeline) in progress — car-data metrics, lap flags, sector bests, brake entry speed ranks, and battle states all implemented and validated. Next: `ingest_stint_metrics` (requires `is_estimated_clean_air`, now available). Backfill ingestion ongoing in background.**
 
 ---
 
@@ -265,20 +265,24 @@ All tables populated correctly for meeting 1280 (2026 Chinese GP).
 - `ingest_brake_entry_speed_ranks(client, session_key, driver_lap_metrics)` — session-level pass computing percentile rank (midpoint formula), z-score (population std), and category ('early'/'average'/'late') for `speed_at_brake_start_kph_*` across all drivers. Upserts `brake_entry_speed_pct_rank/z_score/category_lap/s1/s2/s3` to `lap_metrics`.
 - `ingest_lap_flags(client, session_key, laps, stints_rows, rc_rows)` — upserts `is_neutralized` (any SC/VSC/red flag RC event within the lap's UTC window) and `tyre_age_at_lap` (`tyre_age_at_start + lap_number − stint.lap_start`) to `lap_metrics`. Both are `None` when source data is missing.
 - `ingest_session_sector_bests(client, session_key, laps)` — upserts one row to `session_sector_bests` with best S1/S2/S3 time + driver + theoretical best lap; also upserts `delta_to_session_best_s1/s2/s3` per driver/lap to `lap_metrics`. Zero/negative/null sector times excluded from best computation.
-- `recompute_lap_metrics(client, session_key, laps, session_type, rc_rows, stints_rows)` — fully functional for race, sprint, qualifying, sprint qualifying, sprint shootout sessions. Call order: `ingest_lap_flags` → `ingest_session_sector_bests` → `ingest_lap_metrics` → G summary → `ingest_brake_entry_speed_ranks`.
+- `ingest_battle_states(client, session_key, laps, intervals_rows, overtakes_rows)` — position snapshot via bisect on per-driver intervals index; `gap_ahead` = driver's own interval, `gap_behind` = following driver's interval; battle drivers set when gap < 1s; `is_estimated_clean_air` when all 3 sector gaps > 2s; overtakes counted via bisect into sector UTC windows. OpenF1 leader artifact handled: `interval==0.0 AND gap_to_leader==0.0` treated as leader sentinel. Called for all session types (qualifying gets None for gap fields, still populates i1/i2/sector_context from laps).
+- `recompute_lap_metrics(client, session_key, laps, session_type, rc_rows, stints_rows, intervals_rows, overtakes_rows)` — fully functional for race, sprint, qualifying, sprint qualifying, sprint shootout sessions. Call order: `ingest_lap_flags` → `ingest_session_sector_bests` → `ingest_lap_metrics` → G summary → `ingest_brake_entry_speed_ranks` → `ingest_battle_states`.
+- `ingest_intervals` and `ingest_overtakes` now return raw API rows (list[dict]) for downstream use in `ingest_battle_states`.
 
 **Weather fields (2026-03-29):** `wind_speed`, `wind_direction`, `pressure` were already being fetched and included in `ingest_weather` row mapping — pipeline code was already correct. Schema migration (adding 3 columns to `weather` table) pending. 6 `TestIngestWeather` tests added to document the field mapping.
 
 **CLI fix (2026-03-29):** `ingest.py --session <key> --recompute` was broken (called `recompute_lap_metrics` with missing required args). Fixed to route through `process_session(recompute=True)`.
 
-**Tests: 258 total (all passing). Run with `pixi run -e pipeline test`.**
+**Battle states (2026-03-30):** `ingest_battle_states` implemented, tested (295 tests passing), schema migrated, and validated against 2026 Chinese GP race session. Regression test added for OpenF1 leader zero-interval artifact. Scoping bug in `_position_snapshot` (gap closure variable) found and fixed — `gap` now stored in `lead_lap` tuples and properly unpacked.
 
-**Schema changes required in Supabase before running `--recompute`:**
-- `lap_metrics`: full column set — all car-data metrics above + `is_neutralized bool`, `tyre_age_at_lap int`, `delta_to_session_best_s1/s2/s3 float`, `brake_entry_speed_pct_rank_lap/s1/s2/s3 float`, `brake_entry_speed_z_score_lap/s1/s2/s3 float`, `brake_entry_speed_category_lap/s1/s2/s3 text`
-- `race_results`: `mean_peak_accel_g float`, `mean_peak_accel_g_clean float`, `mean_peak_decel_g_abs float`, `mean_peak_decel_g_abs_clean float`, `fastest_lap_flag bool`
-- `qualifying_results`: `q1_peak_accel_g float`, `q1_peak_decel_g_abs float`, `q2_*`, `q3_*` (6 columns)
+**Tests: 295 total (all passing). Run with `pixi run -e pipeline test`.**
+
+**Schema changes applied in Supabase (all migrations complete):**
+- `lap_metrics`: full column set — all car-data metrics + `is_neutralized bool`, `tyre_age_at_lap int`, `delta_to_session_best_s1/s2/s3 float`, `brake_entry_speed_pct_rank/z_score/category_lap/s1/s2/s3`, `gap_ahead/behind_s1/s2/s3 numeric`, `battle_ahead/behind_s1/s2/s3_driver int`, `is_estimated_clean_air bool`, `overtakes/overtaken_s1/s2/s3 int`, `lap_overtakes/lap_overtaken int`, `i1_speed/i2_speed int`, `sector_context_s1/s2/s3 jsonb`
+- `race_results`: `mean_peak_accel_g`, `mean_peak_accel_g_clean`, `mean_peak_decel_g_abs`, `mean_peak_decel_g_abs_clean float`, `fastest_lap_flag bool`
+- `qualifying_results`: `q1/q2/q3_peak_accel_g float`, `q1/q2/q3_peak_decel_g_abs float` (6 columns)
 - `weather`: `wind_speed float`, `wind_direction int`, `pressure float`
-- **New tables**: `session_sector_bests` — `(session_key int PK, best_s1/s2/s3 float, best_s1/s2/s3_driver int, theoretical_best_lap float)`
+- **New table**: `session_sector_bests` — `(session_key int PK, best_s1/s2/s3 float, best_s1/s2/s3_driver int, theoretical_best_lap float)`
 
 ---
 
@@ -305,22 +309,21 @@ All tables populated correctly for meeting 1280 (2026 Chinese GP).
 
 ### Phase 5 — Derived Metrics Pipeline (continuing)
 
-Full scope documented in `product_roadmap.md`. All pipeline code is written and tested — the next session should begin with schema migrations, then run `--recompute` to populate Supabase.
+Full scope documented in `product_roadmap.md`. Schema migrations complete. All implemented functions validated against 2026 Chinese GP data in Supabase.
 
-**Completed pipeline functions (all tested, pending schema migration to run):**
+**Completed pipeline functions (all tested and validated in Supabase):**
 - ✅ `ingest_fastest_lap_flag` — race/sprint only, race_results table
 - ✅ `ingest_brake_entry_speed_ranks` — pct_rank/z_score/category per sector, lap_metrics table
 - ✅ `ingest_lap_flags` — is_neutralized + tyre_age_at_lap, lap_metrics table
 - ✅ `ingest_session_sector_bests` — session_sector_bests table + delta_to_session_best_s1/s2/s3 in lap_metrics
-- ✅ `ingest_weather` wind/pressure fields — already in pipeline code, just needs schema columns added
+- ✅ `ingest_weather` wind/pressure fields — schema migrated and populated
+- ✅ `ingest_battle_states` — gap/battle states, clean air estimation, overtake counts, i1/i2/sector_context
 
 **Next pipeline work (priority order):**
 
-1. **Schema migrations** — apply the Supabase DDL listed in the Phase 5 section above. Once done, run `python pipeline/ingest.py --session <key> --recompute` on 2026 Chinese GP sessions to validate.
-2. **Battle states** (`ingest_battle_states`) — `gap_ahead/behind_s1/s2/s3` from intervals × sector boundary timestamps; `is_estimated_clean_air` (gap_ahead > 2s across all sectors); `overtakes_s1/s2/s3` / `overtaken_s1/s2/s3` matched to sector UTC windows. New function wired into `recompute_lap_metrics`.
-3. **`stint_metrics`** (`ingest_stint_metrics`) — clean/dirty air pace, representative pace, racing lap count per stint. Requires `is_estimated_clean_air` (from battle states) and `is_neutralized` (already implemented).
-4. **`season_driver_stats` / `season_constructor_stats`** — cumulative per-round rows; requires backfill ingestion to be substantially complete.
-5. **`pipeline/seed_circuits.py`** — one-off script to populate `circuits` reference table (needed for `distance_km` in season stats).
+1. **`stint_metrics`** (`ingest_stint_metrics`) — clean/dirty air pace, representative pace, racing lap count per stint. Requires `is_estimated_clean_air` (now available in `lap_metrics`) and `is_neutralized` (already implemented).
+2. **`season_driver_stats` / `season_constructor_stats`** — cumulative per-round rows; requires backfill ingestion to be substantially complete.
+3. **`pipeline/seed_circuits.py`** — one-off script to populate `circuits` reference table (needed for `distance_km` in season stats).
 
 **API efficiency rule (established, do not regress):**
 Always fetch the broadest useful time window in a single call and segment client-side. Per-lap loops (20 drivers × 55 laps = 1,100 calls) reliably hit the OpenF1 sustained limit. Learned during `research/car_velocity/noise.py` Section 9, implemented in `ingest_lap_metrics`.

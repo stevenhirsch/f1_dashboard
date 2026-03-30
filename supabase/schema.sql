@@ -26,6 +26,9 @@
 --     ALTER TABLE qualifying_results ADD COLUMN IF NOT EXISTS q3_laps integer;
 --
 --   position and team_radio tables added (Phase 3) — just run their CREATE statements below.
+--
+--   Phase 5 lap_metrics columns + session_sector_bests table + race_results/qualifying_results/weather
+--   additions (2026-03-30) — run the ALTER TABLE block at the bottom of this file.
 
 -- ---------------------------------------------------------------------------
 -- races  (meeting metadata)
@@ -384,3 +387,156 @@ create table if not exists championship_teams (
 
 alter table championship_teams enable row level security;
 create policy "anon read" on championship_teams for select to anon using (true);
+
+
+-- ===========================================================================
+-- Phase 5 migrations (2026-03-30)
+-- Run these ALTER TABLE statements on your live Supabase instance.
+-- All use ADD COLUMN IF NOT EXISTS — safe to re-run.
+-- ===========================================================================
+
+-- ---------------------------------------------------------------------------
+-- lap_metrics — Phase 5 car-data derived columns
+-- ---------------------------------------------------------------------------
+ALTER TABLE lap_metrics ADD COLUMN IF NOT EXISTS peak_accel_g                              numeric;
+ALTER TABLE lap_metrics ADD COLUMN IF NOT EXISTS peak_decel_g_abs                         numeric;
+ALTER TABLE lap_metrics ADD COLUMN IF NOT EXISTS max_linear_acceleration_g_lap             numeric;
+ALTER TABLE lap_metrics ADD COLUMN IF NOT EXISTS max_linear_acceleration_g_s1              numeric;
+ALTER TABLE lap_metrics ADD COLUMN IF NOT EXISTS max_linear_acceleration_g_s2              numeric;
+ALTER TABLE lap_metrics ADD COLUMN IF NOT EXISTS max_linear_acceleration_g_s3              numeric;
+ALTER TABLE lap_metrics ADD COLUMN IF NOT EXISTS max_linear_deceleration_g_lap             numeric;
+ALTER TABLE lap_metrics ADD COLUMN IF NOT EXISTS max_linear_deceleration_g_s1              numeric;
+ALTER TABLE lap_metrics ADD COLUMN IF NOT EXISTS max_linear_deceleration_g_s2              numeric;
+ALTER TABLE lap_metrics ADD COLUMN IF NOT EXISTS max_linear_deceleration_g_s3              numeric;
+ALTER TABLE lap_metrics ADD COLUMN IF NOT EXISTS max_speed_kph_lap                         numeric;
+ALTER TABLE lap_metrics ADD COLUMN IF NOT EXISTS max_speed_kph_s1                          numeric;
+ALTER TABLE lap_metrics ADD COLUMN IF NOT EXISTS max_speed_kph_s2                          numeric;
+ALTER TABLE lap_metrics ADD COLUMN IF NOT EXISTS max_speed_kph_s3                          numeric;
+ALTER TABLE lap_metrics ADD COLUMN IF NOT EXISTS coasting_ratio_lap                        numeric;
+ALTER TABLE lap_metrics ADD COLUMN IF NOT EXISTS coasting_ratio_s1                         numeric;
+ALTER TABLE lap_metrics ADD COLUMN IF NOT EXISTS coasting_ratio_s2                         numeric;
+ALTER TABLE lap_metrics ADD COLUMN IF NOT EXISTS coasting_ratio_s3                         numeric;
+ALTER TABLE lap_metrics ADD COLUMN IF NOT EXISTS coasting_distance_m_lap                   numeric;
+ALTER TABLE lap_metrics ADD COLUMN IF NOT EXISTS coasting_distance_m_s1                    numeric;
+ALTER TABLE lap_metrics ADD COLUMN IF NOT EXISTS coasting_distance_m_s2                    numeric;
+ALTER TABLE lap_metrics ADD COLUMN IF NOT EXISTS coasting_distance_m_s3                    numeric;
+ALTER TABLE lap_metrics ADD COLUMN IF NOT EXISTS estimated_superclipping_distance_m_lap    numeric;
+ALTER TABLE lap_metrics ADD COLUMN IF NOT EXISTS estimated_superclipping_distance_m_s1     numeric;
+ALTER TABLE lap_metrics ADD COLUMN IF NOT EXISTS estimated_superclipping_distance_m_s2     numeric;
+ALTER TABLE lap_metrics ADD COLUMN IF NOT EXISTS estimated_superclipping_distance_m_s3     numeric;
+ALTER TABLE lap_metrics ADD COLUMN IF NOT EXISTS full_throttle_pct_lap                     numeric;
+ALTER TABLE lap_metrics ADD COLUMN IF NOT EXISTS full_throttle_pct_s1                      numeric;
+ALTER TABLE lap_metrics ADD COLUMN IF NOT EXISTS full_throttle_pct_s2                      numeric;
+ALTER TABLE lap_metrics ADD COLUMN IF NOT EXISTS full_throttle_pct_s3                      numeric;
+ALTER TABLE lap_metrics ADD COLUMN IF NOT EXISTS throttle_brake_overlap_ratio_lap          numeric;
+ALTER TABLE lap_metrics ADD COLUMN IF NOT EXISTS throttle_brake_overlap_ratio_s1           numeric;
+ALTER TABLE lap_metrics ADD COLUMN IF NOT EXISTS throttle_brake_overlap_ratio_s2           numeric;
+ALTER TABLE lap_metrics ADD COLUMN IF NOT EXISTS throttle_brake_overlap_ratio_s3           numeric;
+ALTER TABLE lap_metrics ADD COLUMN IF NOT EXISTS throttle_input_variance_lap               numeric;
+ALTER TABLE lap_metrics ADD COLUMN IF NOT EXISTS throttle_input_variance_s1                numeric;
+ALTER TABLE lap_metrics ADD COLUMN IF NOT EXISTS throttle_input_variance_s2                numeric;
+ALTER TABLE lap_metrics ADD COLUMN IF NOT EXISTS throttle_input_variance_s3                numeric;
+ALTER TABLE lap_metrics ADD COLUMN IF NOT EXISTS drs_activation_count                      integer;
+ALTER TABLE lap_metrics ADD COLUMN IF NOT EXISTS drs_distance_m                            numeric;
+ALTER TABLE lap_metrics ADD COLUMN IF NOT EXISTS brake_zone_count_lap                      integer;
+ALTER TABLE lap_metrics ADD COLUMN IF NOT EXISTS brake_zone_count_s1                       integer;
+ALTER TABLE lap_metrics ADD COLUMN IF NOT EXISTS brake_zone_count_s2                       integer;
+ALTER TABLE lap_metrics ADD COLUMN IF NOT EXISTS brake_zone_count_s3                       integer;
+ALTER TABLE lap_metrics ADD COLUMN IF NOT EXISTS mean_peak_decel_g_lap                     numeric;
+ALTER TABLE lap_metrics ADD COLUMN IF NOT EXISTS mean_peak_decel_g_s1                      numeric;
+ALTER TABLE lap_metrics ADD COLUMN IF NOT EXISTS mean_peak_decel_g_s2                      numeric;
+ALTER TABLE lap_metrics ADD COLUMN IF NOT EXISTS mean_peak_decel_g_s3                      numeric;
+ALTER TABLE lap_metrics ADD COLUMN IF NOT EXISTS speed_at_brake_start_kph_lap              numeric;
+ALTER TABLE lap_metrics ADD COLUMN IF NOT EXISTS speed_at_brake_start_kph_s1               numeric;
+ALTER TABLE lap_metrics ADD COLUMN IF NOT EXISTS speed_at_brake_start_kph_s2               numeric;
+ALTER TABLE lap_metrics ADD COLUMN IF NOT EXISTS speed_at_brake_start_kph_s3               numeric;
+ALTER TABLE lap_metrics ADD COLUMN IF NOT EXISTS brake_entry_speed_pct_rank_lap            numeric;
+ALTER TABLE lap_metrics ADD COLUMN IF NOT EXISTS brake_entry_speed_pct_rank_s1             numeric;
+ALTER TABLE lap_metrics ADD COLUMN IF NOT EXISTS brake_entry_speed_pct_rank_s2             numeric;
+ALTER TABLE lap_metrics ADD COLUMN IF NOT EXISTS brake_entry_speed_pct_rank_s3             numeric;
+ALTER TABLE lap_metrics ADD COLUMN IF NOT EXISTS brake_entry_speed_z_score_lap             numeric;
+ALTER TABLE lap_metrics ADD COLUMN IF NOT EXISTS brake_entry_speed_z_score_s1              numeric;
+ALTER TABLE lap_metrics ADD COLUMN IF NOT EXISTS brake_entry_speed_z_score_s2              numeric;
+ALTER TABLE lap_metrics ADD COLUMN IF NOT EXISTS brake_entry_speed_z_score_s3              numeric;
+ALTER TABLE lap_metrics ADD COLUMN IF NOT EXISTS brake_entry_speed_category_lap            text;
+ALTER TABLE lap_metrics ADD COLUMN IF NOT EXISTS brake_entry_speed_category_s1             text;
+ALTER TABLE lap_metrics ADD COLUMN IF NOT EXISTS brake_entry_speed_category_s2             text;
+ALTER TABLE lap_metrics ADD COLUMN IF NOT EXISTS brake_entry_speed_category_s3             text;
+ALTER TABLE lap_metrics ADD COLUMN IF NOT EXISTS is_neutralized                            boolean;
+ALTER TABLE lap_metrics ADD COLUMN IF NOT EXISTS tyre_age_at_lap                           integer;
+ALTER TABLE lap_metrics ADD COLUMN IF NOT EXISTS delta_to_session_best_s1                  numeric;
+ALTER TABLE lap_metrics ADD COLUMN IF NOT EXISTS delta_to_session_best_s2                  numeric;
+ALTER TABLE lap_metrics ADD COLUMN IF NOT EXISTS delta_to_session_best_s3                  numeric;
+
+-- ---------------------------------------------------------------------------
+-- lap_metrics — Phase 5 battle states + lap context (ingest_battle_states)
+-- ---------------------------------------------------------------------------
+ALTER TABLE lap_metrics ADD COLUMN IF NOT EXISTS gap_ahead_s1                             numeric;
+ALTER TABLE lap_metrics ADD COLUMN IF NOT EXISTS gap_ahead_s2                             numeric;
+ALTER TABLE lap_metrics ADD COLUMN IF NOT EXISTS gap_ahead_s3                             numeric;
+ALTER TABLE lap_metrics ADD COLUMN IF NOT EXISTS gap_behind_s1                            numeric;
+ALTER TABLE lap_metrics ADD COLUMN IF NOT EXISTS gap_behind_s2                            numeric;
+ALTER TABLE lap_metrics ADD COLUMN IF NOT EXISTS gap_behind_s3                            numeric;
+ALTER TABLE lap_metrics ADD COLUMN IF NOT EXISTS battle_ahead_s1_driver                  integer;
+ALTER TABLE lap_metrics ADD COLUMN IF NOT EXISTS battle_ahead_s2_driver                  integer;
+ALTER TABLE lap_metrics ADD COLUMN IF NOT EXISTS battle_ahead_s3_driver                  integer;
+ALTER TABLE lap_metrics ADD COLUMN IF NOT EXISTS battle_behind_s1_driver                 integer;
+ALTER TABLE lap_metrics ADD COLUMN IF NOT EXISTS battle_behind_s2_driver                 integer;
+ALTER TABLE lap_metrics ADD COLUMN IF NOT EXISTS battle_behind_s3_driver                 integer;
+ALTER TABLE lap_metrics ADD COLUMN IF NOT EXISTS is_estimated_clean_air                  boolean;
+ALTER TABLE lap_metrics ADD COLUMN IF NOT EXISTS overtakes_s1                            integer;
+ALTER TABLE lap_metrics ADD COLUMN IF NOT EXISTS overtakes_s2                            integer;
+ALTER TABLE lap_metrics ADD COLUMN IF NOT EXISTS overtakes_s3                            integer;
+ALTER TABLE lap_metrics ADD COLUMN IF NOT EXISTS overtaken_s1                            integer;
+ALTER TABLE lap_metrics ADD COLUMN IF NOT EXISTS overtaken_s2                            integer;
+ALTER TABLE lap_metrics ADD COLUMN IF NOT EXISTS overtaken_s3                            integer;
+ALTER TABLE lap_metrics ADD COLUMN IF NOT EXISTS lap_overtakes                           integer;
+ALTER TABLE lap_metrics ADD COLUMN IF NOT EXISTS lap_overtaken                           integer;
+ALTER TABLE lap_metrics ADD COLUMN IF NOT EXISTS i1_speed                                integer;
+ALTER TABLE lap_metrics ADD COLUMN IF NOT EXISTS i2_speed                                integer;
+ALTER TABLE lap_metrics ADD COLUMN IF NOT EXISTS sector_context_s1                       jsonb;
+ALTER TABLE lap_metrics ADD COLUMN IF NOT EXISTS sector_context_s2                       jsonb;
+ALTER TABLE lap_metrics ADD COLUMN IF NOT EXISTS sector_context_s3                       jsonb;
+
+-- ---------------------------------------------------------------------------
+-- session_sector_bests  (new table — Phase 5)
+-- ---------------------------------------------------------------------------
+create table if not exists session_sector_bests (
+    session_key         integer primary key references sessions(session_key),
+    best_s1             numeric,
+    best_s2             numeric,
+    best_s3             numeric,
+    best_s1_driver      integer,
+    best_s2_driver      integer,
+    best_s3_driver      integer,
+    theoretical_best_lap numeric
+);
+
+alter table session_sector_bests enable row level security;
+create policy "anon read" on session_sector_bests for select to anon using (true);
+
+-- ---------------------------------------------------------------------------
+-- race_results — Phase 5 additions
+-- ---------------------------------------------------------------------------
+ALTER TABLE race_results ADD COLUMN IF NOT EXISTS mean_peak_accel_g              numeric;
+ALTER TABLE race_results ADD COLUMN IF NOT EXISTS mean_peak_accel_g_clean        numeric;
+ALTER TABLE race_results ADD COLUMN IF NOT EXISTS mean_peak_decel_g_abs          numeric;
+ALTER TABLE race_results ADD COLUMN IF NOT EXISTS mean_peak_decel_g_abs_clean    numeric;
+ALTER TABLE race_results ADD COLUMN IF NOT EXISTS fastest_lap_flag               boolean;
+
+-- ---------------------------------------------------------------------------
+-- qualifying_results — Phase 5 additions
+-- ---------------------------------------------------------------------------
+ALTER TABLE qualifying_results ADD COLUMN IF NOT EXISTS q1_peak_accel_g     numeric;
+ALTER TABLE qualifying_results ADD COLUMN IF NOT EXISTS q1_peak_decel_g_abs  numeric;
+ALTER TABLE qualifying_results ADD COLUMN IF NOT EXISTS q2_peak_accel_g     numeric;
+ALTER TABLE qualifying_results ADD COLUMN IF NOT EXISTS q2_peak_decel_g_abs  numeric;
+ALTER TABLE qualifying_results ADD COLUMN IF NOT EXISTS q3_peak_accel_g     numeric;
+ALTER TABLE qualifying_results ADD COLUMN IF NOT EXISTS q3_peak_decel_g_abs  numeric;
+
+-- ---------------------------------------------------------------------------
+-- weather — Phase 5 additions
+-- ---------------------------------------------------------------------------
+ALTER TABLE weather ADD COLUMN IF NOT EXISTS wind_speed       numeric;    -- m/s
+ALTER TABLE weather ADD COLUMN IF NOT EXISTS wind_direction   integer;    -- degrees 0–359
+ALTER TABLE weather ADD COLUMN IF NOT EXISTS pressure         numeric;    -- mbar

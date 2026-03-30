@@ -16,8 +16,10 @@ from ingest import (
     _get_compound_for_lap,
     _normalize_phase,
     _parse_gap,
+    _parse_intervals_index,
     _pick,
     _upsert,
+    ingest_battle_states,
     ingest_championship_drivers,
     ingest_championship_teams,
     ingest_drivers,
@@ -1038,6 +1040,36 @@ class TestIngestQualifyingResults(unittest.TestCase):
 
 
 # ===========================================================================
+# ingest_overtakes
+# ===========================================================================
+
+class TestIngestOvertakes(unittest.TestCase):
+
+    @patch("ingest.openf1.get_overtakes")
+    def test_returns_raw_api_rows(self, mock_get_overtakes):
+        """ingest_overtakes returns the raw API list for downstream use."""
+        client = _mock_client()
+        raw = [{"session_key": 9000, "date": "2024-03-01T14:00:00",
+                "overtaking_driver_number": 44, "overtaken_driver_number": 1,
+                "position": 3}]
+        mock_get_overtakes.return_value = raw
+
+        result = ingest_overtakes(client, 9000)
+
+        self.assertIs(result, raw)
+
+    @patch("ingest.openf1.get_overtakes")
+    def test_empty_response_returns_empty_list(self, mock_get_overtakes):
+        """Empty API response returns empty list."""
+        client = _mock_client()
+        mock_get_overtakes.return_value = []
+
+        result = ingest_overtakes(client, 9000)
+
+        self.assertEqual(result, [])
+
+
+# ===========================================================================
 # ingest_intervals
 # ===========================================================================
 
@@ -1127,6 +1159,17 @@ class TestIngestIntervals(unittest.TestCase):
         upserted = client.table.return_value.upsert.call_args.args[0]
         # _parse_gap("+1 LAP") returns (None, 1); the interval field takes the float part
         self.assertIsNone(upserted[0]["interval"])
+
+    @patch("ingest.openf1.get_intervals")
+    def test_returns_raw_api_rows(self, mock_get_intervals):
+        """ingest_intervals returns the raw API list for downstream use."""
+        client = _mock_client()
+        raw = [self._interval(gap_to_leader=1.0, interval=0.5)]
+        mock_get_intervals.return_value = raw
+
+        result = ingest_intervals(client, 9000)
+
+        self.assertIs(result, raw)
 
 
 # ===========================================================================
@@ -2318,6 +2361,37 @@ class TestIngestLapMetrics(unittest.TestCase):
         self.assertIn(44, result)
         self.assertEqual(len(result[44]), 1)   # only the second lap
 
+    @patch("ingest._compute_lap_metrics")
+    @patch("ingest.openf1.get_car_data")
+    def test_mixed_timestamp_formats_do_not_raise(self, mock_get_car_data, mock_clm):
+        """Car data with mixed timestamp formats (some with .microseconds, some without,
+        some with +00:00 instead of Z) must not raise ValueError.
+
+        Regression: pd.to_datetime() without format='ISO8601' inferred the format from
+        the first record and failed when a subsequent record omitted fractional seconds
+        (e.g. '2026-03-13T07:46:38+00:00' after records with '.123456+00:00').
+        """
+        import datetime
+        base = datetime.datetime(2024, 3, 2, 13, 0, 0)
+        records = []
+        for i in range(80):
+            # Alternate between timestamps with microseconds and without,
+            # and between Z and +00:00 timezone notation.
+            if i % 3 == 0:
+                ts = (base + datetime.timedelta(seconds=i)).strftime('%Y-%m-%dT%H:%M:%S.%f+00:00')
+            elif i % 3 == 1:
+                ts = (base + datetime.timedelta(seconds=i)).strftime('%Y-%m-%dT%H:%M:%S+00:00')
+            else:
+                ts = (base + datetime.timedelta(seconds=i)).strftime('%Y-%m-%dT%H:%M:%SZ')
+            records.append({'date': ts, 'speed': 200.0, 'throttle': 100, 'brake': 0, 'drs': 0})
+
+        mock_get_car_data.return_value = records
+        mock_clm.return_value = _MOCK_METRICS.copy()
+        client = _mock_client()
+
+        # Should not raise ValueError
+        ingest_lap_metrics(client, 9158, _make_laps(3, driver_number=44))
+
 
 # ===========================================================================
 # ingest_race_peak_g_summary
@@ -3182,6 +3256,475 @@ class TestIngestBrakeEntrySpeedRanks(unittest.TestCase):
         ingest_brake_entry_speed_ranks(client, 9000, dlm)
         upserted = client.table.return_value.upsert.call_args.args[0]
         self.assertEqual(len(upserted), 4)
+
+
+# ===========================================================================
+# ingest_battle_states
+# ===========================================================================
+
+class TestIngestBattleStates(unittest.TestCase):
+    """Tests for gap, battle, overtake, and lap-context fields in lap_metrics."""
+
+    # ----- fixture builders -------------------------------------------------
+
+    def _lap(self, driver_number=44, lap_number=5,
+             date_start='2024-03-02T13:00:00Z', lap_duration=90.0,
+             duration_sector_1=30.0, duration_sector_2=30.0,
+             i1_speed=210, i2_speed=280,
+             segments_sector_1=None, segments_sector_2=None, segments_sector_3=None):
+        return {
+            'driver_number':      driver_number,
+            'lap_number':         lap_number,
+            'date_start':         date_start,
+            'lap_duration':       lap_duration,
+            'duration_sector_1':  duration_sector_1,
+            'duration_sector_2':  duration_sector_2,
+            'i1_speed':           i1_speed,
+            'i2_speed':           i2_speed,
+            'segments_sector_1':  segments_sector_1,
+            'segments_sector_2':  segments_sector_2,
+            'segments_sector_3':  segments_sector_3,
+        }
+
+    def _interval_row(self, driver_number=44, date='2024-03-02T13:00:45Z',
+                      interval=3.5, gap_to_leader=5.0, laps_down=None):
+        # Raw API row format (gap_to_leader and interval are raw values, may be strings).
+        gtl = str(laps_down) + ' LAP' if laps_down else (str(gap_to_leader) if gap_to_leader is not None else None)
+        return {
+            'driver_number': driver_number,
+            'date':          date,
+            'interval':      interval,
+            'gap_to_leader': gap_to_leader,
+        }
+
+    def _raw_interval(self, driver_number=44, date='2024-03-02T13:00:45Z',
+                      interval=3.5, gap_to_leader=5.0):
+        """Raw API interval row with numeric fields already (no string parsing needed)."""
+        return {
+            'driver_number': driver_number,
+            'date':          date,
+            'interval':      interval,
+            'gap_to_leader': gap_to_leader,
+        }
+
+    def _overtake_row(self, overtaking=44, overtaken=1, date='2024-03-02T13:00:10Z'):
+        return {
+            'driver_number_overtaking': overtaking,
+            'driver_number_overtaken':  overtaken,
+            'date':                     date,
+        }
+
+    def _upserted(self, client):
+        return client.table.return_value.upsert.call_args.args[0]
+
+    def _row_for(self, rows, driver_number):
+        return next(r for r in rows if r['driver_number'] == driver_number)
+
+    # ----- gap_ahead ---------------------------------------------------------
+
+    def test_gap_ahead_from_interval_value(self):
+        """gap_ahead_s{X} is the driver's interval value at the sector end time."""
+        client = _mock_client()
+        lap = self._lap()
+        # Interval reading at ~t0+45s (midpoint) — nearest to s2_end (t0+60s) and s3_end (t0+90s)
+        intervals = [self._raw_interval(driver_number=44, date='2024-03-02T13:00:45Z',
+                                        interval=3.5, gap_to_leader=5.0)]
+        ingest_battle_states(client, 9000, [lap], intervals, [])
+        row = self._upserted(client)[0]
+        # All three sector ends are within nearest-neighbour range of this single reading
+        self.assertAlmostEqual(row['gap_ahead_s1'], 3.5)
+        self.assertAlmostEqual(row['gap_ahead_s2'], 3.5)
+        self.assertAlmostEqual(row['gap_ahead_s3'], 3.5)
+
+    def test_gap_ahead_none_for_leader(self):
+        """Leader has interval=None → gap_ahead=None."""
+        client = _mock_client()
+        lap = self._lap(driver_number=1)
+        intervals = [self._raw_interval(driver_number=1, date='2024-03-02T13:00:45Z',
+                                        interval=None, gap_to_leader=None)]
+        ingest_battle_states(client, 9000, [lap], intervals, [])
+        row = self._upserted(client)[0]
+        self.assertIsNone(row['gap_ahead_s1'])
+        self.assertIsNone(row['gap_ahead_s2'])
+        self.assertIsNone(row['gap_ahead_s3'])
+
+    def test_gap_ahead_none_when_no_intervals(self):
+        """Empty intervals_rows → all gap_ahead fields None."""
+        client = _mock_client()
+        lap = self._lap()
+        ingest_battle_states(client, 9000, [lap], [], [])
+        row = self._upserted(client)[0]
+        self.assertIsNone(row['gap_ahead_s1'])
+        self.assertIsNone(row['gap_ahead_s2'])
+        self.assertIsNone(row['gap_ahead_s3'])
+
+    def test_gap_fields_none_when_sector_time_missing(self):
+        """Missing duration_sector_1 → all s1 gap/battle fields None."""
+        client = _mock_client()
+        lap = self._lap(duration_sector_1=None)
+        intervals = [self._raw_interval(driver_number=44, date='2024-03-02T13:00:45Z',
+                                        interval=3.5, gap_to_leader=5.0)]
+        ingest_battle_states(client, 9000, [lap], intervals, [])
+        row = self._upserted(client)[0]
+        self.assertIsNone(row['gap_ahead_s1'])
+        self.assertIsNone(row['gap_behind_s1'])
+        self.assertIsNone(row['battle_ahead_s1_driver'])
+        self.assertIsNone(row['battle_behind_s1_driver'])
+
+    # ----- gap_behind --------------------------------------------------------
+
+    def test_gap_behind_from_car_behind_interval(self):
+        """gap_behind_sX = interval of the driver ranked directly behind."""
+        client = _mock_client()
+        # Driver 44 is P2, driver 33 is P3 with interval=0.8 to driver 44.
+        lap_44 = self._lap(driver_number=44)
+        # Lap for driver 33 — not strictly needed since we only check driver 44's row
+        lap_33 = self._lap(driver_number=33, lap_number=5,
+                           date_start='2024-03-02T13:00:00Z', lap_duration=90.0,
+                           duration_sector_1=30.0, duration_sector_2=30.0)
+        # P1 leader
+        int_1  = self._raw_interval(driver_number=1,  date='2024-03-02T13:00:45Z',
+                                    interval=None, gap_to_leader=None)
+        # P2 driver 44
+        int_44 = self._raw_interval(driver_number=44, date='2024-03-02T13:00:45Z',
+                                    interval=2.0, gap_to_leader=2.0)
+        # P3 driver 33, 0.8s behind driver 44
+        int_33 = self._raw_interval(driver_number=33, date='2024-03-02T13:00:45Z',
+                                    interval=0.8, gap_to_leader=2.8)
+        ingest_battle_states(client, 9000, [lap_44, lap_33],
+                             [int_1, int_44, int_33], [])
+        rows = self._upserted(client)
+        row_44 = self._row_for(rows, 44)
+        self.assertAlmostEqual(row_44['gap_behind_s1'], 0.8)
+
+    def test_last_place_has_no_gap_behind(self):
+        """Driver at last position → gap_behind = None."""
+        client = _mock_client()
+        lap = self._lap(driver_number=99)
+        intervals = [self._raw_interval(driver_number=99, date='2024-03-02T13:00:45Z',
+                                        interval=5.0, gap_to_leader=10.0)]
+        ingest_battle_states(client, 9000, [lap], intervals, [])
+        row = self._upserted(client)[0]
+        self.assertIsNone(row['gap_behind_s1'])
+        self.assertIsNone(row['gap_behind_s2'])
+        self.assertIsNone(row['gap_behind_s3'])
+
+    # ----- battle drivers ----------------------------------------------------
+
+    def test_battle_ahead_driver_set_when_gap_under_1s(self):
+        """battle_ahead_sX_driver = dn of car ahead when gap < 1.0."""
+        client = _mock_client()
+        lap_44 = self._lap(driver_number=44)
+        lap_1  = self._lap(driver_number=1, lap_number=5,
+                           date_start='2024-03-02T13:00:00Z', lap_duration=90.0,
+                           duration_sector_1=30.0, duration_sector_2=30.0)
+        int_1  = self._raw_interval(driver_number=1,  date='2024-03-02T13:00:45Z',
+                                    interval=None, gap_to_leader=None)
+        int_44 = self._raw_interval(driver_number=44, date='2024-03-02T13:00:45Z',
+                                    interval=0.6, gap_to_leader=0.6)
+        ingest_battle_states(client, 9000, [lap_44, lap_1], [int_1, int_44], [])
+        rows = self._upserted(client)
+        row_44 = self._row_for(rows, 44)
+        self.assertEqual(row_44['battle_ahead_s1_driver'], 1)
+        self.assertEqual(row_44['battle_ahead_s2_driver'], 1)
+        self.assertEqual(row_44['battle_ahead_s3_driver'], 1)
+
+    def test_battle_ahead_driver_none_when_gap_over_1s(self):
+        """battle_ahead_sX_driver = None when gap ≥ 1.0."""
+        client = _mock_client()
+        lap_44 = self._lap(driver_number=44)
+        lap_1  = self._lap(driver_number=1, lap_number=5,
+                           date_start='2024-03-02T13:00:00Z', lap_duration=90.0,
+                           duration_sector_1=30.0, duration_sector_2=30.0)
+        int_1  = self._raw_interval(driver_number=1,  date='2024-03-02T13:00:45Z',
+                                    interval=None, gap_to_leader=None)
+        int_44 = self._raw_interval(driver_number=44, date='2024-03-02T13:00:45Z',
+                                    interval=1.5, gap_to_leader=1.5)
+        ingest_battle_states(client, 9000, [lap_44, lap_1], [int_1, int_44], [])
+        rows = self._upserted(client)
+        row_44 = self._row_for(rows, 44)
+        self.assertIsNone(row_44['battle_ahead_s1_driver'])
+
+    def test_battle_behind_driver_identified_correctly(self):
+        """battle_behind_sX_driver set when car behind is within 1s."""
+        client = _mock_client()
+        lap_44 = self._lap(driver_number=44)
+        lap_33 = self._lap(driver_number=33, lap_number=5,
+                           date_start='2024-03-02T13:00:00Z', lap_duration=90.0,
+                           duration_sector_1=30.0, duration_sector_2=30.0)
+        int_1  = self._raw_interval(driver_number=1,  date='2024-03-02T13:00:45Z',
+                                    interval=None, gap_to_leader=None)
+        int_44 = self._raw_interval(driver_number=44, date='2024-03-02T13:00:45Z',
+                                    interval=2.0, gap_to_leader=2.0)
+        # Driver 33 is 0.5s behind driver 44
+        int_33 = self._raw_interval(driver_number=33, date='2024-03-02T13:00:45Z',
+                                    interval=0.5, gap_to_leader=2.5)
+        ingest_battle_states(client, 9000, [lap_44, lap_33],
+                             [int_1, int_44, int_33], [])
+        rows = self._upserted(client)
+        row_44 = self._row_for(rows, 44)
+        self.assertEqual(row_44['battle_behind_s1_driver'], 33)
+
+    def test_leader_has_no_battle_ahead(self):
+        """Race leader → battle_ahead_sX_driver = None."""
+        client = _mock_client()
+        lap = self._lap(driver_number=1)
+        intervals = [self._raw_interval(driver_number=1, date='2024-03-02T13:00:45Z',
+                                        interval=None, gap_to_leader=None)]
+        ingest_battle_states(client, 9000, [lap], intervals, [])
+        row = self._upserted(client)[0]
+        self.assertIsNone(row['battle_ahead_s1_driver'])
+        self.assertIsNone(row['battle_ahead_s2_driver'])
+        self.assertIsNone(row['battle_ahead_s3_driver'])
+
+    # ----- is_estimated_clean_air --------------------------------------------
+
+    def test_is_clean_air_true_when_all_gaps_over_2s(self):
+        """is_estimated_clean_air = True when all sector gap_aheads > 2.0."""
+        client = _mock_client()
+        lap = self._lap(driver_number=44)
+        intervals = [self._raw_interval(driver_number=44, date='2024-03-02T13:00:45Z',
+                                        interval=3.5, gap_to_leader=5.0)]
+        ingest_battle_states(client, 9000, [lap], intervals, [])
+        row = self._upserted(client)[0]
+        self.assertTrue(row['is_estimated_clean_air'])
+
+    def test_is_clean_air_false_when_any_gap_under_2s(self):
+        """is_estimated_clean_air = False when any sector gap ≤ 2.0."""
+        client = _mock_client()
+        lap = self._lap(driver_number=44)
+        # interval of 1.5 → gap_ahead = 1.5 ≤ 2.0
+        intervals = [self._raw_interval(driver_number=44, date='2024-03-02T13:00:45Z',
+                                        interval=1.5, gap_to_leader=3.0)]
+        ingest_battle_states(client, 9000, [lap], intervals, [])
+        row = self._upserted(client)[0]
+        self.assertFalse(row['is_estimated_clean_air'])
+
+    def test_is_clean_air_none_when_no_intervals(self):
+        """is_estimated_clean_air = None when intervals_rows is empty."""
+        client = _mock_client()
+        lap = self._lap()
+        ingest_battle_states(client, 9000, [lap], [], [])
+        row = self._upserted(client)[0]
+        self.assertIsNone(row['is_estimated_clean_air'])
+
+    def test_leader_is_estimated_clean_air_true(self):
+        """Race leader (interval=None, gap_to_leader=None) → is_estimated_clean_air=True."""
+        client = _mock_client()
+        lap = self._lap(driver_number=1)
+        intervals = [self._raw_interval(driver_number=1, date='2024-03-02T13:00:45Z',
+                                        interval=None, gap_to_leader=None)]
+        ingest_battle_states(client, 9000, [lap], intervals, [])
+        row = self._upserted(client)[0]
+        self.assertTrue(row['is_estimated_clean_air'])
+
+    def test_leader_zero_interval_openf1_artifact(self):
+        """OpenF1 sometimes returns interval=0.0 and gap_to_leader=0.0 for the race leader
+        instead of null/null. These should be treated as the leader: gap_ahead=None,
+        is_estimated_clean_air=True, not gap_ahead=0.0 and is_clean_air=False."""
+        client = _mock_client()
+        lap = self._lap(driver_number=12)
+        intervals = [self._raw_interval(driver_number=12, date='2024-03-02T13:00:45Z',
+                                        interval=0.0, gap_to_leader=0.0)]
+        ingest_battle_states(client, 9000, [lap], intervals, [])
+        row = self._upserted(client)[0]
+        self.assertIsNone(row['gap_ahead_s1'])
+        self.assertIsNone(row['gap_ahead_s2'])
+        self.assertIsNone(row['gap_ahead_s3'])
+        self.assertTrue(row['is_estimated_clean_air'])
+        self.assertIsNone(row['battle_ahead_s1_driver'])
+
+    def test_is_clean_air_none_when_sector_time_missing(self):
+        """Missing sector duration → is_estimated_clean_air = None."""
+        client = _mock_client()
+        lap = self._lap(duration_sector_1=None)
+        intervals = [self._raw_interval(driver_number=44, date='2024-03-02T13:00:45Z',
+                                        interval=3.5, gap_to_leader=5.0)]
+        ingest_battle_states(client, 9000, [lap], intervals, [])
+        row = self._upserted(client)[0]
+        self.assertIsNone(row['is_estimated_clean_air'])
+
+    # ----- overtakes ---------------------------------------------------------
+
+    def test_overtake_event_in_s1_window_counted(self):
+        """Overtake at t0+10s falls in s1 window [t0, t0+30] → overtakes_s1=1."""
+        client = _mock_client()
+        lap = self._lap()
+        overtakes = [self._overtake_row(overtaking=44, overtaken=1,
+                                        date='2024-03-02T13:00:10Z')]
+        ingest_battle_states(client, 9000, [lap], [], overtakes)
+        row = self._upserted(client)[0]
+        self.assertEqual(row['overtakes_s1'], 1)
+        self.assertEqual(row['overtakes_s2'], 0)
+        self.assertEqual(row['overtakes_s3'], 0)
+
+    def test_overtake_event_in_s2_window_not_in_s1(self):
+        """Overtake at t0+40s falls in s2 window [t0+30, t0+60] → overtakes_s2=1."""
+        client = _mock_client()
+        lap = self._lap()
+        overtakes = [self._overtake_row(overtaking=44, overtaken=1,
+                                        date='2024-03-02T13:00:40Z')]
+        ingest_battle_states(client, 9000, [lap], [], overtakes)
+        row = self._upserted(client)[0]
+        self.assertEqual(row['overtakes_s1'], 0)
+        self.assertEqual(row['overtakes_s2'], 1)
+        self.assertEqual(row['overtakes_s3'], 0)
+
+    def test_overtake_before_lap_start_not_counted(self):
+        """Overtake 5s before lap start → not counted in any sector."""
+        client = _mock_client()
+        lap = self._lap()
+        overtakes = [self._overtake_row(overtaking=44, overtaken=1,
+                                        date='2024-03-02T12:59:55Z')]
+        ingest_battle_states(client, 9000, [lap], [], overtakes)
+        row = self._upserted(client)[0]
+        self.assertEqual(row['overtakes_s1'], 0)
+        self.assertEqual(row['overtakes_s2'], 0)
+        self.assertEqual(row['overtakes_s3'], 0)
+
+    def test_lap_overtakes_is_sum_of_sectors(self):
+        """lap_overtakes = sum of overtakes_s1 + overtakes_s2 + overtakes_s3."""
+        client = _mock_client()
+        lap = self._lap()
+        overtakes = [
+            self._overtake_row(overtaking=44, overtaken=1,  date='2024-03-02T13:00:10Z'),
+            self._overtake_row(overtaking=44, overtaken=33, date='2024-03-02T13:00:40Z'),
+        ]
+        ingest_battle_states(client, 9000, [lap], [], overtakes)
+        row = self._upserted(client)[0]
+        self.assertEqual(row['lap_overtakes'], 2)
+        self.assertEqual(row['overtakes_s1'], 1)
+        self.assertEqual(row['overtakes_s2'], 1)
+
+    def test_overtaken_counted_separately_from_overtakes(self):
+        """driver_number_overtaken events populate overtaken_sX independently."""
+        client = _mock_client()
+        lap = self._lap(driver_number=44)
+        overtakes = [self._overtake_row(overtaking=1, overtaken=44,
+                                        date='2024-03-02T13:00:20Z')]
+        ingest_battle_states(client, 9000, [lap], [], overtakes)
+        row = self._upserted(client)[0]
+        self.assertEqual(row['overtaken_s1'], 1)
+        self.assertEqual(row['overtakes_s1'], 0)
+
+    def test_lap_overtaken_is_sum_of_sectors(self):
+        """lap_overtaken = sum of overtaken_s1/s2/s3."""
+        client = _mock_client()
+        lap = self._lap(driver_number=44)
+        overtakes = [
+            self._overtake_row(overtaking=1,  overtaken=44, date='2024-03-02T13:00:10Z'),
+            self._overtake_row(overtaking=33, overtaken=44, date='2024-03-02T13:01:10Z'),
+        ]
+        ingest_battle_states(client, 9000, [lap], [], overtakes)
+        row = self._upserted(client)[0]
+        self.assertEqual(row['lap_overtaken'], 2)
+
+    def test_overtakes_none_when_lap_times_missing(self):
+        """Missing lap_duration → all overtake counts None."""
+        client = _mock_client()
+        lap = self._lap(lap_duration=None, duration_sector_1=None)
+        overtakes = [self._overtake_row(overtaking=44, overtaken=1,
+                                        date='2024-03-02T13:00:10Z')]
+        ingest_battle_states(client, 9000, [lap], [], overtakes)
+        row = self._upserted(client)[0]
+        self.assertIsNone(row['overtakes_s1'])
+        self.assertIsNone(row['lap_overtakes'])
+        self.assertIsNone(row['lap_overtaken'])
+
+    # ----- i1_speed / i2_speed / sector_context ------------------------------
+
+    def test_i1_i2_speed_copied_from_laps(self):
+        """i1_speed and i2_speed pass through from the laps dict."""
+        client = _mock_client()
+        lap = self._lap(i1_speed=215, i2_speed=295)
+        ingest_battle_states(client, 9000, [lap], [], [])
+        row = self._upserted(client)[0]
+        self.assertEqual(row['i1_speed'], 215)
+        self.assertEqual(row['i2_speed'], 295)
+
+    def test_i1_i2_none_when_missing_in_lap(self):
+        """None i1/i2 values pass through as None."""
+        client = _mock_client()
+        lap = self._lap(i1_speed=None, i2_speed=None)
+        ingest_battle_states(client, 9000, [lap], [], [])
+        row = self._upserted(client)[0]
+        self.assertIsNone(row['i1_speed'])
+        self.assertIsNone(row['i2_speed'])
+
+    def test_sector_context_copied_from_laps(self):
+        """segments_sector_1/2/3 pass through as sector_context_s1/s2/s3."""
+        client = _mock_client()
+        lap = self._lap(segments_sector_1=[2048, 2049, 2051],
+                        segments_sector_2=[2049, 2049],
+                        segments_sector_3=[2051, 2051, 2048])
+        ingest_battle_states(client, 9000, [lap], [], [])
+        row = self._upserted(client)[0]
+        self.assertEqual(row['sector_context_s1'], [2048, 2049, 2051])
+        self.assertEqual(row['sector_context_s2'], [2049, 2049])
+        self.assertEqual(row['sector_context_s3'], [2051, 2051, 2048])
+
+    # ----- row structure / filtering -----------------------------------------
+
+    def test_row_contains_required_keys(self):
+        """Every upserted row has session_key, driver_number, lap_number."""
+        client = _mock_client()
+        lap = self._lap()
+        ingest_battle_states(client, 9000, [lap], [], [])
+        row = self._upserted(client)[0]
+        for key in ('session_key', 'driver_number', 'lap_number'):
+            self.assertIn(key, row)
+        self.assertEqual(row['session_key'], 9000)
+        self.assertEqual(row['driver_number'], 44)
+        self.assertEqual(row['lap_number'], 5)
+
+    def test_missing_driver_number_filtered(self):
+        """Lap with driver_number=None produces no upsert row."""
+        client = _mock_client()
+        lap = self._lap(driver_number=None)
+        ingest_battle_states(client, 9000, [lap], [], [])
+        client.table.assert_not_called()
+
+    def test_empty_laps_no_upsert(self):
+        """Empty laps list → no upsert called."""
+        client = _mock_client()
+        ingest_battle_states(client, 9000, [], [], [])
+        client.table.assert_not_called()
+
+    def test_one_row_per_lap(self):
+        """Two laps for the same driver produce two rows."""
+        client = _mock_client()
+        laps = [
+            self._lap(driver_number=44, lap_number=1),
+            self._lap(driver_number=44, lap_number=2),
+        ]
+        ingest_battle_states(client, 9000, laps, [], [])
+        rows = self._upserted(client)
+        self.assertEqual(len(rows), 2)
+
+    # ----- _parse_intervals_index helper -------------------------------------
+
+    def test_parse_intervals_index_sorts_by_timestamp(self):
+        """Index entries are sorted by timestamp ascending."""
+        rows = [
+            {'driver_number': 44, 'date': '2024-03-02T13:00:05Z', 'interval': 2.0, 'gap_to_leader': 5.0},
+            {'driver_number': 44, 'date': '2024-03-02T13:00:01Z', 'interval': 2.1, 'gap_to_leader': 5.1},
+        ]
+        idx = _parse_intervals_index(rows)
+        timestamps = [e[0] for e in idx[44]]
+        self.assertEqual(timestamps, sorted(timestamps))
+
+    def test_parse_intervals_index_skips_missing_driver(self):
+        """Rows without driver_number are skipped."""
+        rows = [{'driver_number': None, 'date': '2024-03-02T13:00:01Z',
+                 'interval': 1.0, 'gap_to_leader': 2.0}]
+        idx = _parse_intervals_index(rows)
+        self.assertEqual(idx, {})
+
+    def test_parse_intervals_index_skips_missing_date(self):
+        """Rows without date are skipped."""
+        rows = [{'driver_number': 44, 'date': None, 'interval': 1.0, 'gap_to_leader': 2.0}]
+        idx = _parse_intervals_index(rows)
+        self.assertEqual(idx, {})
 
 
 if __name__ == "__main__":
