@@ -10,6 +10,7 @@ import ingest
 from ingest import (
     _assign_qualifying_phases,
     _brake_zone_stats,
+    _build_neutralized_periods,
     _compute_lap_metrics,
     _compute_qualifying_best_per_phase,
     _find_brake_zones,
@@ -20,6 +21,7 @@ from ingest import (
     _pick,
     _upsert,
     ingest_battle_states,
+    ingest_stint_metrics,
     ingest_championship_drivers,
     ingest_championship_teams,
     ingest_drivers,
@@ -2815,8 +2817,8 @@ class TestIngestLapFlags(unittest.TestCase):
             'lap_duration':  lap_duration,
         }
 
-    def _rc(self, date, category='SafetyCar', flag=None):
-        return {'date': date, 'category': category, 'flag': flag}
+    def _rc(self, date, category='SafetyCar', flag=None, message=None):
+        return {'date': date, 'category': category, 'flag': flag, 'message': message}
 
     def _stint(self, driver_number=44, lap_start=1, lap_end=20,
                tyre_age_at_start=0):
@@ -2834,26 +2836,36 @@ class TestIngestLapFlags(unittest.TestCase):
     # is_neutralized
     # ------------------------------------------------------------------
 
-    def test_sc_event_mid_lap_is_neutralized_true(self):
-        """SC event at t+30s inside a 90s lap → is_neutralized True."""
+    def test_sc_period_overlapping_lap_is_neutralized_true(self):
+        """SC DEPLOYED within lap, IN THIS LAP after lap end → lap is neutralized."""
         client = _mock_client()
+        # lap: 13:00:00 → 13:01:30; SC deployed at 13:00:30, ends 13:02:00
         ingest_lap_flags(
             client, 9000,
             laps=[self._lap()],
             stints_rows=[],
-            rc_rows=[self._rc('2024-03-02T13:00:30Z', category='SafetyCar')],
+            rc_rows=[
+                self._rc('2024-03-02T13:00:30Z', category='SafetyCar',
+                         message='SAFETY CAR DEPLOYED'),
+                self._rc('2024-03-02T13:02:00Z', category='SafetyCar',
+                         message='SAFETY CAR IN THIS LAP'),
+            ],
         )
-        row = self._upserted(client)[0]
-        self.assertTrue(row['is_neutralized'])
+        self.assertTrue(self._upserted(client)[0]['is_neutralized'])
 
-    def test_vsc_event_mid_lap_is_neutralized_true(self):
-        """Virtual SC shares category='SafetyCar' — same detection path."""
+    def test_vsc_period_overlapping_lap_is_neutralized_true(self):
+        """VSC DEPLOYED within lap, ENDING after lap end → lap is neutralized."""
         client = _mock_client()
         ingest_lap_flags(
             client, 9000,
             laps=[self._lap()],
             stints_rows=[],
-            rc_rows=[self._rc('2024-03-02T13:00:45Z', category='SafetyCar')],
+            rc_rows=[
+                self._rc('2024-03-02T13:00:45Z', category='SafetyCar',
+                         message='VIRTUAL SAFETY CAR DEPLOYED'),
+                self._rc('2024-03-02T13:02:00Z', category='SafetyCar',
+                         message='VIRTUAL SAFETY CAR ENDING'),
+            ],
         )
         self.assertTrue(self._upserted(client)[0]['is_neutralized'])
 
@@ -2868,26 +2880,37 @@ class TestIngestLapFlags(unittest.TestCase):
         )
         self.assertTrue(self._upserted(client)[0]['is_neutralized'])
 
-    def test_sc_event_before_lap_not_neutralized(self):
-        """SC event 1s before lap start → not neutralized."""
+    def test_sc_period_ends_before_lap_not_neutralized(self):
+        """SC period entirely before lap (IN THIS LAP at 12:59:59) → not neutralized."""
         client = _mock_client()
+        # lap: 13:00:00 → 13:01:30; SC period: 12:58:00 → 12:59:59
         ingest_lap_flags(
             client, 9000,
             laps=[self._lap()],
             stints_rows=[],
-            rc_rows=[self._rc('2024-03-02T12:59:59Z', category='SafetyCar')],
+            rc_rows=[
+                self._rc('2024-03-02T12:58:00Z', category='SafetyCar',
+                         message='SAFETY CAR DEPLOYED'),
+                self._rc('2024-03-02T12:59:59Z', category='SafetyCar',
+                         message='SAFETY CAR IN THIS LAP'),
+            ],
         )
         self.assertFalse(self._upserted(client)[0]['is_neutralized'])
 
-    def test_sc_event_after_lap_not_neutralized(self):
-        """SC event 1s after lap end → not neutralized."""
+    def test_sc_period_starts_after_lap_not_neutralized(self):
+        """SC period entirely after lap (DEPLOYED at 13:01:31) → not neutralized."""
         client = _mock_client()
-        # lap ends at 13:01:30Z; event at 13:01:31Z
+        # lap ends at 13:01:30Z; SC starts 13:01:31Z
         ingest_lap_flags(
             client, 9000,
             laps=[self._lap()],
             stints_rows=[],
-            rc_rows=[self._rc('2024-03-02T13:01:31Z', category='SafetyCar')],
+            rc_rows=[
+                self._rc('2024-03-02T13:01:31Z', category='SafetyCar',
+                         message='SAFETY CAR DEPLOYED'),
+                self._rc('2024-03-02T13:03:00Z', category='SafetyCar',
+                         message='SAFETY CAR IN THIS LAP'),
+            ],
         )
         self.assertFalse(self._upserted(client)[0]['is_neutralized'])
 
@@ -2936,26 +2959,37 @@ class TestIngestLapFlags(unittest.TestCase):
         )
         self.assertIsNone(self._upserted(client)[0]['is_neutralized'])
 
-    def test_sc_event_exactly_at_lap_start_is_neutralized_true(self):
-        """Boundary: event at exact lap start timestamp → neutralized."""
+    def test_sc_period_starting_at_lap_start_is_neutralized_true(self):
+        """Boundary: SC DEPLOYED exactly at lap start timestamp → neutralized."""
         client = _mock_client()
+        # lap: 13:00:00 → 13:01:30; SC period starts at lap start
         ingest_lap_flags(
             client, 9000,
             laps=[self._lap()],
             stints_rows=[],
-            rc_rows=[self._rc('2024-03-02T13:00:00Z', category='SafetyCar')],
+            rc_rows=[
+                self._rc('2024-03-02T13:00:00Z', category='SafetyCar',
+                         message='SAFETY CAR DEPLOYED'),
+                self._rc('2024-03-02T13:02:00Z', category='SafetyCar',
+                         message='SAFETY CAR IN THIS LAP'),
+            ],
         )
         self.assertTrue(self._upserted(client)[0]['is_neutralized'])
 
-    def test_sc_event_exactly_at_lap_end_is_neutralized_true(self):
-        """Boundary: event at exact lap end timestamp → neutralized."""
+    def test_sc_period_ending_at_lap_end_is_neutralized_true(self):
+        """Boundary: SC IN THIS LAP exactly at lap end timestamp → neutralized."""
         client = _mock_client()
-        # lap ends at 13:01:30Z
+        # lap ends at 13:01:30Z; SC period ends at that exact moment
         ingest_lap_flags(
             client, 9000,
             laps=[self._lap()],
             stints_rows=[],
-            rc_rows=[self._rc('2024-03-02T13:01:30Z', category='SafetyCar')],
+            rc_rows=[
+                self._rc('2024-03-02T12:59:00Z', category='SafetyCar',
+                         message='SAFETY CAR DEPLOYED'),
+                self._rc('2024-03-02T13:01:30Z', category='SafetyCar',
+                         message='SAFETY CAR IN THIS LAP'),
+            ],
         )
         self.assertTrue(self._upserted(client)[0]['is_neutralized'])
 
@@ -3081,6 +3115,195 @@ class TestIngestLapFlags(unittest.TestCase):
         ]
         ingest_lap_flags(client, 9000, laps=laps, stints_rows=[], rc_rows=[])
         self.assertEqual(len(self._upserted(client)), 3)
+
+    # ------------------------------------------------------------------
+    # period-based neutralization (sprint SC fix)
+    # ------------------------------------------------------------------
+
+    def test_lap_entirely_within_sc_period_is_neutralized(self):
+        """Core fix: lap entirely within SC period (no event inside the lap) → True.
+
+        Reproduces the sprint scenario where SC is deployed before a pit-stop
+        and laps run under the SC have no new RC event within their own window.
+        """
+        client = _mock_client()
+        # SC deployed at 12:58:00, IN THIS LAP at 13:02:00.
+        # Lap runs 13:00:00 → 13:01:30 — entirely within the SC period.
+        ingest_lap_flags(
+            client, 9000,
+            laps=[self._lap()],
+            stints_rows=[],
+            rc_rows=[
+                self._rc('2024-03-02T12:58:00Z', category='SafetyCar',
+                         message='SAFETY CAR DEPLOYED'),
+                self._rc('2024-03-02T13:02:00Z', category='SafetyCar',
+                         message='SAFETY CAR IN THIS LAP'),
+            ],
+        )
+        self.assertTrue(self._upserted(client)[0]['is_neutralized'])
+
+    def test_restart_lap_after_sc_in_this_lap_not_neutralized(self):
+        """Lap starting after SC IN THIS LAP timestamp → not neutralized (racing lap)."""
+        client = _mock_client()
+        # SC period: 12:58:00 → 12:59:30.  Lap starts at 13:00:00 (after end).
+        ingest_lap_flags(
+            client, 9000,
+            laps=[self._lap()],
+            stints_rows=[],
+            rc_rows=[
+                self._rc('2024-03-02T12:58:00Z', category='SafetyCar',
+                         message='SAFETY CAR DEPLOYED'),
+                self._rc('2024-03-02T12:59:30Z', category='SafetyCar',
+                         message='SAFETY CAR IN THIS LAP'),
+            ],
+        )
+        self.assertFalse(self._upserted(client)[0]['is_neutralized'])
+
+    def test_multiple_sc_periods_any_overlap_neutralizes(self):
+        """Two SC periods — lap overlapping the second is neutralized."""
+        client = _mock_client()
+        # First SC: 12:50 → 12:55 (before lap).  Second SC: 13:00:30 → 13:02:00 (overlaps lap).
+        ingest_lap_flags(
+            client, 9000,
+            laps=[self._lap()],
+            stints_rows=[],
+            rc_rows=[
+                self._rc('2024-03-02T12:50:00Z', category='SafetyCar',
+                         message='SAFETY CAR DEPLOYED'),
+                self._rc('2024-03-02T12:55:00Z', category='SafetyCar',
+                         message='SAFETY CAR IN THIS LAP'),
+                self._rc('2024-03-02T13:00:30Z', category='SafetyCar',
+                         message='SAFETY CAR DEPLOYED'),
+                self._rc('2024-03-02T13:02:00Z', category='SafetyCar',
+                         message='SAFETY CAR IN THIS LAP'),
+            ],
+        )
+        self.assertTrue(self._upserted(client)[0]['is_neutralized'])
+
+    def test_vsc_lap_entirely_within_period_is_neutralized(self):
+        """Lap entirely within a VSC period → neutralized."""
+        client = _mock_client()
+        ingest_lap_flags(
+            client, 9000,
+            laps=[self._lap()],
+            stints_rows=[],
+            rc_rows=[
+                self._rc('2024-03-02T12:58:00Z', category='SafetyCar',
+                         message='VIRTUAL SAFETY CAR DEPLOYED'),
+                self._rc('2024-03-02T13:02:00Z', category='SafetyCar',
+                         message='VIRTUAL SAFETY CAR ENDING'),
+            ],
+        )
+        self.assertTrue(self._upserted(client)[0]['is_neutralized'])
+
+    def test_sc_without_end_message_not_neutralized(self):
+        """SC DEPLOYED with no matching IN THIS LAP → no period formed → not neutralized."""
+        client = _mock_client()
+        ingest_lap_flags(
+            client, 9000,
+            laps=[self._lap()],
+            stints_rows=[],
+            rc_rows=[
+                self._rc('2024-03-02T12:58:00Z', category='SafetyCar',
+                         message='SAFETY CAR DEPLOYED'),
+            ],
+        )
+        self.assertFalse(self._upserted(client)[0]['is_neutralized'])
+
+
+# ===========================================================================
+# _build_neutralized_periods
+# ===========================================================================
+
+class TestBuildNeutralizedPeriods(unittest.TestCase):
+    """Tests for the SC/VSC period parsing helper."""
+
+    def _rc(self, date, category='SafetyCar', flag=None, message=None):
+        return {'date': date, 'category': category, 'flag': flag, 'message': message}
+
+    def _parse(self, rc_rows):
+        import pandas as pd
+        return _build_neutralized_periods(rc_rows, pd)
+
+    def test_sc_period_parsed(self):
+        """DEPLOYED + IN THIS LAP → one (start, end) tuple."""
+        periods = self._parse([
+            self._rc('2024-03-02T13:00:00Z', message='SAFETY CAR DEPLOYED'),
+            self._rc('2024-03-02T13:05:00Z', message='SAFETY CAR IN THIS LAP'),
+        ])
+        self.assertEqual(len(periods), 1)
+        self.assertLess(periods[0][0], periods[0][1])
+
+    def test_vsc_period_parsed(self):
+        """VSC DEPLOYED + ENDING → one (start, end) tuple."""
+        periods = self._parse([
+            self._rc('2024-03-02T13:00:00Z', message='VIRTUAL SAFETY CAR DEPLOYED'),
+            self._rc('2024-03-02T13:03:00Z', message='VIRTUAL SAFETY CAR ENDING'),
+        ])
+        self.assertEqual(len(periods), 1)
+        self.assertLess(periods[0][0], periods[0][1])
+
+    def test_red_flag_as_zero_width_period(self):
+        """flag='RED' → (ts, ts) zero-width interval."""
+        periods = self._parse([
+            self._rc('2024-03-02T13:00:00Z', category='Flag', flag='RED'),
+        ])
+        self.assertEqual(len(periods), 1)
+        self.assertEqual(periods[0][0], periods[0][1])
+
+    def test_sc_without_end_not_included(self):
+        """DEPLOYED with no matching IN THIS LAP → period silently skipped."""
+        periods = self._parse([
+            self._rc('2024-03-02T13:00:00Z', message='SAFETY CAR DEPLOYED'),
+        ])
+        self.assertEqual(periods, [])
+
+    def test_vsc_without_end_not_included(self):
+        """VSC DEPLOYED with no matching ENDING → silently skipped."""
+        periods = self._parse([
+            self._rc('2024-03-02T13:00:00Z', message='VIRTUAL SAFETY CAR DEPLOYED'),
+        ])
+        self.assertEqual(periods, [])
+
+    def test_multiple_sc_periods(self):
+        """Two SC deployments produce two separate periods."""
+        periods = self._parse([
+            self._rc('2024-03-02T12:50:00Z', message='SAFETY CAR DEPLOYED'),
+            self._rc('2024-03-02T12:55:00Z', message='SAFETY CAR IN THIS LAP'),
+            self._rc('2024-03-02T13:10:00Z', message='SAFETY CAR DEPLOYED'),
+            self._rc('2024-03-02T13:15:00Z', message='SAFETY CAR IN THIS LAP'),
+        ])
+        self.assertEqual(len(periods), 2)
+
+    def test_vsc_not_matched_as_sc(self):
+        """VIRTUAL SAFETY CAR DEPLOYED does not match the SC DEPLOYED branch."""
+        periods = self._parse([
+            self._rc('2024-03-02T13:00:00Z', message='VIRTUAL SAFETY CAR DEPLOYED'),
+            self._rc('2024-03-02T13:03:00Z', message='SAFETY CAR IN THIS LAP'),
+        ])
+        # 'IN THIS LAP' should not pair with a VSC DEPLOYED
+        self.assertEqual(periods, [])
+
+    def test_unsorted_rows_sorted_by_timestamp(self):
+        """Events out of order are sorted before pairing."""
+        periods = self._parse([
+            self._rc('2024-03-02T13:05:00Z', message='SAFETY CAR IN THIS LAP'),
+            self._rc('2024-03-02T13:00:00Z', message='SAFETY CAR DEPLOYED'),
+        ])
+        self.assertEqual(len(periods), 1)
+        self.assertLess(periods[0][0], periods[0][1])
+
+    def test_empty_rows_returns_empty(self):
+        self.assertEqual(self._parse([]), [])
+
+    def test_non_neutralising_events_ignored(self):
+        """DRS, green flag, yellow flag events produce no periods."""
+        periods = self._parse([
+            self._rc('2024-03-02T13:00:00Z', category='Drs', flag='ENABLED'),
+            self._rc('2024-03-02T13:00:10Z', category='Flag', flag='GREEN'),
+            self._rc('2024-03-02T13:00:20Z', category='Flag', flag='YELLOW'),
+        ])
+        self.assertEqual(periods, [])
 
 
 # ===========================================================================
@@ -3725,6 +3948,324 @@ class TestIngestBattleStates(unittest.TestCase):
         rows = [{'driver_number': 44, 'date': None, 'interval': 1.0, 'gap_to_leader': 2.0}]
         idx = _parse_intervals_index(rows)
         self.assertEqual(idx, {})
+
+
+class TestIngestStintMetrics(unittest.TestCase):
+    """Tests for ingest_stint_metrics — per-stint pace aggregation."""
+
+    # ----- fixture builders --------------------------------------------------
+
+    def _lap(self, driver_number=44, lap_number=1, lap_duration=90.0,
+             is_pit_out_lap=False, pit_in_time=None):
+        return {
+            'driver_number':  driver_number,
+            'lap_number':     lap_number,
+            'lap_duration':   lap_duration,
+            'is_pit_out_lap': is_pit_out_lap,
+            'pit_in_time':    pit_in_time,
+        }
+
+    def _stint(self, driver_number=44, stint_number=1, lap_start=1, lap_end=10):
+        return {
+            'driver_number': driver_number,
+            'stint_number':  stint_number,
+            'lap_start':     lap_start,
+            'lap_end':       lap_end,
+        }
+
+    def _lm(self, driver_number=44, lap_number=1,
+            is_estimated_clean_air=True, is_neutralized=False):
+        return {
+            'driver_number':          driver_number,
+            'lap_number':             lap_number,
+            'is_estimated_clean_air': is_estimated_clean_air,
+            'is_neutralized':         is_neutralized,
+        }
+
+    def _make_client(self, lap_metrics_data=None):
+        """Return (client, stint_metrics_table_mock).
+
+        client.table('lap_metrics') → read mock with configured .data
+        client.table('stint_metrics') (or any other name) → write mock
+        """
+        read_mock = MagicMock()
+        read_mock.select.return_value.eq.return_value.execute.return_value.data = \
+            lap_metrics_data or []
+        write_mock = MagicMock()
+        client = MagicMock()
+        client.table.side_effect = lambda name: read_mock if name == 'lap_metrics' else write_mock
+        return client, write_mock
+
+    def _upserted(self, write_mock):
+        return write_mock.upsert.call_args.args[0]
+
+    # ----- core pace computations --------------------------------------------
+
+    def test_representative_pace_is_median(self):
+        """representative_pace_s is the median of racing lap durations."""
+        laps = [self._lap(lap_number=n, lap_duration=float(90 + n)) for n in range(1, 4)]
+        stints = [self._stint(lap_start=1, lap_end=3)]
+        lm = [self._lm(lap_number=n, is_estimated_clean_air=True) for n in range(1, 4)]
+        client, write_mock = self._make_client(lm)
+        ingest_stint_metrics(client, 1, laps, stints)
+        row = self._upserted(write_mock)[0]
+        # durations: 91, 92, 93 → median = 92.0
+        self.assertAlmostEqual(row['representative_pace_s'], 92.0)
+
+    def test_clean_air_pace_mean_of_clean_laps(self):
+        """clean_air_pace_s averages only laps with is_estimated_clean_air=True."""
+        laps = [self._lap(lap_number=1, lap_duration=90.0),
+                self._lap(lap_number=2, lap_duration=92.0),
+                self._lap(lap_number=3, lap_duration=94.0)]
+        stints = [self._stint(lap_start=1, lap_end=3)]
+        lm = [
+            self._lm(lap_number=1, is_estimated_clean_air=True),
+            self._lm(lap_number=2, is_estimated_clean_air=False),
+            self._lm(lap_number=3, is_estimated_clean_air=True),
+        ]
+        client, write_mock = self._make_client(lm)
+        ingest_stint_metrics(client, 1, laps, stints)
+        row = self._upserted(write_mock)[0]
+        self.assertAlmostEqual(row['clean_air_pace_s'], 92.0)   # (90+94)/2
+        self.assertAlmostEqual(row['dirty_air_pace_s'], 92.0)   # just lap 2
+
+    def test_clean_air_pace_none_when_no_clean_laps(self):
+        """clean_air_pace_s is None when no racing lap has is_estimated_clean_air=True."""
+        laps = [self._lap(lap_number=1, lap_duration=90.0)]
+        stints = [self._stint(lap_start=1, lap_end=1)]
+        lm = [self._lm(lap_number=1, is_estimated_clean_air=False)]
+        client, write_mock = self._make_client(lm)
+        ingest_stint_metrics(client, 1, laps, stints)
+        row = self._upserted(write_mock)[0]
+        self.assertIsNone(row['clean_air_pace_s'])
+
+    def test_dirty_air_pace_none_when_no_dirty_laps(self):
+        """dirty_air_pace_s is None when no racing lap has is_estimated_clean_air=False."""
+        laps = [self._lap(lap_number=1, lap_duration=90.0)]
+        stints = [self._stint(lap_start=1, lap_end=1)]
+        lm = [self._lm(lap_number=1, is_estimated_clean_air=True)]
+        client, write_mock = self._make_client(lm)
+        ingest_stint_metrics(client, 1, laps, stints)
+        row = self._upserted(write_mock)[0]
+        self.assertIsNone(row['dirty_air_pace_s'])
+
+    def test_clean_air_none_counts_toward_racing_laps(self):
+        """A lap with is_estimated_clean_air=None still counts toward representative_pace."""
+        laps = [self._lap(lap_number=1, lap_duration=91.0),
+                self._lap(lap_number=2, lap_duration=92.0)]
+        stints = [self._stint(lap_start=1, lap_end=2)]
+        lm = [
+            self._lm(lap_number=1, is_estimated_clean_air=None),
+            self._lm(lap_number=2, is_estimated_clean_air=None),
+        ]
+        client, write_mock = self._make_client(lm)
+        ingest_stint_metrics(client, 1, laps, stints)
+        row = self._upserted(write_mock)[0]
+        self.assertEqual(row['racing_lap_count'], 2)
+        self.assertIsNotNone(row['representative_pace_s'])
+        self.assertIsNone(row['clean_air_pace_s'])
+        self.assertIsNone(row['dirty_air_pace_s'])
+
+    # ----- racing lap exclusions ---------------------------------------------
+
+    def test_neutralized_lap_excluded(self):
+        """Laps with is_neutralized=True are not racing laps."""
+        laps = [self._lap(lap_number=1, lap_duration=90.0),
+                self._lap(lap_number=2, lap_duration=120.0)]  # SC lap
+        stints = [self._stint(lap_start=1, lap_end=2)]
+        lm = [
+            self._lm(lap_number=1, is_neutralized=False),
+            self._lm(lap_number=2, is_neutralized=True),
+        ]
+        client, write_mock = self._make_client(lm)
+        ingest_stint_metrics(client, 1, laps, stints)
+        row = self._upserted(write_mock)[0]
+        self.assertEqual(row['racing_lap_count'], 1)
+        self.assertAlmostEqual(row['representative_pace_s'], 90.0)
+
+    def test_neutralized_none_treated_as_not_neutralized(self):
+        """is_neutralized=None is treated as not neutralized — lap is included."""
+        laps = [self._lap(lap_number=1, lap_duration=90.0)]
+        stints = [self._stint(lap_start=1, lap_end=1)]
+        lm = [self._lm(lap_number=1, is_neutralized=None)]
+        client, write_mock = self._make_client(lm)
+        ingest_stint_metrics(client, 1, laps, stints)
+        row = self._upserted(write_mock)[0]
+        self.assertEqual(row['racing_lap_count'], 1)
+
+    def test_pit_in_lap_excluded(self):
+        """Laps with pit_in_time set are excluded from racing laps."""
+        laps = [self._lap(lap_number=1, lap_duration=90.0),
+                self._lap(lap_number=2, lap_duration=110.0, pit_in_time=25.3)]
+        stints = [self._stint(lap_start=1, lap_end=2)]
+        lm = [self._lm(lap_number=n) for n in range(1, 3)]
+        client, write_mock = self._make_client(lm)
+        ingest_stint_metrics(client, 1, laps, stints)
+        row = self._upserted(write_mock)[0]
+        self.assertEqual(row['racing_lap_count'], 1)
+
+    def test_pit_out_lap_excluded(self):
+        """Laps with is_pit_out_lap=True are excluded from racing laps."""
+        laps = [self._lap(lap_number=1, lap_duration=105.0, is_pit_out_lap=True),
+                self._lap(lap_number=2, lap_duration=90.0)]
+        stints = [self._stint(lap_start=1, lap_end=2)]
+        lm = [self._lm(lap_number=n) for n in range(1, 3)]
+        client, write_mock = self._make_client(lm)
+        ingest_stint_metrics(client, 1, laps, stints)
+        row = self._upserted(write_mock)[0]
+        self.assertEqual(row['racing_lap_count'], 1)
+        self.assertAlmostEqual(row['representative_pace_s'], 90.0)
+
+    def test_missing_lap_duration_excluded(self):
+        """A lap with no lap_duration in laps list is excluded from racing laps."""
+        laps = [self._lap(lap_number=1, lap_duration=None),
+                self._lap(lap_number=2, lap_duration=90.0)]
+        stints = [self._stint(lap_start=1, lap_end=2)]
+        lm = [self._lm(lap_number=n) for n in range(1, 3)]
+        client, write_mock = self._make_client(lm)
+        ingest_stint_metrics(client, 1, laps, stints)
+        row = self._upserted(write_mock)[0]
+        self.assertEqual(row['racing_lap_count'], 1)
+
+    # ----- first/second half split -------------------------------------------
+
+    def test_first_second_half_ceiling_split_odd(self):
+        """For 3 racing laps, ceil(3/2)=2: first=[lap1,lap2], second=[lap3]."""
+        laps = [self._lap(lap_number=n, lap_duration=float(90 + n)) for n in range(1, 4)]
+        stints = [self._stint(lap_start=1, lap_end=3)]
+        lm = [self._lm(lap_number=n) for n in range(1, 4)]
+        client, write_mock = self._make_client(lm)
+        ingest_stint_metrics(client, 1, laps, stints)
+        row = self._upserted(write_mock)[0]
+        # durations in lap order: 91, 92, 93
+        # first half (laps 1,2): mean = 91.5; second half (lap 3): mean = 93.0
+        self.assertAlmostEqual(row['first_half_pace_s'], 91.5)
+        self.assertAlmostEqual(row['second_half_pace_s'], 93.0)
+
+    def test_first_second_half_even_split(self):
+        """For 4 racing laps, split=2: first=[1,2], second=[3,4]."""
+        laps = [self._lap(lap_number=n, lap_duration=float(90 + n)) for n in range(1, 5)]
+        stints = [self._stint(lap_start=1, lap_end=4)]
+        lm = [self._lm(lap_number=n) for n in range(1, 5)]
+        client, write_mock = self._make_client(lm)
+        ingest_stint_metrics(client, 1, laps, stints)
+        row = self._upserted(write_mock)[0]
+        self.assertAlmostEqual(row['first_half_pace_s'], 91.5)   # (91+92)/2
+        self.assertAlmostEqual(row['second_half_pace_s'], 93.5)  # (93+94)/2
+
+    def test_first_half_none_for_single_racing_lap(self):
+        """For 1 racing lap: ceil(1/2)=1, so first_half gets the lap, second_half=None."""
+        laps = [self._lap(lap_number=1, lap_duration=90.0)]
+        stints = [self._stint(lap_start=1, lap_end=1)]
+        lm = [self._lm(lap_number=1)]
+        client, write_mock = self._make_client(lm)
+        ingest_stint_metrics(client, 1, laps, stints)
+        row = self._upserted(write_mock)[0]
+        self.assertAlmostEqual(row['first_half_pace_s'], 90.0)
+        self.assertIsNone(row['second_half_pace_s'])
+
+    def test_all_pace_none_for_zero_racing_laps(self):
+        """When all laps are pit/neutralized, all pace fields are None."""
+        laps = [self._lap(lap_number=1, lap_duration=90.0, pit_in_time=25.0)]
+        stints = [self._stint(lap_start=1, lap_end=1)]
+        lm = [self._lm(lap_number=1)]
+        client, write_mock = self._make_client(lm)
+        ingest_stint_metrics(client, 1, laps, stints)
+        row = self._upserted(write_mock)[0]
+        self.assertEqual(row['racing_lap_count'], 0)
+        self.assertIsNone(row['representative_pace_s'])
+        self.assertIsNone(row['first_half_pace_s'])
+        self.assertIsNone(row['second_half_pace_s'])
+
+    # ----- stint grouping and structure --------------------------------------
+
+    def test_multi_stint_produces_separate_rows(self):
+        """Two stints produce two separate rows in stint_metrics."""
+        laps = [self._lap(lap_number=n, lap_duration=90.0) for n in range(1, 6)]
+        # pit-in on lap 3, pit-out on lap 4
+        laps[2] = self._lap(lap_number=3, lap_duration=110.0, pit_in_time=20.0)
+        laps[3] = self._lap(lap_number=4, lap_duration=105.0, is_pit_out_lap=True)
+        stints = [
+            self._stint(stint_number=1, lap_start=1, lap_end=3),
+            self._stint(stint_number=2, lap_start=4, lap_end=5),
+        ]
+        lm = [self._lm(lap_number=n) for n in range(1, 6)]
+        client, write_mock = self._make_client(lm)
+        ingest_stint_metrics(client, 1, laps, stints)
+        rows = self._upserted(write_mock)
+        stint_numbers = {r['stint_number'] for r in rows}
+        self.assertEqual(stint_numbers, {1, 2})
+
+    def test_final_stint_lap_end_none_covers_remaining_laps(self):
+        """A stint with lap_end=None covers all laps from lap_start onward."""
+        laps = [self._lap(lap_number=n, lap_duration=90.0) for n in range(5, 9)]
+        stints = [self._stint(stint_number=2, lap_start=5, lap_end=None)]
+        lm = [self._lm(lap_number=n) for n in range(5, 9)]
+        client, write_mock = self._make_client(lm)
+        ingest_stint_metrics(client, 1, laps, stints)
+        row = self._upserted(write_mock)[0]
+        self.assertEqual(row['racing_lap_count'], 4)
+        self.assertEqual(row['stint_number'], 2)
+
+    def test_lap_outside_stint_range_excluded(self):
+        """Laps not covered by any stint range are not grouped and not upserted."""
+        laps = [self._lap(lap_number=1, lap_duration=90.0),
+                self._lap(lap_number=5, lap_duration=90.0)]  # lap 5 not in stint
+        stints = [self._stint(lap_start=1, lap_end=1)]
+        lm = [self._lm(lap_number=1), self._lm(lap_number=5)]
+        client, write_mock = self._make_client(lm)
+        ingest_stint_metrics(client, 1, laps, stints)
+        rows = self._upserted(write_mock)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]['racing_lap_count'], 1)
+
+    # ----- row structure and guard clauses -----------------------------------
+
+    def test_row_has_required_keys(self):
+        """Each upserted row contains session_key, driver_number, stint_number."""
+        laps = [self._lap(lap_number=1, lap_duration=90.0)]
+        stints = [self._stint(lap_start=1, lap_end=1)]
+        lm = [self._lm(lap_number=1)]
+        client, write_mock = self._make_client(lm)
+        ingest_stint_metrics(client, 1, laps, stints)
+        row = self._upserted(write_mock)[0]
+        self.assertEqual(row['session_key'], 1)
+        self.assertEqual(row['driver_number'], 44)
+        self.assertEqual(row['stint_number'], 1)
+
+    def test_empty_stints_no_upsert(self):
+        """Empty stints_rows triggers early return — no upsert called."""
+        laps = [self._lap(lap_number=1, lap_duration=90.0)]
+        client, write_mock = self._make_client()
+        ingest_stint_metrics(client, 1, laps, [])
+        write_mock.upsert.assert_not_called()
+
+    def test_empty_laps_no_upsert(self):
+        """Empty laps triggers early return — no upsert called."""
+        stints = [self._stint(lap_start=1, lap_end=5)]
+        client, write_mock = self._make_client()
+        ingest_stint_metrics(client, 1, [], stints)
+        write_mock.upsert.assert_not_called()
+
+    def test_multi_driver_produces_separate_rows(self):
+        """Drivers with laps in the same stint range each get their own row."""
+        laps = [
+            self._lap(driver_number=44, lap_number=1, lap_duration=90.0),
+            self._lap(driver_number=1,  lap_number=1, lap_duration=91.0),
+        ]
+        stints = [
+            self._stint(driver_number=44, lap_start=1, lap_end=1),
+            self._stint(driver_number=1,  lap_start=1, lap_end=1),
+        ]
+        lm = [
+            self._lm(driver_number=44, lap_number=1),
+            self._lm(driver_number=1,  lap_number=1),
+        ]
+        client, write_mock = self._make_client(lm)
+        ingest_stint_metrics(client, 1, laps, stints)
+        rows = self._upserted(write_mock)
+        driver_numbers = {r['driver_number'] for r in rows}
+        self.assertEqual(driver_numbers, {44, 1})
 
 
 if __name__ == "__main__":

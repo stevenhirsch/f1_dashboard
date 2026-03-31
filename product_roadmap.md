@@ -371,8 +371,8 @@ Derived from intervals timestamps cross-referenced with sector boundary times fr
   - Sector Timing Usage: These colors are primarily used in qualifying and practice sessions to help teams and viewers analyze performance in the three designated sectors (S1, S2, S3) of the track. 
   - We can ingest this for qualifying data as additional context
 
-**`lap_metrics` — lap-level flags and deltas ✅ Implemented (2026-03-29)**
-- `is_neutralized` ✅ — True when any SC/VSC (`category='SafetyCar'`) or red flag (`flag='RED'`) RC event falls within `[date_start, date_start + lap_duration]`; None when start time or duration missing
+**`lap_metrics` — lap-level flags and deltas ✅ Implemented (2026-03-29, SC/VSC period detection improved 2026-03-31)**
+- `is_neutralized` ✅ — True when the lap's UTC window overlaps any neutralized period; periods are built by `_build_neutralized_periods` from RC messages: SC (`SAFETY CAR DEPLOYED` → `SAFETY CAR IN THIS LAP`), VSC (`VIRTUAL SAFETY CAR DEPLOYED` → `VIRTUAL SAFETY CAR ENDING`), red flag (zero-width point interval). Period-based detection (vs. original point-in-time check) correctly neutralizes laps that fall entirely within a SC/VSC deployment with no new RC event inside that specific lap — required to fix sprint stint_metrics inflated pace from post-pit SC laps. None when start time or duration missing.
 - `tyre_age_at_lap` ✅ — `tyre_age_at_start + (lap_number − stint.lap_start)` via stint lookup; None when no matching stint (e.g. OpenF1 sprint data gap)
 - `delta_to_session_best_s1/s2/s3` ✅ — sector time minus session best; computed as part of `ingest_session_sector_bests`; None when either value missing
 
@@ -381,12 +381,13 @@ Derived from intervals timestamps cross-referenced with sector boundary times fr
 - `best_s1/s2/s3_driver` ✅ — driver who set each best
 - `theoretical_best_lap` ✅ — sum of best_s1 + best_s2 + best_s3; None if any sector missing
 
-**`stint_metrics`** — per (session_key, driver_number, stint_number)
-- `clean_air_pace_s` — mean lap time on laps where is_estimated_clean_air == true
-- `dirty_air_pace_s` — mean on non-clean laps
-- `first_half_pace_s` / `second_half_pace_s` — split on stint midpoint, excluding neutralized laps
-- `representative_pace_s` — median of non-neutralized, non-pit-in/out laps
-- `racing_lap_count` — laps excluding neutralized and pit-in/out
+**`stint_metrics` ✅ Implemented (2026-03-31)** — per (session_key, driver_number, stint_number); race/sprint only
+- `clean_air_pace_s` ✅ — mean lap time on racing laps where is_estimated_clean_air = True
+- `dirty_air_pace_s` ✅ — mean on racing laps where is_estimated_clean_air = False
+- `first_half_pace_s` / `second_half_pace_s` ✅ — split at ceil(n/2) of racing laps sorted by lap number; first half gets the larger share on odd counts
+- `representative_pace_s` ✅ — median of racing laps (non-neutralized, non-pit-in/out, valid lap_duration)
+- `racing_lap_count` ✅ — count of racing laps per above definition
+- Reads `is_estimated_clean_air` and `is_neutralized` from Supabase `lap_metrics`; reads `lap_duration` / pit flags from in-memory `laps` list; stint assignment from `stints_rows`
 
 **`race_results.fastest_lap_flag`** ✅ Implemented (2026-03-29)
 Derived from minimum `lap_duration` among classified finishers (not DNF/DNS/DSQ). `ingest_fastest_lap_flag(client, session_key, laps)` — reuses cached `get_session_result` response, no extra API call. Called for race and sprint sessions in `process_session`.
@@ -425,7 +426,7 @@ One row per driver per round; full table gives season progression plottable over
 ✅ 6. ingest_brake_entry_speed_ranks — session-level pct_rank/z_score/category
 ✅ 7. race_results.fastest_lap_flag — ingest_fastest_lap_flag (called in process_session, not recompute)
 ✅ 8. ingest_battle_states — gap/battle states per sector (intervals × sector timestamps)
-   9. ingest_stint_metrics — requires is_estimated_clean_air + is_neutralized
+✅ 9. ingest_stint_metrics — race/sprint only; reads lap_metrics from Supabase for flags
   10. season_driver_stats + season_constructor_stats (cumulative row; reads prior round, adds delta)
 ```
 

@@ -1198,6 +1198,73 @@ def ingest_qualifying_peak_g_summary(
     _upsert(client, 'qualifying_results', rows)
 
 
+def _build_neutralized_periods(
+    rc_rows: list[dict],
+    pd_module,
+) -> list[tuple[float, float]]:
+    """Parse race control messages into (start_epoch, end_epoch) neutralized intervals.
+
+    Three event types are handled:
+
+    - Safety Car: ``SAFETY CAR DEPLOYED`` → ``SAFETY CAR IN THIS LAP``
+    - Virtual Safety Car: ``VIRTUAL SAFETY CAR DEPLOYED`` → ``VIRTUAL SAFETY CAR ENDING``
+    - Red flag: ``flag='RED'`` represented as a zero-width interval ``(ts, ts)``
+
+    Lap overlap check: ``t_start <= period_end AND t_end >= period_start``
+    (inclusive on both ends so a lap containing a boundary timestamp is still
+    counted as neutralized).
+
+    SC/VSC pairing scans forward to find the matching end message.  If no end
+    message is found (e.g., truncated data) the period is silently skipped.
+    """
+    events: list[tuple[float, dict]] = []
+    for r in rc_rows:
+        d = r.get('date')
+        if not d:
+            continue
+        try:
+            events.append((pd_module.to_datetime(d).timestamp(), r))
+        except Exception:
+            pass
+    events.sort(key=lambda x: x[0])
+
+    periods: list[tuple[float, float]] = []
+    i = 0
+    while i < len(events):
+        ts, r = events[i]
+        cat = r.get('category')
+        msg = (r.get('message') or '').upper()
+        flag = r.get('flag')
+
+        if cat == 'SafetyCar' and 'VIRTUAL SAFETY CAR DEPLOYED' in msg:
+            # VSC: scan forward for VIRTUAL SAFETY CAR ENDING.
+            for j in range(i + 1, len(events)):
+                ts2, r2 = events[j]
+                if r2.get('category') == 'SafetyCar' and \
+                        'VIRTUAL SAFETY CAR ENDING' in (r2.get('message') or '').upper():
+                    periods.append((ts, ts2))
+                    break
+
+        elif cat == 'SafetyCar' and 'DEPLOYED' in msg:
+            # SC (checked after VSC so "VIRTUAL … DEPLOYED" is not matched here).
+            # Scan forward for SAFETY CAR IN THIS LAP.
+            for j in range(i + 1, len(events)):
+                ts2, r2 = events[j]
+                if r2.get('category') == 'SafetyCar' and \
+                        'IN THIS LAP' in (r2.get('message') or '').upper():
+                    periods.append((ts, ts2))
+                    break
+
+        elif flag == 'RED':
+            # Red flag: zero-width point interval — overlap check degenerates to
+            # the original point-in-time containment check for this case.
+            periods.append((ts, ts))
+
+        i += 1
+
+    return periods
+
+
 def ingest_lap_flags(
     client: Client,
     session_key: int,
@@ -1207,10 +1274,18 @@ def ingest_lap_flags(
 ) -> None:
     """Populate ``is_neutralized`` and ``tyre_age_at_lap`` in ``lap_metrics``.
 
-    ``is_neutralized``: True when any Safety Car, Virtual Safety Car, or Red
-    Flag race-control event falls within the lap's UTC time window
-    ``[date_start, date_start + lap_duration]``.  None when the lap's start
-    time or duration is missing.
+    ``is_neutralized``: True when the lap's UTC window overlaps any neutralized
+    period built from race control messages.  Periods are:
+
+    - Safety Car: ``SAFETY CAR DEPLOYED`` → ``SAFETY CAR IN THIS LAP``
+    - Virtual Safety Car: ``VIRTUAL SAFETY CAR DEPLOYED`` → ``VIRTUAL SAFETY CAR ENDING``
+    - Red flag: the broadcast timestamp treated as a zero-width point interval
+
+    This period-based approach correctly neutralizes laps that fall entirely
+    within a SC/VSC deployment even when no new RC message is broadcast during
+    that specific lap (e.g. SC laps after a pit stop during a sprint SC period).
+
+    None when the lap's start time or duration is missing.
 
     ``tyre_age_at_lap``: ``tyre_age_at_start + (lap_number − stint.lap_start)``
     for the matching stint.  None when no matching stint is found (e.g. OpenF1
@@ -1218,16 +1293,7 @@ def ingest_lap_flags(
     """
     import pandas as pd
 
-    # Build sorted list of neutralising event timestamps (UTC epoch seconds).
-    neutralising_ts: list[float] = []
-    for r in rc_rows:
-        if r.get('category') == 'SafetyCar' or r.get('flag') == 'RED':
-            d = r.get('date')
-            if d:
-                try:
-                    neutralising_ts.append(pd.to_datetime(d).timestamp())
-                except Exception:
-                    pass
+    neutralized_periods = _build_neutralized_periods(rc_rows, pd)
 
     # Stint index: {driver_number: [stints sorted ascending by lap_start]}.
     stints_by_driver: dict[int, list[dict]] = {}
@@ -1254,7 +1320,10 @@ def ingest_lap_flags(
             try:
                 t_start = pd.to_datetime(date_start).timestamp()
                 t_end = t_start + float(lap_dur)
-                is_neutralized = any(t_start <= t <= t_end for t in neutralising_ts)
+                is_neutralized = any(
+                    t_start <= p_end and t_end >= p_start
+                    for p_start, p_end in neutralized_periods
+                )
             except Exception:
                 pass
 
@@ -1747,6 +1816,129 @@ def ingest_battle_states(
     _upsert(client, 'lap_metrics', rows)
 
 
+def ingest_stint_metrics(
+    client: Client,
+    session_key: int,
+    laps: list[dict],
+    stints_rows: list[dict],
+) -> None:
+    """Aggregate per-stint pace metrics into ``stint_metrics``.
+
+    Reads ``is_estimated_clean_air`` and ``is_neutralized`` from ``lap_metrics``
+    (written by earlier pipeline steps) and ``lap_duration`` / pit flags from the
+    in-memory ``laps`` list.  Only race/sprint sessions should be passed; qualifying
+    is skipped at the call site.
+
+    Racing laps are laps that are not neutralized, not pit-in, not pit-out, and
+    have a valid lap_duration.  ``is_neutralized=None`` is treated as not neutralized
+    (include the lap unless we have positive evidence of a yellow/red/SC period).
+    """
+    import math
+    import statistics
+    from collections import defaultdict
+
+    if not laps or not stints_rows:
+        return
+
+    # --- lookup structures from laps -----------------------------------------
+    lap_dur: dict[tuple[int, int], float] = {}
+    pit_in: set[tuple[int, int]] = set()
+    pit_out: set[tuple[int, int]] = set()
+
+    for lap in laps:
+        dn = lap.get('driver_number')
+        ln = lap.get('lap_number')
+        if dn is None or ln is None:
+            continue
+        dur = lap.get('lap_duration')
+        if dur is not None:
+            lap_dur[(dn, ln)] = float(dur)
+        if lap.get('pit_in_time') is not None:
+            pit_in.add((dn, ln))
+        if lap.get('is_pit_out_lap'):
+            pit_out.add((dn, ln))
+
+    # --- stint assignment per driver -----------------------------------------
+    driver_stints: dict[int, list[dict]] = defaultdict(list)
+    for s in stints_rows:
+        dn = s.get('driver_number')
+        if dn is not None and s.get('stint_number') is not None and s.get('lap_start') is not None:
+            driver_stints[dn].append(s)
+
+    def _stint_for(dn: int, ln: int) -> int | None:
+        for s in driver_stints.get(dn, []):
+            start = s['lap_start']
+            end = s.get('lap_end')
+            if ln >= start and (end is None or ln <= end):
+                return s['stint_number']
+        return None
+
+    # --- read clean_air / neutralized flags from Supabase --------------------
+    resp = (
+        client.table('lap_metrics')
+        .select('driver_number,lap_number,is_estimated_clean_air,is_neutralized')
+        .eq('session_key', session_key)
+        .execute()
+    )
+    lm_data = resp.data or []
+
+    # --- group into (driver, stint) buckets ----------------------------------
+    stint_laps: dict[tuple[int, int], list[dict]] = defaultdict(list)
+    for r in lm_data:
+        dn = r.get('driver_number')
+        ln = r.get('lap_number')
+        if dn is None or ln is None:
+            continue
+        sn = _stint_for(dn, ln)
+        if sn is None:
+            continue
+        stint_laps[(dn, sn)].append({
+            'lap_number':             ln,
+            'lap_duration':           lap_dur.get((dn, ln)),
+            'is_estimated_clean_air': r.get('is_estimated_clean_air'),
+            'is_neutralized':         r.get('is_neutralized'),
+            'is_pit_in':              (dn, ln) in pit_in,
+            'is_pit_out':             (dn, ln) in pit_out,
+        })
+
+    # --- compute metrics per stint -------------------------------------------
+    def _mean(vals: list[float]) -> float | None:
+        return sum(vals) / len(vals) if vals else None
+
+    def _median(vals: list[float]) -> float | None:
+        return statistics.median(vals) if vals else None
+
+    rows: list[dict] = []
+    for (dn, sn), entries in stint_laps.items():
+        racing = sorted(
+            [e for e in entries
+             if e['lap_duration'] is not None
+             and e['is_neutralized'] is not True
+             and not e['is_pit_in']
+             and not e['is_pit_out']],
+            key=lambda e: e['lap_number'],
+        )
+        n = len(racing)
+        durations = [e['lap_duration'] for e in racing]
+        split = math.ceil(n / 2)
+
+        rows.append({
+            'session_key':           session_key,
+            'driver_number':         dn,
+            'stint_number':          sn,
+            'representative_pace_s': _median(durations),
+            'clean_air_pace_s':      _mean([e['lap_duration'] for e in racing
+                                            if e['is_estimated_clean_air'] is True]),
+            'dirty_air_pace_s':      _mean([e['lap_duration'] for e in racing
+                                            if e['is_estimated_clean_air'] is False]),
+            'first_half_pace_s':     _mean(durations[:split]),
+            'second_half_pace_s':    _mean(durations[split:]),
+            'racing_lap_count':      n,
+        })
+
+    _upsert(client, 'stint_metrics', rows)
+
+
 def recompute_lap_metrics(
     client: Client,
     session_key: int,
@@ -1778,6 +1970,7 @@ def recompute_lap_metrics(
         ingest_brake_entry_speed_ranks(client, session_key, driver_lap_metrics)
         ingest_battle_states(client, session_key, laps,
                              intervals_rows or [], overtakes_rows or [])
+        ingest_stint_metrics(client, session_key, laps, stints_rows or [])
         total = sum(len(v) for v in driver_lap_metrics.values())
         print(f"  lap_metrics: {total} laps across {len(driver_lap_metrics)} drivers")
     elif session_type in ('qualifying', 'sprint qualifying', 'sprint shootout'):

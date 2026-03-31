@@ -188,6 +188,26 @@ create policy "anon read" on pit_stops for select to anon using (true);
 
 
 -- ---------------------------------------------------------------------------
+-- stint_metrics
+-- ---------------------------------------------------------------------------
+create table if not exists stint_metrics (
+    session_key           integer not null references sessions(session_key),
+    driver_number         integer not null,
+    stint_number          integer not null,
+    clean_air_pace_s      numeric,
+    dirty_air_pace_s      numeric,
+    first_half_pace_s     numeric,
+    second_half_pace_s    numeric,
+    representative_pace_s numeric,
+    racing_lap_count      integer,
+    primary key (session_key, driver_number, stint_number)
+);
+
+alter table stint_metrics enable row level security;
+create policy "anon read" on stint_metrics for select to anon using (true);
+
+
+-- ---------------------------------------------------------------------------
 -- weather
 -- ---------------------------------------------------------------------------
 create table if not exists weather (
