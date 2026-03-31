@@ -99,8 +99,10 @@ stint_metrics        — per (session_key, driver_number, stint_number)
                        representative_pace, racing_lap_count
 season_driver_stats  — cumulative season totals per (year, driver_number, meeting_key)
                        one row per round so full-season progression is plottable
-                       includes: laps_completed, distance_km, overtakes, pit_stops,
-                       podiums, poles, fastest_laps, points_scored, dnf/dns counts
+                       stratified by race vs sprint: entries/wins/podiums/poles/dnf/dns/dsq/points
+                       + laps_completed, distance_km, overtakes, pit_stops, fastest_laps,
+                         points_scored (canonical from championship API), wins_over_teammate,
+                         qualifying_supertimes
 season_constructor_stats — same structure at constructor level
                            keyed on (year, team_name, meeting_key)
 circuits             — static reference table: circuit_key, name, location, country,
@@ -290,7 +292,7 @@ circuits             — static reference table: circuit_key, name, location, co
 ---
 
 ### Phase 5 — Derived Metrics Pipeline
-- Status: **Partial — car-data metrics + lap flags + sector bests implemented; battle states + stint_metrics remaining**
+- Status: **Complete (2026-03-31)**
 *All computed at ingestion time. Populates `lap_metrics`, `stint_metrics`, `session_sector_bests`, `season_driver_stats`, `season_constructor_stats`. Unlocks Phase 6 and the chatbot data model.*
 
 **Signal notes**
@@ -395,20 +397,23 @@ Derived from minimum `lap_duration` among classified finishers (not DNF/DNS/DSQ)
 **`weather` additions ✅ Pipeline-complete (2026-03-29)**
 - `wind_speed` (m/s), `wind_direction` (degrees 0–359), `pressure` (mbar) — already fetched and mapped in `ingest_weather`; schema migration (3 columns) pending
 
-**`championship_drivers` / `championship_teams` additions**
-- `points_gap_to_leader`, `points_gap_to_p2` — derived from same API response at ingestion
+**`championship_drivers` / `championship_teams` additions ✅ Implemented (2026-03-31)**
+- `points_gap_to_leader`, `points_gap_to_p2` — derived from same API response at ingestion; negative for leader (ahead of P2)
 
-**`season_driver_stats`** — cumulative per (year, driver_number, meeting_key)
+**`season_driver_stats` ✅ Implemented (2026-03-31)** — cumulative per (year, driver_number, meeting_key)
 One row per driver per round; full table gives season progression plottable over time.
-- `round_number` — integer round within the year (for ordering)
-- `races_entered`, `races_classified`, `dnf_count`, `dns_count`, `dsq_count`, `penalty_points`
+- `round_number` — from full OpenF1 calendar (`get_meetings(year)`), not just ingested rounds
+- `races_entered`, `races_classified`, `dnf_count`, `dns_count`, `dsq_count`
 - `laps_completed`, `distance_km` (laps × `races.circuit_length_km`)
 - `total_overtakes_made`, `total_overtakes_suffered`, `total_pit_stops`
-- `podiums`, `poles`, `fastest_laps`, `points_scored`, `points_per_race`, `percent_of_driver_points_relative_to_maximum` (i.e., winning every race), `percent_of_team_points_by_driver`, `wins_over_teammate`
-- `qualifying_supertimes` - average gap between teammate from the best qualifying lap of each race weekend; assesses pure pace between drivers 
-- Sprints count toward all totals (laps, distance, overtakes, etc.)
+- `podiums`, `poles`, `fastest_laps`, `wins_over_teammate`
+- `points_scored` — canonical cumulative total from the championship API (includes rounds not yet ingested)
+- Stratified by session type: `race_entries/wins/podiums/poles/dnf/dns/dsq/points` vs. `sprint_entries/wins/podiums/poles/dnf/dns/dsq/points`
+- Sprint classification uses `session_name == "Sprint"` (OpenF1 returns `session_type = "Race"` for both Race and Sprint)
+- `qualifying_supertimes` — average gap between teammate from the best qualifying lap of each race weekend; assesses pure pace between drivers
+- `process_meeting` calls both season stats functions after all session ingestion completes
 
-**`season_constructor_stats`** — same structure at constructor level, keyed on (year, team_name, meeting_key)
+**`season_constructor_stats` ✅ Implemented (2026-03-31)** — same structure at constructor level, keyed on (year, team_name, meeting_key)
 
 **`circuits`** — static reference table, populated by `pipeline/seed_circuits.py` (not automated ingest)
 - `circuit_key`, `circuit_name`, `location`, `country`, `length_km`
@@ -427,7 +432,7 @@ One row per driver per round; full table gives season progression plottable over
 ✅ 7. race_results.fastest_lap_flag — ingest_fastest_lap_flag (called in process_session, not recompute)
 ✅ 8. ingest_battle_states — gap/battle states per sector (intervals × sector timestamps)
 ✅ 9. ingest_stint_metrics — race/sprint only; reads lap_metrics from Supabase for flags
-  10. season_driver_stats + season_constructor_stats (cumulative row; reads prior round, adds delta)
+✅ 10. season_driver_stats + season_constructor_stats (cumulative row per round, called from process_meeting)
 ```
 
 When a formula changes, run `ingest.py --recompute --session <session_key>` to regenerate from step 2 onwards without re-fetching raw data. The `computed_at` timestamp on `lap_metrics` identifies rows predating a formula change.

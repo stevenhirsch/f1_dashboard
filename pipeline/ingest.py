@@ -24,9 +24,12 @@ Environment variables (required):
 
 import argparse
 import bisect
+import math
 import os
+import statistics
 import sys
 import time
+from collections import defaultdict
 from typing import Any
 
 import httpx
@@ -65,6 +68,13 @@ def _upsert(client: Client, table: str, rows: list[dict]) -> None:
 def _pick(d: dict, *keys: str) -> dict:
     """Return a new dict with only the specified keys that exist in d."""
     return {k: d[k] for k in keys if k in d}
+
+
+def _query_in(client: Client, table: str, select: str, column: str, values: list) -> list[dict]:
+    """Safe .select().in_() wrapper — returns [] when values is empty."""
+    if not values:
+        return []
+    return client.table(table).select(select).in_(column, values).execute().data or []
 
 
 # ---------------------------------------------------------------------------
@@ -605,18 +615,27 @@ def ingest_starting_grid(client: Client, session_key: int) -> None:
 def ingest_championship_drivers(client: Client, session_key: int) -> None:
     """Upsert driver championship standings into `championship_drivers` (race/sprint only)."""
     standings = openf1.get_championship_drivers(session_key)
-    rows = [
-        {
-            "session_key":      s.get("session_key"),
-            "driver_number":    s.get("driver_number"),
-            "points_start":     s.get("points_start"),
-            "points_current":   s.get("points_current"),
-            "position_start":   s.get("position_start"),
-            "position_current": s.get("position_current"),
-        }
-        for s in standings
-        if s.get("session_key") and s.get("driver_number") is not None
-    ]
+    all_pts = sorted(
+        [s["points_current"] for s in standings if s.get("points_current") is not None],
+        reverse=True,
+    )
+    leader_pts = all_pts[0] if all_pts else None
+    p2_pts = all_pts[1] if len(all_pts) > 1 else None
+    rows = []
+    for s in standings:
+        if not s.get("session_key") or s.get("driver_number") is None:
+            continue
+        pc = s.get("points_current")
+        rows.append({
+            "session_key":          s["session_key"],
+            "driver_number":        s["driver_number"],
+            "points_start":         s.get("points_start"),
+            "points_current":       pc,
+            "position_start":       s.get("position_start"),
+            "position_current":     s.get("position_current"),
+            "points_gap_to_leader": (leader_pts - pc) if (leader_pts is not None and pc is not None) else None,
+            "points_gap_to_p2":     (p2_pts - pc)     if (p2_pts     is not None and pc is not None) else None,
+        })
     _upsert(client, "championship_drivers", rows)
 
 
@@ -655,19 +674,565 @@ def ingest_team_radio(client: Client, session_key: int) -> None:
 def ingest_championship_teams(client: Client, session_key: int) -> None:
     """Upsert constructor championship standings into `championship_teams` (race/sprint only)."""
     standings = openf1.get_championship_teams(session_key)
-    rows = [
-        {
-            "session_key":      s.get("session_key"),
-            "team_name":        s.get("team_name"),
-            "points_start":     s.get("points_start"),
-            "points_current":   s.get("points_current"),
-            "position_start":   s.get("position_start"),
-            "position_current": s.get("position_current"),
-        }
-        for s in standings
-        if s.get("session_key") and s.get("team_name")
-    ]
+    all_pts = sorted(
+        [s["points_current"] for s in standings if s.get("points_current") is not None],
+        reverse=True,
+    )
+    leader_pts = all_pts[0] if all_pts else None
+    p2_pts = all_pts[1] if len(all_pts) > 1 else None
+    rows = []
+    for s in standings:
+        if not s.get("session_key") or not s.get("team_name"):
+            continue
+        pc = s.get("points_current")
+        rows.append({
+            "session_key":          s["session_key"],
+            "team_name":            s["team_name"],
+            "points_start":         s.get("points_start"),
+            "points_current":       pc,
+            "position_start":       s.get("position_start"),
+            "position_current":     s.get("position_current"),
+            "points_gap_to_leader": (leader_pts - pc) if (leader_pts is not None and pc is not None) else None,
+            "points_gap_to_p2":     (p2_pts - pc)     if (p2_pts     is not None and pc is not None) else None,
+        })
     _upsert(client, "championship_teams", rows)
+
+
+def ingest_season_driver_stats(client: Client, year: int) -> None:
+    """Compute and upsert cumulative per-driver season stats, one row per (year, round, driver)."""
+    # 1. Build canonical round order from the full F1 calendar (OpenF1), then restrict
+    #    to meetings that have already been ingested into Supabase.
+    all_year_meetings = [
+        m for m in openf1.get_meetings(year)
+        if "pre-season" not in (m.get("meeting_name") or "").lower()
+        and "testing" not in (m.get("meeting_name") or "").lower()
+    ]
+    all_year_meetings.sort(key=lambda m: m.get("date_start") or "")
+    meeting_order = {m["meeting_key"]: i + 1 for i, m in enumerate(all_year_meetings)}
+
+    races_resp = client.table('races').select('meeting_key,date_start').eq('year', year).execute()
+    meetings = sorted(races_resp.data or [], key=lambda m: m.get('date_start') or '')
+    if not meetings:
+        return
+    meeting_keys = [m['meeting_key'] for m in meetings]
+
+    # 2. Sessions for these meetings.
+    sessions_resp = (
+        client.table('sessions')
+        .select('session_key,meeting_key,session_type,session_name')
+        .in_('meeting_key', meeting_keys)
+        .execute()
+    )
+    all_sessions = sessions_resp.data or []
+    all_sk  = [s['session_key'] for s in all_sessions]
+    # Use session_type for race/qual split (OpenF1 returns "Race"/"Qualifying"),
+    # and session_name to distinguish sprint from race within each type.
+    race_sk = [s['session_key'] for s in all_sessions
+               if (s.get('session_type') or '').lower() == 'race']
+    qual_sk = [s['session_key'] for s in all_sessions
+               if (s.get('session_type') or '').lower() == 'qualifying']
+
+    if not race_sk:
+        return
+
+    # Sprint classification uses session_name (session_type is "Race" for both).
+    sk_is_sprint: dict[int, bool] = {
+        s['session_key']: (s.get('session_name') or '').lower() == 'sprint'
+        for s in all_sessions
+    }
+    sk_is_sprint_qual: dict[int, bool] = {
+        s['session_key']: (s.get('session_name') or '').lower() in ('sprint qualifying', 'sprint shootout')
+        for s in all_sessions
+    }
+
+    # Group session keys by meeting.
+    race_sk_by_meeting: dict[int, list[int]] = defaultdict(list)
+    qual_sk_by_meeting: dict[int, list[int]] = defaultdict(list)
+    for s in all_sessions:
+        mk = s['meeting_key']
+        st = (s.get('session_type') or '').lower()
+        if st == 'race':
+            race_sk_by_meeting[mk].append(s['session_key'])
+        elif st == 'qualifying':
+            qual_sk_by_meeting[mk].append(s['session_key'])
+
+    # 3. Batch-read all needed tables.
+    race_results = _query_in(client, 'race_results',
+        'session_key,driver_number,position,number_of_laps,dnf,dns,dsq,fastest_lap_flag,points',
+        'session_key', race_sk)
+    champ_drv = _query_in(client, 'championship_drivers',
+        'session_key,driver_number,points_current',
+        'session_key', race_sk)
+    overtakes = _query_in(client, 'overtakes',
+        'session_key,driver_number_overtaking,driver_number_overtaken',
+        'session_key', race_sk)
+    pit_stops = _query_in(client, 'pit_stops',
+        'session_key,driver_number',
+        'session_key', race_sk)
+    starting_grid = _query_in(client, 'starting_grid',
+        'session_key,driver_number,position',
+        'session_key', qual_sk)
+    qual_results = _query_in(client, 'qualifying_results',
+        'session_key,driver_number,best_lap_time',
+        'session_key', qual_sk)
+    drivers_raw = _query_in(client, 'drivers',
+        'session_key,driver_number,team_name',
+        'session_key', all_sk)
+    champ_teams = _query_in(client, 'championship_teams',
+        'session_key,team_name,points_current',
+        'session_key', race_sk)
+
+    # 4. Build lookup indexes.
+    rr_by_sk: dict[int, dict[int, dict]] = defaultdict(dict)
+    for rr in race_results:
+        rr_by_sk[rr['session_key']][rr['driver_number']] = rr
+
+    champ_pts_by_sk: dict[int, dict[int, float | None]] = defaultdict(dict)
+    for cd in champ_drv:
+        champ_pts_by_sk[cd['session_key']][cd['driver_number']] = cd.get('points_current')
+
+    champ_team_pts_by_sk: dict[int, dict[str, float | None]] = defaultdict(dict)
+    for ct in champ_teams:
+        champ_team_pts_by_sk[ct['session_key']][ct['team_name']] = ct.get('points_current')
+
+    ov_made_by_sk: dict[int, dict[int, int]] = defaultdict(lambda: defaultdict(int))
+    ov_suffered_by_sk: dict[int, dict[int, int]] = defaultdict(lambda: defaultdict(int))
+    for ov in overtakes:
+        ov_made_by_sk[ov['session_key']][ov['driver_number_overtaking']] += 1
+        ov_suffered_by_sk[ov['session_key']][ov['driver_number_overtaken']] += 1
+
+    ps_count_by_sk: dict[int, dict[int, int]] = defaultdict(lambda: defaultdict(int))
+    for ps in pit_stops:
+        ps_count_by_sk[ps['session_key']][ps['driver_number']] += 1
+
+    # Pole per qualifying session: session_key -> driver_number
+    pole_by_qual_sk: dict[int, int] = {}
+    for sg in starting_grid:
+        if sg.get('position') == 1 and sg.get('driver_number') is not None:
+            pole_by_qual_sk[sg['session_key']] = sg['driver_number']
+
+    # Qualifying best time per session per driver.
+    qt_by_sk: dict[int, dict[int, float | None]] = defaultdict(dict)
+    for qr in qual_results:
+        qt_by_sk[qr['session_key']][qr['driver_number']] = qr.get('best_lap_time')
+
+    # Team per (session_key, driver_number).
+    team_by_sk_dn: dict[tuple[int, int], str | None] = {}
+    for d in drivers_raw:
+        team_by_sk_dn[(d['session_key'], d['driver_number'])] = d.get('team_name')
+
+    # Teammates per session: session_key -> driver_number -> [teammate_numbers]
+    team_members_by_sk: dict[int, dict[str, list[int]]] = defaultdict(lambda: defaultdict(list))
+    for d in drivers_raw:
+        if d.get('team_name'):
+            team_members_by_sk[d['session_key']][d['team_name']].append(d['driver_number'])
+    teammates_by_sk: dict[int, dict[int, list[int]]] = defaultdict(dict)
+    for sk, team_map in team_members_by_sk.items():
+        for members in team_map.values():
+            for dn in members:
+                teammates_by_sk[sk][dn] = [m for m in members if m != dn]
+
+    # 5. Discover all driver numbers across race sessions.
+    all_dns: set[int] = {rr['driver_number'] for rr in race_results}
+
+    # 6. Accumulate stats per driver across meetings.
+    def _new_state() -> dict:
+        return {
+            # Combined totals
+            'races_entered': 0, 'races_classified': 0,
+            'dnf_count': 0, 'dns_count': 0, 'dsq_count': 0,
+            'laps_completed': 0, 'wins': 0, 'podiums': 0, 'poles': 0,
+            'fastest_laps': 0, 'wins_over_teammate': 0,
+            'total_overtakes_made': 0, 'total_overtakes_suffered': 0,
+            'total_pit_stops': 0, 'qual_gaps': [],
+            # Race-specific
+            'race_entries': 0, 'race_wins': 0, 'race_podiums': 0, 'race_poles': 0,
+            'race_dnf_count': 0, 'race_dns_count': 0, 'race_dsq_count': 0,
+            'race_points': 0.0,
+            # Sprint-specific
+            'sprint_entries': 0, 'sprint_wins': 0, 'sprint_podiums': 0, 'sprint_poles': 0,
+            'sprint_dnf_count': 0, 'sprint_dns_count': 0, 'sprint_dsq_count': 0,
+            'sprint_points': 0.0,
+        }
+
+    state: dict[int, dict] = {dn: _new_state() for dn in all_dns}
+    running_pts: dict[int, float | None] = {}  # last known championship points per driver
+
+    rows: list[dict] = []
+
+    for meeting in meetings:
+        mk = meeting['meeting_key']
+        round_num = meeting_order[mk]
+
+        # --- race/sprint sessions ---
+        for sk in race_sk_by_meeting.get(mk, []):
+            is_sprint = sk_is_sprint.get(sk, False)
+            for dn, rr in rr_by_sk.get(sk, {}).items():
+                if dn not in state:
+                    state[dn] = _new_state()
+                c = state[dn]
+                c['races_entered'] += 1
+                pts_earned = rr.get('points') or 0.0
+                if is_sprint:
+                    c['sprint_entries'] += 1
+                    c['sprint_points'] += pts_earned
+                else:
+                    c['race_entries'] += 1
+                    c['race_points'] += pts_earned
+                if rr.get('dns'):
+                    c['dns_count'] += 1
+                    c['sprint_dns_count' if is_sprint else 'race_dns_count'] += 1
+                elif rr.get('dsq'):
+                    c['dsq_count'] += 1
+                    c['sprint_dsq_count' if is_sprint else 'race_dsq_count'] += 1
+                elif rr.get('dnf'):
+                    c['dnf_count'] += 1
+                    c['sprint_dnf_count' if is_sprint else 'race_dnf_count'] += 1
+                else:
+                    c['races_classified'] += 1
+                c['laps_completed'] += rr.get('number_of_laps') or 0
+                pos = rr.get('position')
+                if pos == 1:
+                    c['wins'] += 1
+                    c['sprint_wins' if is_sprint else 'race_wins'] += 1
+                if pos is not None and pos <= 3:
+                    c['podiums'] += 1
+                    c['sprint_podiums' if is_sprint else 'race_podiums'] += 1
+                if rr.get('fastest_lap_flag'):
+                    c['fastest_laps'] += 1
+                c['total_overtakes_made']     += ov_made_by_sk[sk].get(dn, 0)
+                c['total_overtakes_suffered'] += ov_suffered_by_sk[sk].get(dn, 0)
+                c['total_pit_stops']          += ps_count_by_sk[sk].get(dn, 0)
+                # wins_over_teammate (count once per session even if multiple teammates)
+                if pos is not None and not rr.get('dns') and not rr.get('dsq'):
+                    for tm in teammates_by_sk[sk].get(dn, []):
+                        tm_pos = rr_by_sk[sk].get(tm, {}).get('position')
+                        if tm_pos is not None and pos < tm_pos:
+                            c['wins_over_teammate'] += 1
+                            break
+            # Update running championship points.
+            for dn, pts in champ_pts_by_sk.get(sk, {}).items():
+                running_pts[dn] = pts
+
+        # --- qualifying sessions (poles + qual gaps) ---
+        for sk in qual_sk_by_meeting.get(mk, []):
+            is_sprint_qual = sk_is_sprint_qual.get(sk, False)
+            pole_dn = pole_by_qual_sk.get(sk)
+            if pole_dn is not None:
+                if pole_dn not in state:
+                    state[pole_dn] = _new_state()
+                state[pole_dn]['poles'] += 1
+                state[pole_dn]['sprint_poles' if is_sprint_qual else 'race_poles'] += 1
+
+            qt = qt_by_sk.get(sk, {})
+            for dn, my_time in qt.items():
+                if my_time is None:
+                    continue
+                for tm in teammates_by_sk[sk].get(dn, []):
+                    tm_time = qt.get(tm)
+                    if tm_time is not None:
+                        if dn not in state:
+                            state[dn] = _new_state()
+                        state[dn]['qual_gaps'].append(my_time - tm_time)
+                        break
+
+        # --- get team points for this round (latest per team across race sessions) ---
+        team_pts_at_round: dict[str, float] = {}
+        for sk in race_sk_by_meeting.get(mk, []):
+            for team, pts in champ_team_pts_by_sk.get(sk, {}).items():
+                if pts is not None:
+                    team_pts_at_round[team] = pts
+
+        # --- emit one row per driver seen so far ---
+        for dn, c in state.items():
+            if c['races_entered'] == 0 and c['poles'] == 0:
+                continue  # driver hasn't appeared yet
+            pts = running_pts.get(dn)
+
+            # Team membership for this driver at this meeting (use first race session found).
+            team: str | None = None
+            for sk in race_sk_by_meeting.get(mk, []):
+                team = team_by_sk_dn.get((sk, dn))
+                if team:
+                    break
+            if team is None:  # try qualifying sessions
+                for sk in qual_sk_by_meeting.get(mk, []):
+                    team = team_by_sk_dn.get((sk, dn))
+                    if team:
+                        break
+
+            pct_team: float | None = None
+            if team and pts is not None:
+                team_total = team_pts_at_round.get(team)
+                if team_total and team_total > 0:
+                    pct_team = round((pts / team_total) * 100.0, 4)
+
+            gaps = c['qual_gaps']
+            qual_gap_mean = sum(gaps) / len(gaps) if gaps else None
+            rows.append({
+                'year':                       year,
+                'round_number':               round_num,
+                'driver_number':              dn,
+                'races_entered':              c['races_entered'],
+                'race_entries':               c['race_entries'],
+                'sprint_entries':             c['sprint_entries'],
+                'races_classified':           c['races_classified'],
+                'dnf_count':                  c['dnf_count'],
+                'dns_count':                  c['dns_count'],
+                'dsq_count':                  c['dsq_count'],
+                'race_dnf_count':             c['race_dnf_count'],
+                'race_dns_count':             c['race_dns_count'],
+                'race_dsq_count':             c['race_dsq_count'],
+                'sprint_dnf_count':           c['sprint_dnf_count'],
+                'sprint_dns_count':           c['sprint_dns_count'],
+                'sprint_dsq_count':           c['sprint_dsq_count'],
+                'laps_completed':             c['laps_completed'],
+                'wins':                       c['wins'],
+                'race_wins':                  c['race_wins'],
+                'sprint_wins':                c['sprint_wins'],
+                'podiums':                    c['podiums'],
+                'race_podiums':               c['race_podiums'],
+                'sprint_podiums':             c['sprint_podiums'],
+                'poles':                      c['poles'],
+                'race_poles':                 c['race_poles'],
+                'sprint_poles':               c['sprint_poles'],
+                'fastest_laps':               c['fastest_laps'],
+                'points_scored':              pts,
+                'race_points':                c['race_points'],
+                'sprint_points':              c['sprint_points'],
+                'wins_over_teammate':         c['wins_over_teammate'],
+                'qualifying_supertime_gap_s': qual_gap_mean,
+                'percent_of_team_points':     pct_team,
+                'total_overtakes_made':       c['total_overtakes_made'],
+                'total_overtakes_suffered':   c['total_overtakes_suffered'],
+                'total_pit_stops':            c['total_pit_stops'],
+            })
+
+    _upsert(client, 'season_driver_stats', rows)
+
+
+def ingest_season_constructor_stats(client: Client, year: int) -> None:
+    """Compute and upsert cumulative per-constructor season stats, one row per (year, round, team)."""
+    # 1. Build canonical round order from the full F1 calendar (OpenF1), then restrict
+    #    to meetings that have already been ingested into Supabase.
+    all_year_meetings = [
+        m for m in openf1.get_meetings(year)
+        if "pre-season" not in (m.get("meeting_name") or "").lower()
+        and "testing" not in (m.get("meeting_name") or "").lower()
+    ]
+    all_year_meetings.sort(key=lambda m: m.get("date_start") or "")
+    meeting_order = {m["meeting_key"]: i + 1 for i, m in enumerate(all_year_meetings)}
+
+    races_resp = client.table('races').select('meeting_key,date_start').eq('year', year).execute()
+    meetings = sorted(races_resp.data or [], key=lambda m: m.get('date_start') or '')
+    if not meetings:
+        return
+    meeting_keys = [m['meeting_key'] for m in meetings]
+
+    # 2. Sessions for these meetings.
+    sessions_resp = (
+        client.table('sessions')
+        .select('session_key,meeting_key,session_type,session_name')
+        .in_('meeting_key', meeting_keys)
+        .execute()
+    )
+    all_sessions = sessions_resp.data or []
+    all_sk  = [s['session_key'] for s in all_sessions]
+    race_sk = [s['session_key'] for s in all_sessions
+                if (s.get('session_type') or '').lower() == 'race']
+    qual_sk = [s['session_key'] for s in all_sessions
+                if (s.get('session_type') or '').lower() == 'qualifying']
+
+    if not race_sk:
+        return
+
+    sk_is_sprint: dict[int, bool] = {
+        s['session_key']: (s.get('session_name') or '').lower() == 'sprint'
+        for s in all_sessions
+    }
+    sk_is_sprint_qual: dict[int, bool] = {
+        s['session_key']: (s.get('session_name') or '').lower() in ('sprint qualifying', 'sprint shootout')
+        for s in all_sessions
+    }
+
+    race_sk_by_meeting: dict[int, list[int]] = defaultdict(list)
+    qual_sk_by_meeting: dict[int, list[int]] = defaultdict(list)
+    for s in all_sessions:
+        mk = s['meeting_key']
+        st = (s.get('session_type') or '').lower()
+        if st == 'race':
+            race_sk_by_meeting[mk].append(s['session_key'])
+        elif st == 'qualifying':
+            qual_sk_by_meeting[mk].append(s['session_key'])
+
+    # 3. Batch-read tables.
+    race_results = _query_in(client, 'race_results',
+        'session_key,driver_number,position,number_of_laps,dnf,dns,dsq,fastest_lap_flag,points',
+        'session_key', race_sk)
+    champ_teams = _query_in(client, 'championship_teams',
+        'session_key,team_name,points_current',
+        'session_key', race_sk)
+    pit_stops = _query_in(client, 'pit_stops',
+        'session_key,driver_number',
+        'session_key', race_sk)
+    starting_grid = _query_in(client, 'starting_grid',
+        'session_key,driver_number,position',
+        'session_key', qual_sk)
+    drivers_raw = _query_in(client, 'drivers',
+        'session_key,driver_number,team_name',
+        'session_key', all_sk)
+
+    # 4. Build indexes.
+    rr_by_sk: dict[int, dict[int, dict]] = defaultdict(dict)
+    for rr in race_results:
+        rr_by_sk[rr['session_key']][rr['driver_number']] = rr
+
+    ct_pts_by_sk: dict[int, dict[str, float | None]] = defaultdict(dict)
+    for ct in champ_teams:
+        ct_pts_by_sk[ct['session_key']][ct['team_name']] = ct.get('points_current')
+
+    ps_count_by_sk: dict[int, dict[int, int]] = defaultdict(lambda: defaultdict(int))
+    for ps in pit_stops:
+        ps_count_by_sk[ps['session_key']][ps['driver_number']] += 1
+
+    pole_by_qual_sk: dict[int, tuple[int, str | None]] = {}  # sk -> (driver_number, team)
+    # team will be filled after building team_by_sk_dn
+    pole_dn_by_qual_sk: dict[int, int] = {}
+    for sg in starting_grid:
+        if sg.get('position') == 1 and sg.get('driver_number') is not None:
+            pole_dn_by_qual_sk[sg['session_key']] = sg['driver_number']
+
+    team_by_sk_dn: dict[tuple[int, int], str | None] = {}
+    for d in drivers_raw:
+        team_by_sk_dn[(d['session_key'], d['driver_number'])] = d.get('team_name')
+
+    # Teams per race session.
+    teams_by_race_sk: dict[int, set[str]] = defaultdict(set)
+    for d in drivers_raw:
+        sk = d['session_key']
+        if sk in race_sk and d.get('team_name'):
+            teams_by_race_sk[sk].add(d['team_name'])
+
+    # Drivers per team per race session.
+    dns_by_sk_team: dict[tuple[int, str], list[int]] = defaultdict(list)
+    for d in drivers_raw:
+        if d.get('team_name') and d['session_key'] in set(race_sk):
+            dns_by_sk_team[(d['session_key'], d['team_name'])].append(d['driver_number'])
+
+    # All team names.
+    all_teams: set[str] = {d['team_name'] for d in drivers_raw if d.get('team_name')}
+
+    # 5. Accumulate.
+    def _new_team_state() -> dict:
+        return {
+            # Combined
+            'wins': 0, 'podiums': 0, 'poles': 0, 'fastest_laps': 0,
+            'races_entered': 0, 'dnf_count': 0, 'laps_completed': 0,
+            'total_pit_stops': 0,
+            # Race-specific
+            'race_entries': 0, 'race_wins': 0, 'race_podiums': 0, 'race_poles': 0,
+            'race_dnf_count': 0, 'race_points': 0.0,
+            # Sprint-specific
+            'sprint_entries': 0, 'sprint_wins': 0, 'sprint_podiums': 0, 'sprint_poles': 0,
+            'sprint_dnf_count': 0, 'sprint_points': 0.0,
+        }
+
+    state: dict[str, dict] = {t: _new_team_state() for t in all_teams}
+    running_pts: dict[str, float | None] = {}
+
+    rows: list[dict] = []
+
+    for meeting in meetings:
+        mk = meeting['meeting_key']
+        round_num = meeting_order[mk]
+
+        # --- race/sprint sessions ---
+        for sk in race_sk_by_meeting.get(mk, []):
+            is_sprint = sk_is_sprint.get(sk, False)
+            for dn, rr in rr_by_sk.get(sk, {}).items():
+                team = team_by_sk_dn.get((sk, dn))
+                if not team:
+                    continue
+                if team not in state:
+                    state[team] = _new_team_state()
+                c = state[team]
+                pts_earned = rr.get('points') or 0.0
+                c['races_entered'] += 1
+                if is_sprint:
+                    c['sprint_entries'] += 1
+                    c['sprint_points'] += pts_earned
+                else:
+                    c['race_entries'] += 1
+                    c['race_points'] += pts_earned
+                if rr.get('dnf') and not rr.get('dns') and not rr.get('dsq'):
+                    c['dnf_count'] += 1
+                    c['sprint_dnf_count' if is_sprint else 'race_dnf_count'] += 1
+                c['laps_completed'] += rr.get('number_of_laps') or 0
+                pos = rr.get('position')
+                if pos == 1:
+                    c['wins'] += 1
+                    c['sprint_wins' if is_sprint else 'race_wins'] += 1
+                if pos is not None and pos <= 3:
+                    c['podiums'] += 1
+                    c['sprint_podiums' if is_sprint else 'race_podiums'] += 1
+                if rr.get('fastest_lap_flag'):
+                    c['fastest_laps'] += 1
+                c['total_pit_stops'] += ps_count_by_sk[sk].get(dn, 0)
+
+            for team, pts in ct_pts_by_sk.get(sk, {}).items():
+                if pts is not None:
+                    running_pts[team] = pts
+
+        # --- qualifying sessions (poles) ---
+        for sk in qual_sk_by_meeting.get(mk, []):
+            is_sprint_qual = sk_is_sprint_qual.get(sk, False)
+            pole_dn = pole_dn_by_qual_sk.get(sk)
+            if pole_dn is not None:
+                pole_team = team_by_sk_dn.get((sk, pole_dn))
+                if not pole_team:
+                    for rsk in race_sk_by_meeting.get(mk, []):
+                        pole_team = team_by_sk_dn.get((rsk, pole_dn))
+                        if pole_team:
+                            break
+                if pole_team:
+                    if pole_team not in state:
+                        state[pole_team] = _new_team_state()
+                    state[pole_team]['poles'] += 1
+                    state[pole_team]['sprint_poles' if is_sprint_qual else 'race_poles'] += 1
+
+        # --- emit one row per team seen so far ---
+        for team, c in state.items():
+            if c['races_entered'] == 0 and c['poles'] == 0:
+                continue
+            pts = running_pts.get(team)
+            rows.append({
+                'year':              year,
+                'round_number':      round_num,
+                'team_name':         team,
+                'points_scored':     pts,
+                'race_points':       c['race_points'],
+                'sprint_points':     c['sprint_points'],
+                'wins':              c['wins'],
+                'race_wins':         c['race_wins'],
+                'sprint_wins':       c['sprint_wins'],
+                'podiums':           c['podiums'],
+                'race_podiums':      c['race_podiums'],
+                'sprint_podiums':    c['sprint_podiums'],
+                'poles':             c['poles'],
+                'race_poles':        c['race_poles'],
+                'sprint_poles':      c['sprint_poles'],
+                'fastest_laps':      c['fastest_laps'],
+                'races_entered':     c['races_entered'],
+                'race_entries':      c['race_entries'],
+                'sprint_entries':    c['sprint_entries'],
+                'dnf_count':         c['dnf_count'],
+                'race_dnf_count':    c['race_dnf_count'],
+                'sprint_dnf_count':  c['sprint_dnf_count'],
+                'laps_completed':    c['laps_completed'],
+                'total_pit_stops':   c['total_pit_stops'],
+            })
+
+    _upsert(client, 'season_constructor_stats', rows)
 
 
 # ---------------------------------------------------------------------------
@@ -1046,7 +1611,6 @@ def ingest_lap_metrics(
     look up any per-lap metric for a specific lap number without re-querying.
     """
     import pandas as pd
-    from collections import defaultdict
 
     laps_by_driver: dict[int, list[dict]] = defaultdict(list)
     for lap in laps:
@@ -1833,10 +2397,6 @@ def ingest_stint_metrics(
     have a valid lap_duration.  ``is_neutralized=None`` is treated as not neutralized
     (include the lap unless we have positive evidence of a yellow/red/SC period).
     """
-    import math
-    import statistics
-    from collections import defaultdict
-
     if not laps or not stints_rows:
         return
 
@@ -2060,25 +2620,33 @@ def process_session(client: Client, session_key: int, recompute: bool = False) -
 
 
 def process_meeting(client: Client, meeting_key: int, recompute: bool = False) -> None:
-    """Ingest all sessions for a meeting."""
+    """Ingest all sessions for a meeting, then refresh cumulative season stats."""
     meeting_info = openf1.get_meeting(meeting_key)
+    year: int | None = None
     if meeting_info:
         m = meeting_info[0]
         name = m.get("meeting_name") or "Unknown"
         location = m.get("location") or m.get("circuit_short_name") or ""
-        year = m.get("year") or ""
-        print(f"\n→ Meeting {meeting_key} — {name} · {location} · {year}")
+        year = m.get("year") or None
+        print(f"\n→ Meeting {meeting_key} — {name} · {location} · {year or ''}")
     else:
         print(f"\n→ Meeting {meeting_key}")
 
     sessions = openf1.get_sessions(meeting_key)
     allowed = {"Race", "Qualifying", "Sprint", "Sprint Qualifying", "Sprint Shootout"}
     eligible = [s for s in sessions if s.get("session_name") in allowed]
+    if year is None and eligible:
+        year = eligible[0].get("year")
     print(f"  {len(eligible)} session(s) to ingest: "
           f"{', '.join(s.get('session_name', '?') for s in eligible)}")
 
     for s in eligible:
         process_session(client, s["session_key"], recompute=recompute)
+
+    if year:
+        print(f"  computing season stats for {year} …")
+        ingest_season_driver_stats(client, year)
+        ingest_season_constructor_stats(client, year)
 
     print(f"\n✓ Meeting {meeting_key} complete")
 

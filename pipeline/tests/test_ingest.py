@@ -19,11 +19,14 @@ from ingest import (
     _parse_gap,
     _parse_intervals_index,
     _pick,
+    _query_in,
     _upsert,
     ingest_battle_states,
     ingest_stint_metrics,
     ingest_championship_drivers,
     ingest_championship_teams,
+    ingest_season_driver_stats,
+    ingest_season_constructor_stats,
     ingest_drivers,
     ingest_brake_entry_speed_ranks,
     ingest_fastest_lap_flag,
@@ -4266,6 +4269,734 @@ class TestIngestStintMetrics(unittest.TestCase):
         rows = self._upserted(write_mock)
         driver_numbers = {r['driver_number'] for r in rows}
         self.assertEqual(driver_numbers, {44, 1})
+
+
+# ===========================================================================
+# _query_in
+# ===========================================================================
+
+class TestQueryIn(unittest.TestCase):
+
+    def test_empty_values_returns_empty_without_calling_client(self):
+        client = MagicMock()
+        result = _query_in(client, 'some_table', 'col', 'id', [])
+        self.assertEqual(result, [])
+        client.table.assert_not_called()
+
+    def test_nonempty_values_calls_client_and_returns_data(self):
+        client = MagicMock()
+        client.table.return_value.select.return_value.in_.return_value.execute.return_value.data = [
+            {'id': 1}
+        ]
+        result = _query_in(client, 'sessions', 'session_key', 'meeting_key', [101])
+        self.assertEqual(result, [{'id': 1}])
+        client.table.assert_called_once_with('sessions')
+
+    def test_none_data_returns_empty_list(self):
+        client = MagicMock()
+        client.table.return_value.select.return_value.in_.return_value.execute.return_value.data = None
+        result = _query_in(client, 'sessions', 'session_key', 'meeting_key', [1])
+        self.assertEqual(result, [])
+
+
+# ===========================================================================
+# ingest_championship_drivers — gap fields
+# ===========================================================================
+
+class TestIngestChampionshipDriversGaps(unittest.TestCase):
+
+    def _make_standing(self, session_key=1, driver_number=44, points_start=0,
+                       points_current=25, position_start=1, position_current=1):
+        return {
+            'session_key': session_key, 'driver_number': driver_number,
+            'points_start': points_start, 'points_current': points_current,
+            'position_start': position_start, 'position_current': position_current,
+        }
+
+    @patch('ingest.openf1.get_championship_drivers')
+    def test_leader_gap_to_leader_is_zero(self, mock_get):
+        """Championship leader should have points_gap_to_leader = 0."""
+        mock_get.return_value = [
+            self._make_standing(driver_number=1,  points_current=50),
+            self._make_standing(driver_number=44, points_current=30),
+        ]
+        client = _mock_client()
+        ingest_championship_drivers(client, 1)
+        rows = client.table.return_value.upsert.call_args.args[0]
+        leader = next(r for r in rows if r['driver_number'] == 1)
+        self.assertEqual(leader['points_gap_to_leader'], 0)
+
+    @patch('ingest.openf1.get_championship_drivers')
+    def test_non_leader_gap_to_leader(self, mock_get):
+        """Non-leader gap = leader_pts - driver_pts."""
+        mock_get.return_value = [
+            self._make_standing(driver_number=1,  points_current=50),
+            self._make_standing(driver_number=44, points_current=30),
+        ]
+        client = _mock_client()
+        ingest_championship_drivers(client, 1)
+        rows = client.table.return_value.upsert.call_args.args[0]
+        p2 = next(r for r in rows if r['driver_number'] == 44)
+        self.assertEqual(p2['points_gap_to_leader'], 20)
+
+    @patch('ingest.openf1.get_championship_drivers')
+    def test_p2_gap_to_p2_is_zero(self, mock_get):
+        """P2 driver has points_gap_to_p2 = 0."""
+        mock_get.return_value = [
+            self._make_standing(driver_number=1,  points_current=50),
+            self._make_standing(driver_number=44, points_current=30),
+        ]
+        client = _mock_client()
+        ingest_championship_drivers(client, 1)
+        rows = client.table.return_value.upsert.call_args.args[0]
+        p2 = next(r for r in rows if r['driver_number'] == 44)
+        self.assertEqual(p2['points_gap_to_p2'], 0)
+
+    @patch('ingest.openf1.get_championship_drivers')
+    def test_leader_gap_to_p2_is_negative(self, mock_get):
+        """Leader's points_gap_to_p2 = p2_pts - leader_pts (negative = ahead)."""
+        mock_get.return_value = [
+            self._make_standing(driver_number=1,  points_current=50),
+            self._make_standing(driver_number=44, points_current=30),
+        ]
+        client = _mock_client()
+        ingest_championship_drivers(client, 1)
+        rows = client.table.return_value.upsert.call_args.args[0]
+        leader = next(r for r in rows if r['driver_number'] == 1)
+        self.assertEqual(leader['points_gap_to_p2'], -20)
+
+    @patch('ingest.openf1.get_championship_drivers')
+    def test_gap_none_when_points_current_none(self, mock_get):
+        """Gaps are None when points_current is None."""
+        mock_get.return_value = [
+            self._make_standing(driver_number=1, points_current=None),
+        ]
+        client = _mock_client()
+        ingest_championship_drivers(client, 1)
+        rows = client.table.return_value.upsert.call_args.args[0]
+        self.assertIsNone(rows[0]['points_gap_to_leader'])
+        self.assertIsNone(rows[0]['points_gap_to_p2'])
+
+
+# ===========================================================================
+# ingest_championship_teams — gap fields
+# ===========================================================================
+
+class TestIngestChampionshipTeamsGaps(unittest.TestCase):
+
+    def _make_standing(self, session_key=1, team_name='Red Bull Racing',
+                       points_start=0, points_current=50):
+        return {
+            'session_key': session_key, 'team_name': team_name,
+            'points_start': points_start, 'points_current': points_current,
+            'position_start': 1, 'position_current': 1,
+        }
+
+    @patch('ingest.openf1.get_championship_teams')
+    def test_leader_gap_zero(self, mock_get):
+        mock_get.return_value = [
+            self._make_standing(team_name='Red Bull Racing', points_current=80),
+            self._make_standing(team_name='Ferrari',         points_current=60),
+        ]
+        client = _mock_client()
+        ingest_championship_teams(client, 1)
+        rows = client.table.return_value.upsert.call_args.args[0]
+        leader = next(r for r in rows if r['team_name'] == 'Red Bull Racing')
+        self.assertEqual(leader['points_gap_to_leader'], 0)
+
+    @patch('ingest.openf1.get_championship_teams')
+    def test_non_leader_gap(self, mock_get):
+        mock_get.return_value = [
+            self._make_standing(team_name='Red Bull Racing', points_current=80),
+            self._make_standing(team_name='Ferrari',         points_current=60),
+        ]
+        client = _mock_client()
+        ingest_championship_teams(client, 1)
+        rows = client.table.return_value.upsert.call_args.args[0]
+        ferrari = next(r for r in rows if r['team_name'] == 'Ferrari')
+        self.assertEqual(ferrari['points_gap_to_leader'], 20)
+
+
+# ===========================================================================
+# ingest_season_driver_stats
+# ===========================================================================
+
+class TestIngestSeasonDriverStats(unittest.TestCase):
+    """Unit tests for ingest_season_driver_stats using a multi-table mock."""
+
+    # ----- fixture builders --------------------------------------------------
+
+    def _meeting(self, key=101, date='2026-03-15'):
+        return {'meeting_key': key, 'date_start': date}
+
+    def _session(self, sk=1001, meeting_key=101, session_type='Race'):
+        return {'session_key': sk, 'meeting_key': meeting_key, 'session_type': session_type}
+
+    def _rr(self, sk=1001, dn=44, position=1, laps=57,
+            dnf=False, dns=False, dsq=False, fastest_lap=False):
+        return {
+            'session_key': sk, 'driver_number': dn, 'position': position,
+            'number_of_laps': laps, 'dnf': dnf, 'dns': dns, 'dsq': dsq,
+            'fastest_lap_flag': fastest_lap,
+        }
+
+    def _cd(self, sk=1001, dn=44, pts=25.0):
+        return {'session_key': sk, 'driver_number': dn, 'points_current': pts}
+
+    def _ct(self, sk=1001, team='Red Bull Racing', pts=43.0):
+        return {'session_key': sk, 'team_name': team, 'points_current': pts}
+
+    def _driver(self, sk=1001, dn=44, team='Red Bull Racing'):
+        return {'session_key': sk, 'driver_number': dn, 'team_name': team}
+
+    def _sg(self, sk=2001, dn=44, pos=1):
+        return {'session_key': sk, 'driver_number': dn, 'position': pos}
+
+    def _qr(self, sk=2001, dn=44, best_time=90.5):
+        return {'session_key': sk, 'driver_number': dn, 'best_lap_time': best_time}
+
+    def _ov(self, sk=1001, overtaking=44, overtaken=1):
+        return {'session_key': sk, 'driver_number_overtaking': overtaking,
+                'driver_number_overtaken': overtaken}
+
+    def _ps(self, sk=1001, dn=44):
+        return {'session_key': sk, 'driver_number': dn}
+
+    def _make_client(self, *, meetings, sessions, race_results,
+                     champ_drv=None, champ_teams=None, overtakes=None,
+                     pit_stops=None, starting_grid=None, qual_results=None,
+                     drivers=None):
+        """Build a mock client whose table responses match the supplied data."""
+        table_data = {
+            'races':                meetings,
+            'sessions':             sessions,
+            'race_results':         race_results,
+            'championship_drivers': champ_drv or [],
+            'championship_teams':   champ_teams or [],
+            'overtakes':            overtakes or [],
+            'pit_stops':            pit_stops or [],
+            'starting_grid':        starting_grid or [],
+            'qualifying_results':   qual_results or [],
+            'drivers':              drivers or [],
+        }
+        client = MagicMock()
+
+        def table_side(name):
+            data = table_data.get(name, [])
+            m = MagicMock()
+            # .select().eq()... or .select().in_()... both lead to .execute().data
+            m.select.return_value.eq.return_value.execute.return_value.data = data
+            m.select.return_value.in_.return_value.execute.return_value.data = data
+            m.upsert.return_value.execute.return_value = MagicMock()
+            return m
+
+        client.table.side_effect = table_side
+        return client
+
+    def _upserted(self, client):
+        """Return the rows passed to the season_driver_stats upsert call."""
+        for call in client.table.call_args_list:
+            if call.args[0] == 'season_driver_stats':
+                tbl = client.table('season_driver_stats')
+                return tbl.upsert.call_args.args[0]
+        return []
+
+    # ----- tests -------------------------------------------------------------
+
+    @patch('ingest.openf1.get_meetings', return_value=[])
+    def test_no_meetings_no_upsert(self, _):
+        client = self._make_client(meetings=[], sessions=[], race_results=[])
+        ingest_season_driver_stats(client, 2026)
+        # No upsert to season_driver_stats should occur
+        for c in client.table.call_args_list:
+            if c.args[0] == 'season_driver_stats':
+                tbl = client.table('season_driver_stats')
+                tbl.upsert.assert_not_called()
+
+    @patch('ingest.openf1.get_meetings')
+    def test_no_race_sessions_no_upsert(self, mock_get_meetings):
+        """Only qualifying sessions → no race data → early return."""
+        meetings = [self._meeting()]
+        mock_get_meetings.return_value = meetings
+        client = self._make_client(
+            meetings=meetings,
+            sessions=[self._session(sk=2001, session_type='Qualifying')],
+            race_results=[],
+        )
+        ingest_season_driver_stats(client, 2026)
+        for c in client.table.call_args_list:
+            if c.args[0] == 'season_driver_stats':
+                tbl = client.table('season_driver_stats')
+                tbl.upsert.assert_not_called()
+
+    def test_win_counted(self):
+        """A P1 finish should increment wins to 1."""
+        rows = self._run_and_capture(
+            meetings=[self._meeting()],
+            sessions=[self._session()],
+            race_results=[self._rr(dn=44, position=1)],
+            champ_drv=[self._cd(dn=44, pts=25.0)],
+            champ_teams=[self._ct()],
+            drivers=[self._driver(dn=44)],
+        )
+        self.assertEqual(rows[0]['wins'], 1)
+
+    def _run_and_capture(self, *, meetings, sessions, race_results,
+                         champ_drv=None, champ_teams=None, overtakes=None,
+                         pit_stops=None, starting_grid=None,
+                         qual_results=None, drivers=None):
+        """Run ingest_season_driver_stats and return the upserted rows."""
+        upserted: list[dict] = []
+
+        table_data = {
+            'races':                meetings,
+            'sessions':             sessions,
+            'race_results':         race_results,
+            'championship_drivers': champ_drv or [],
+            'championship_teams':   champ_teams or [],
+            'overtakes':            overtakes or [],
+            'pit_stops':            pit_stops or [],
+            'starting_grid':        starting_grid or [],
+            'qualifying_results':   qual_results or [],
+            'drivers':              drivers or [],
+            'season_driver_stats':  [],
+        }
+
+        def table_side(name):
+            data = table_data.get(name, [])
+            m = MagicMock()
+            m.select.return_value.eq.return_value.execute.return_value.data = data
+            m.select.return_value.in_.return_value.execute.return_value.data = data
+
+            def capture_upsert(rows, **kwargs):
+                if name == 'season_driver_stats':
+                    upserted.extend(rows)
+                return MagicMock()
+
+            m.upsert.side_effect = capture_upsert
+            m.upsert.return_value.execute.return_value = MagicMock()
+            return m
+
+        client = MagicMock()
+        client.table.side_effect = table_side
+        with patch('ingest.openf1.get_meetings', return_value=meetings):
+            ingest_season_driver_stats(client, 2026)
+        return upserted
+
+    def test_podium_counted(self):
+        rows = self._run_and_capture(
+            meetings=[self._meeting()],
+            sessions=[self._session()],
+            race_results=[self._rr(dn=44, position=3)],
+            champ_drv=[self._cd(dn=44, pts=15.0)],
+            drivers=[self._driver(dn=44)],
+        )
+        self.assertEqual(rows[0]['podiums'], 1)
+
+    def test_no_podium_for_p4(self):
+        rows = self._run_and_capture(
+            meetings=[self._meeting()],
+            sessions=[self._session()],
+            race_results=[self._rr(dn=44, position=4)],
+            champ_drv=[self._cd(dn=44, pts=12.0)],
+            drivers=[self._driver(dn=44)],
+        )
+        self.assertEqual(rows[0]['podiums'], 0)
+
+    def test_dnf_counted(self):
+        rows = self._run_and_capture(
+            meetings=[self._meeting()],
+            sessions=[self._session()],
+            race_results=[self._rr(dn=44, position=None, dnf=True)],
+            drivers=[self._driver(dn=44)],
+        )
+        self.assertEqual(rows[0]['dnf_count'], 1)
+        self.assertEqual(rows[0]['races_classified'], 0)
+
+    def test_dns_counted(self):
+        rows = self._run_and_capture(
+            meetings=[self._meeting()],
+            sessions=[self._session()],
+            race_results=[self._rr(dn=44, position=None, dns=True)],
+            drivers=[self._driver(dn=44)],
+        )
+        self.assertEqual(rows[0]['dns_count'], 1)
+
+    def test_fastest_lap_flag_counted(self):
+        rows = self._run_and_capture(
+            meetings=[self._meeting()],
+            sessions=[self._session()],
+            race_results=[self._rr(dn=44, position=2, fastest_lap=True)],
+            champ_drv=[self._cd(dn=44, pts=19.0)],
+            drivers=[self._driver(dn=44)],
+        )
+        self.assertEqual(rows[0]['fastest_laps'], 1)
+
+    def test_points_scored_from_championship_drivers(self):
+        rows = self._run_and_capture(
+            meetings=[self._meeting()],
+            sessions=[self._session()],
+            race_results=[self._rr(dn=44, position=1)],
+            champ_drv=[self._cd(dn=44, pts=75.0)],
+            drivers=[self._driver(dn=44)],
+        )
+        self.assertEqual(rows[0]['points_scored'], 75.0)
+
+    def test_pole_from_starting_grid(self):
+        rows = self._run_and_capture(
+            meetings=[self._meeting()],
+            sessions=[
+                self._session(sk=1001, session_type='Race'),
+                self._session(sk=2001, session_type='Qualifying'),
+            ],
+            race_results=[self._rr(sk=1001, dn=44, position=1)],
+            champ_drv=[self._cd(sk=1001, dn=44, pts=25.0)],
+            starting_grid=[self._sg(sk=2001, dn=44, pos=1)],
+            drivers=[
+                self._driver(sk=1001, dn=44),
+                self._driver(sk=2001, dn=44),
+            ],
+        )
+        self.assertEqual(rows[0]['poles'], 1)
+
+    def test_wins_over_teammate(self):
+        """Driver 44 (P1) beats teammate 1 (P2) → wins_over_teammate = 1."""
+        rows = self._run_and_capture(
+            meetings=[self._meeting()],
+            sessions=[self._session()],
+            race_results=[
+                self._rr(dn=44, position=1),
+                self._rr(dn=1,  position=2),
+            ],
+            champ_drv=[
+                self._cd(dn=44, pts=25.0),
+                self._cd(dn=1,  pts=18.0),
+            ],
+            drivers=[
+                self._driver(dn=44, team='Red Bull Racing'),
+                self._driver(dn=1,  team='Red Bull Racing'),
+            ],
+        )
+        d44 = next(r for r in rows if r['driver_number'] == 44)
+        self.assertEqual(d44['wins_over_teammate'], 1)
+
+    def test_no_wins_over_teammate_when_lost(self):
+        """Driver 44 (P2) does not get wins_over_teammate when teammate is P1."""
+        rows = self._run_and_capture(
+            meetings=[self._meeting()],
+            sessions=[self._session()],
+            race_results=[
+                self._rr(dn=44, position=2),
+                self._rr(dn=1,  position=1),
+            ],
+            champ_drv=[
+                self._cd(dn=44, pts=18.0),
+                self._cd(dn=1,  pts=25.0),
+            ],
+            drivers=[
+                self._driver(dn=44, team='Red Bull Racing'),
+                self._driver(dn=1,  team='Red Bull Racing'),
+            ],
+        )
+        d44 = next(r for r in rows if r['driver_number'] == 44)
+        self.assertEqual(d44['wins_over_teammate'], 0)
+
+    def test_overtakes_counted(self):
+        rows = self._run_and_capture(
+            meetings=[self._meeting()],
+            sessions=[self._session()],
+            race_results=[self._rr(dn=44, position=1)],
+            overtakes=[self._ov(overtaking=44, overtaken=1)],
+            drivers=[self._driver(dn=44)],
+        )
+        self.assertEqual(rows[0]['total_overtakes_made'], 1)
+        self.assertEqual(rows[0]['total_overtakes_suffered'], 0)
+
+    def test_pit_stops_counted(self):
+        rows = self._run_and_capture(
+            meetings=[self._meeting()],
+            sessions=[self._session()],
+            race_results=[self._rr(dn=44, position=1)],
+            pit_stops=[self._ps(dn=44), self._ps(dn=44)],
+            drivers=[self._driver(dn=44)],
+        )
+        self.assertEqual(rows[0]['total_pit_stops'], 2)
+
+    def test_cumulative_over_multiple_rounds(self):
+        """Stats accumulate correctly across two rounds."""
+        rows = self._run_and_capture(
+            meetings=[
+                self._meeting(key=101, date='2026-03-01'),
+                self._meeting(key=102, date='2026-03-15'),
+            ],
+            sessions=[
+                self._session(sk=1001, meeting_key=101, session_type='Race'),
+                self._session(sk=1002, meeting_key=102, session_type='Race'),
+            ],
+            race_results=[
+                self._rr(sk=1001, dn=44, position=1),
+                self._rr(sk=1002, dn=44, position=2),
+            ],
+            champ_drv=[
+                self._cd(sk=1001, dn=44, pts=25.0),
+                self._cd(sk=1002, dn=44, pts=43.0),
+            ],
+            drivers=[
+                self._driver(sk=1001, dn=44),
+                self._driver(sk=1002, dn=44),
+            ],
+        )
+        # Round 1: wins=1, races_entered=1
+        r1 = next(r for r in rows if r['round_number'] == 1)
+        r2 = next(r for r in rows if r['round_number'] == 2)
+        self.assertEqual(r1['wins'], 1)
+        self.assertEqual(r1['races_entered'], 1)
+        self.assertEqual(r2['wins'], 1)          # still 1 (no win in round 2)
+        self.assertEqual(r2['races_entered'], 2)  # cumulative
+        self.assertEqual(r2['podiums'], 2)        # P1+P2
+
+    def test_qualifying_supertime_gap_mean(self):
+        """qual gap = driver - teammate; mean computed over multiple rounds."""
+        rows = self._run_and_capture(
+            meetings=[
+                self._meeting(key=101, date='2026-03-01'),
+                self._meeting(key=102, date='2026-03-15'),
+            ],
+            sessions=[
+                self._session(sk=1001, meeting_key=101, session_type='Race'),
+                self._session(sk=2001, meeting_key=101, session_type='Qualifying'),
+                self._session(sk=1002, meeting_key=102, session_type='Race'),
+                self._session(sk=2002, meeting_key=102, session_type='Qualifying'),
+            ],
+            race_results=[
+                self._rr(sk=1001, dn=44, position=1),
+                self._rr(sk=1002, dn=44, position=1),
+            ],
+            champ_drv=[
+                self._cd(sk=1001, dn=44, pts=25.0),
+                self._cd(sk=1002, dn=44, pts=50.0),
+            ],
+            qual_results=[
+                self._qr(sk=2001, dn=44, best_time=90.0),
+                self._qr(sk=2001, dn=1,  best_time=91.0),   # gap = -1.0
+                self._qr(sk=2002, dn=44, best_time=90.5),
+                self._qr(sk=2002, dn=1,  best_time=90.0),   # gap = +0.5
+            ],
+            drivers=[
+                self._driver(sk=1001, dn=44, team='Red Bull Racing'),
+                self._driver(sk=1001, dn=1,  team='Red Bull Racing'),
+                self._driver(sk=1002, dn=44, team='Red Bull Racing'),
+                self._driver(sk=1002, dn=1,  team='Red Bull Racing'),
+                self._driver(sk=2001, dn=44, team='Red Bull Racing'),
+                self._driver(sk=2001, dn=1,  team='Red Bull Racing'),
+                self._driver(sk=2002, dn=44, team='Red Bull Racing'),
+                self._driver(sk=2002, dn=1,  team='Red Bull Racing'),
+            ],
+        )
+        r1 = next(r for r in rows if r['round_number'] == 1 and r['driver_number'] == 44)
+        r2 = next(r for r in rows if r['round_number'] == 2 and r['driver_number'] == 44)
+        self.assertAlmostEqual(r1['qualifying_supertime_gap_s'], -1.0)
+        self.assertAlmostEqual(r2['qualifying_supertime_gap_s'], (-1.0 + 0.5) / 2)
+
+    def test_row_has_required_keys(self):
+        rows = self._run_and_capture(
+            meetings=[self._meeting()],
+            sessions=[self._session()],
+            race_results=[self._rr(dn=44, position=1)],
+            drivers=[self._driver(dn=44)],
+        )
+        self.assertIn('year', rows[0])
+        self.assertIn('round_number', rows[0])
+        self.assertIn('driver_number', rows[0])
+        self.assertEqual(rows[0]['year'], 2026)
+        self.assertEqual(rows[0]['round_number'], 1)
+
+
+# ===========================================================================
+# ingest_season_constructor_stats
+# ===========================================================================
+
+class TestIngestSeasonConstructorStats(unittest.TestCase):
+
+    def _meeting(self, key=101, date='2026-03-15'):
+        return {'meeting_key': key, 'date_start': date}
+
+    def _session(self, sk=1001, meeting_key=101, session_type='Race'):
+        return {'session_key': sk, 'meeting_key': meeting_key, 'session_type': session_type}
+
+    def _rr(self, sk=1001, dn=44, position=1, laps=57, dnf=False, dns=False,
+            dsq=False, fastest_lap=False):
+        return {
+            'session_key': sk, 'driver_number': dn, 'position': position,
+            'number_of_laps': laps, 'dnf': dnf, 'dns': dns, 'dsq': dsq,
+            'fastest_lap_flag': fastest_lap,
+        }
+
+    def _ct(self, sk=1001, team='Red Bull Racing', pts=43.0):
+        return {'session_key': sk, 'team_name': team, 'points_current': pts}
+
+    def _driver(self, sk=1001, dn=44, team='Red Bull Racing'):
+        return {'session_key': sk, 'driver_number': dn, 'team_name': team}
+
+    def _sg(self, sk=2001, dn=44, pos=1):
+        return {'session_key': sk, 'driver_number': dn, 'position': pos}
+
+    def _ps(self, sk=1001, dn=44):
+        return {'session_key': sk, 'driver_number': dn}
+
+    def _run_and_capture(self, *, meetings, sessions, race_results,
+                         champ_teams=None, pit_stops=None, starting_grid=None,
+                         drivers=None):
+        upserted: list[dict] = []
+        table_data = {
+            'races':                    meetings,
+            'sessions':                 sessions,
+            'race_results':             race_results,
+            'championship_teams':       champ_teams or [],
+            'pit_stops':                pit_stops or [],
+            'starting_grid':            starting_grid or [],
+            'drivers':                  drivers or [],
+            'season_constructor_stats': [],
+        }
+
+        def table_side(name):
+            data = table_data.get(name, [])
+            m = MagicMock()
+            m.select.return_value.eq.return_value.execute.return_value.data = data
+            m.select.return_value.in_.return_value.execute.return_value.data = data
+
+            def capture(rows, **kwargs):
+                if name == 'season_constructor_stats':
+                    upserted.extend(rows)
+                return MagicMock()
+
+            m.upsert.side_effect = capture
+            m.upsert.return_value.execute.return_value = MagicMock()
+            return m
+
+        client = MagicMock()
+        client.table.side_effect = table_side
+        with patch('ingest.openf1.get_meetings', return_value=meetings):
+            ingest_season_constructor_stats(client, 2026)
+        return upserted
+
+    def test_team_win_counted(self):
+        rows = self._run_and_capture(
+            meetings=[self._meeting()],
+            sessions=[self._session()],
+            race_results=[self._rr(dn=44, position=1)],
+            champ_teams=[self._ct()],
+            drivers=[self._driver(dn=44, team='Red Bull Racing')],
+        )
+        rbr = next(r for r in rows if r['team_name'] == 'Red Bull Racing')
+        self.assertEqual(rbr['wins'], 1)
+
+    def test_team_podium_counted(self):
+        rows = self._run_and_capture(
+            meetings=[self._meeting()],
+            sessions=[self._session()],
+            race_results=[
+                self._rr(dn=44, position=1),
+                self._rr(dn=11, position=3),
+            ],
+            drivers=[
+                self._driver(dn=44, team='Red Bull Racing'),
+                self._driver(dn=11, team='Red Bull Racing'),
+            ],
+        )
+        rbr = next(r for r in rows if r['team_name'] == 'Red Bull Racing')
+        self.assertEqual(rbr['podiums'], 2)
+
+    def test_team_dnf_counted(self):
+        rows = self._run_and_capture(
+            meetings=[self._meeting()],
+            sessions=[self._session()],
+            race_results=[self._rr(dn=44, position=None, dnf=True)],
+            drivers=[self._driver(dn=44, team='Red Bull Racing')],
+        )
+        rbr = next(r for r in rows if r['team_name'] == 'Red Bull Racing')
+        self.assertEqual(rbr['dnf_count'], 1)
+
+    def test_team_points_from_championship_teams(self):
+        rows = self._run_and_capture(
+            meetings=[self._meeting()],
+            sessions=[self._session()],
+            race_results=[self._rr(dn=44, position=1)],
+            champ_teams=[self._ct(team='Red Bull Racing', pts=43.0)],
+            drivers=[self._driver(dn=44, team='Red Bull Racing')],
+        )
+        rbr = next(r for r in rows if r['team_name'] == 'Red Bull Racing')
+        self.assertEqual(rbr['points_scored'], 43.0)
+
+    def test_team_pole_from_starting_grid(self):
+        rows = self._run_and_capture(
+            meetings=[self._meeting()],
+            sessions=[
+                self._session(sk=1001, session_type='Race'),
+                self._session(sk=2001, session_type='Qualifying'),
+            ],
+            race_results=[self._rr(sk=1001, dn=44, position=2)],
+            starting_grid=[self._sg(sk=2001, dn=44, pos=1)],
+            drivers=[
+                self._driver(sk=1001, dn=44, team='Red Bull Racing'),
+                self._driver(sk=2001, dn=44, team='Red Bull Racing'),
+            ],
+        )
+        rbr = next(r for r in rows if r['team_name'] == 'Red Bull Racing')
+        self.assertEqual(rbr['poles'], 1)
+
+    def test_pit_stops_counted(self):
+        rows = self._run_and_capture(
+            meetings=[self._meeting()],
+            sessions=[self._session()],
+            race_results=[self._rr(dn=44, position=1)],
+            pit_stops=[self._ps(dn=44), self._ps(dn=44)],
+            drivers=[self._driver(dn=44, team='Red Bull Racing')],
+        )
+        rbr = next(r for r in rows if r['team_name'] == 'Red Bull Racing')
+        self.assertEqual(rbr['total_pit_stops'], 2)
+
+    def test_multi_round_accumulation(self):
+        rows = self._run_and_capture(
+            meetings=[
+                self._meeting(key=101, date='2026-03-01'),
+                self._meeting(key=102, date='2026-03-15'),
+            ],
+            sessions=[
+                self._session(sk=1001, meeting_key=101, session_type='Race'),
+                self._session(sk=1002, meeting_key=102, session_type='Race'),
+            ],
+            race_results=[
+                self._rr(sk=1001, dn=44, position=1),
+                self._rr(sk=1002, dn=44, position=2),
+            ],
+            champ_teams=[
+                self._ct(sk=1001, pts=25.0),
+                self._ct(sk=1002, pts=43.0),
+            ],
+            drivers=[
+                self._driver(sk=1001, dn=44, team='Red Bull Racing'),
+                self._driver(sk=1002, dn=44, team='Red Bull Racing'),
+            ],
+        )
+        r1 = next(r for r in rows if r['round_number'] == 1)
+        r2 = next(r for r in rows if r['round_number'] == 2)
+        self.assertEqual(r1['wins'], 1)
+        self.assertEqual(r2['wins'], 1)         # P2 not a win
+        self.assertEqual(r2['podiums'], 2)       # cumulative
+        self.assertEqual(r2['points_scored'], 43.0)
+
+    def test_row_has_required_keys(self):
+        rows = self._run_and_capture(
+            meetings=[self._meeting()],
+            sessions=[self._session()],
+            race_results=[self._rr(dn=44, position=1)],
+            drivers=[self._driver(dn=44)],
+        )
+        self.assertIn('year', rows[0])
+        self.assertIn('round_number', rows[0])
+        self.assertIn('team_name', rows[0])
+        self.assertEqual(rows[0]['year'], 2026)
 
 
 if __name__ == "__main__":

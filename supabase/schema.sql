@@ -560,3 +560,102 @@ ALTER TABLE qualifying_results ADD COLUMN IF NOT EXISTS q3_peak_decel_g_abs  num
 ALTER TABLE weather ADD COLUMN IF NOT EXISTS wind_speed       numeric;    -- m/s
 ALTER TABLE weather ADD COLUMN IF NOT EXISTS wind_direction   integer;    -- degrees 0–359
 ALTER TABLE weather ADD COLUMN IF NOT EXISTS pressure         numeric;    -- mbar
+
+-- ---------------------------------------------------------------------------
+-- championship gap fields (Phase 5 season stats, 2026-03-31)
+-- ---------------------------------------------------------------------------
+ALTER TABLE championship_drivers ADD COLUMN IF NOT EXISTS points_gap_to_leader numeric;
+ALTER TABLE championship_drivers ADD COLUMN IF NOT EXISTS points_gap_to_p2     numeric;
+ALTER TABLE championship_teams   ADD COLUMN IF NOT EXISTS points_gap_to_leader numeric;
+ALTER TABLE championship_teams   ADD COLUMN IF NOT EXISTS points_gap_to_p2     numeric;
+
+-- ---------------------------------------------------------------------------
+-- season_driver_stats  (cumulative per-driver stats per round — Phase 5)
+-- ---------------------------------------------------------------------------
+create table if not exists season_driver_stats (
+    year                        integer not null,
+    round_number                integer not null,
+    driver_number               integer not null,
+    -- Participation
+    races_entered               integer,
+    race_entries                integer,
+    sprint_entries              integer,
+    races_classified            integer,
+    -- DNF/DNS/DSQ (combined + split)
+    dnf_count                   integer,
+    dns_count                   integer,
+    dsq_count                   integer,
+    race_dnf_count              integer,
+    race_dns_count              integer,
+    race_dsq_count              integer,
+    sprint_dnf_count            integer,
+    sprint_dns_count            integer,
+    sprint_dsq_count            integer,
+    laps_completed              integer,
+    -- Achievements (combined + split)
+    wins                        integer,
+    race_wins                   integer,
+    sprint_wins                 integer,
+    podiums                     integer,
+    race_podiums                integer,
+    sprint_podiums              integer,
+    poles                       integer,
+    race_poles                  integer,
+    sprint_poles                integer,
+    fastest_laps                integer,
+    -- Points
+    points_scored               numeric,    -- cumulative championship points (from API)
+    race_points                 numeric,    -- points scored in race sessions only (ingested rounds)
+    sprint_points               numeric,    -- points scored in sprint sessions only (ingested rounds)
+    -- Teammate comparisons
+    wins_over_teammate          integer,
+    qualifying_supertime_gap_s  numeric,    -- running mean of driver - teammate best Q time (s)
+    percent_of_team_points      numeric,    -- driver pts / team total pts × 100
+    -- Action
+    total_overtakes_made        integer,
+    total_overtakes_suffered    integer,
+    total_pit_stops             integer,
+    primary key (year, round_number, driver_number)
+);
+
+alter table season_driver_stats enable row level security;
+create policy "anon read" on season_driver_stats for select to anon using (true);
+
+
+-- ---------------------------------------------------------------------------
+-- season_constructor_stats  (cumulative per-constructor stats per round — Phase 5)
+-- ---------------------------------------------------------------------------
+create table if not exists season_constructor_stats (
+    year            integer not null,
+    round_number    integer not null,
+    team_name       text    not null,
+    -- Points
+    points_scored   numeric,    -- cumulative championship points (from API)
+    race_points     numeric,
+    sprint_points   numeric,
+    total_points    numeric,    -- race_points + sprint_points
+    -- Achievements (combined + split)
+    wins            integer,
+    race_wins       integer,
+    sprint_wins     integer,
+    podiums         integer,
+    race_podiums    integer,
+    sprint_podiums  integer,
+    poles           integer,
+    race_poles      integer,
+    sprint_poles    integer,
+    fastest_laps    integer,
+    -- Participation
+    races_entered   integer,
+    race_entries    integer,
+    sprint_entries  integer,
+    dnf_count       integer,
+    race_dnf_count  integer,
+    sprint_dnf_count integer,
+    laps_completed  integer,
+    total_pit_stops integer,
+    primary key (year, round_number, team_name)
+);
+
+alter table season_constructor_stats enable row level security;
+create policy "anon read" on season_constructor_stats for select to anon using (true);
