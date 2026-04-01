@@ -311,7 +311,7 @@ function RaceLapTable({ laps, stints, pitStops, selectedLapNums, onLapToggle, la
   )
 }
 
-function GapChart({ intervals, teamColour }) {
+function GapChart({ intervals, teamColour, isMobile }) {
   if (!intervals || intervals.length === 0) return null
 
   // Exclude lapped cars and points where gap is 0 (driver is leading — those
@@ -348,8 +348,8 @@ function GapChart({ intervals, teamColour }) {
           tickfont: { size: 10, color: '#a1a1aa' },
           rangemode: 'tozero',
         },
-        margin: { l: 60, r: 20, t: 20, b: 45 },
-        height: 280,
+        margin: isMobile ? { l: 45, r: 10, t: 15, b: 35 } : { l: 60, r: 20, t: 20, b: 45 },
+        height: isMobile ? 220 : 280,
         paper_bgcolor: '#18181b',
         plot_bgcolor: '#18181b',
         font: { color: '#fafafa', family: 'monospace' },
@@ -360,7 +360,7 @@ function GapChart({ intervals, teamColour }) {
   )
 }
 
-function PositionChart({ positions, teamColour }) {
+function PositionChart({ positions, teamColour, isMobile }) {
   if (!positions || positions.length === 0) return null
 
   const colour = teamColour ?? '#e10600'
@@ -391,8 +391,8 @@ function PositionChart({ positions, teamColour }) {
           tickfont: { size: 10, color: '#a1a1aa' },
           dtick: 2,
         },
-        margin: { l: 50, r: 20, t: 20, b: 45 },
-        height: 280,
+        margin: isMobile ? { l: 35, r: 10, t: 15, b: 35 } : { l: 50, r: 20, t: 20, b: 45 },
+        height: isMobile ? 220 : 280,
         paper_bgcolor: '#18181b',
         plot_bgcolor: '#18181b',
         font: { color: '#fafafa', family: 'monospace' },
@@ -403,7 +403,7 @@ function PositionChart({ positions, teamColour }) {
   )
 }
 
-function LapDetailPanel({ sessionKey, driverNumber, selectedLapNums, laps, lapColourMap, onClear }) {
+function LapDetailPanel({ sessionKey, driverNumber, selectedLapNums, laps, lapColourMap, onClear, isMobile }) {
   const selectedLaps = useMemo(
     () => selectedLapNums
       .map(n => laps.find(l => l.lap_number === n))
@@ -459,12 +459,12 @@ function LapDetailPanel({ sessionKey, driverNumber, selectedLapNums, laps, lapCo
         {/* Track map only shown for a single selected lap — multi-lap XY overlay adds no value */}
         <div style={{ display: 'flex', gap: '1rem', flexWrap: 'wrap' }}>
           {selectedLapNums.length === 1 && (
-            <div style={{ flex: '0 0 360px', minWidth: '280px' }}>
-              <TrackMapPlot data={telemetryData} lapColours={lapColours} height={360} />
+            <div style={{ flex: isMobile ? '1 1 100%' : '0 0 360px', minWidth: isMobile ? '0' : '280px' }}>
+              <TrackMapPlot data={telemetryData} lapColours={lapColours} height={isMobile ? 240 : 360} />
             </div>
           )}
           <div style={{ flex: '1 1 320px', minWidth: '280px' }}>
-            <TelemetryChart data={telemetryData} lapColours={lapColours} height={selectedLapNums.length === 1 ? 740 : 820} />
+            <TelemetryChart data={telemetryData} lapColours={lapColours} height={isMobile ? 500 : (selectedLapNums.length === 1 ? 740 : 820)} />
           </div>
         </div>
       </div>
@@ -472,7 +472,7 @@ function LapDetailPanel({ sessionKey, driverNumber, selectedLapNums, laps, lapCo
   )
 }
 
-function RaceSubTab({ raceSessionKey, driverNumber }) {
+function RaceSubTab({ raceSessionKey, driverNumber, isMobile }) {
   const { data, loading } = useDriverRaceData(raceSessionKey, driverNumber)
   const { safetyCarPeriods } = useRaceControl(raceSessionKey)
   const [selectedLapNums, setSelectedLapNums] = useState([])
@@ -517,6 +517,7 @@ function RaceSubTab({ raceSessionKey, driverNumber }) {
             pitStops={pitStops}
             safetyCarPeriods={safetyCarPeriods}
             mode="bars"
+            isMobile={isMobile}
           />
         </div>
       </div>
@@ -526,7 +527,7 @@ function RaceSubTab({ raceSessionKey, driverNumber }) {
           <div style={{ marginBottom: '2rem' }}>
             <h3 style={sectionHeading}>Race Position</h3>
             <div style={{ background: THEME.surface, borderRadius: '8px', border: `1px solid ${THEME.border}`, padding: '0.5rem' }}>
-              <PositionChart positions={positions} teamColour={teamColour} />
+              <PositionChart positions={positions} teamColour={teamColour} isMobile={isMobile} />
             </div>
           </div>
         </LazySection>
@@ -537,7 +538,7 @@ function RaceSubTab({ raceSessionKey, driverNumber }) {
           <div style={{ marginBottom: '2rem' }}>
             <h3 style={sectionHeading}>Gap to Leader</h3>
             <div style={{ background: THEME.surface, borderRadius: '8px', border: `1px solid ${THEME.border}`, padding: '0.5rem' }}>
-              <GapChart intervals={intervals} teamColour={teamColour} />
+              <GapChart intervals={intervals} teamColour={teamColour} isMobile={isMobile} />
             </div>
           </div>
         </LazySection>
@@ -565,6 +566,7 @@ function RaceSubTab({ raceSessionKey, driverNumber }) {
           laps={laps}
           lapColourMap={lapColourMap}
           onClear={() => setSelectedLapNums([])}
+          isMobile={isMobile}
         />
       )}
     </div>
@@ -719,7 +721,7 @@ function QualLapTable({ laps, stints, phaseEvents, selectedLapNums, onLapToggle,
   )
 }
 
-function QualSubTab({ qualifyingSessionKey, driverNumber }) {
+function QualSubTab({ qualifyingSessionKey, driverNumber, isMobile }) {
   const { data, loading } = useDriverQualifyingData(qualifyingSessionKey, driverNumber)
   const [selectedLapNums, setSelectedLapNums] = useState([])
 
@@ -757,7 +759,7 @@ function QualSubTab({ qualifyingSessionKey, driverNumber }) {
       <div style={{ marginBottom: '2rem' }}>
         <h3 style={sectionHeading}>Lap Times</h3>
         <div style={{ background: THEME.surface, borderRadius: '8px', border: `1px solid ${THEME.border}`, padding: '0.5rem' }}>
-          <LapTimesChart laps={timedLaps} stints={stints} mode="bars" phaseEvents={phaseEvents} />
+          <LapTimesChart laps={timedLaps} stints={stints} mode="bars" phaseEvents={phaseEvents} isMobile={isMobile} />
         </div>
       </div>
 
@@ -783,6 +785,7 @@ function QualSubTab({ qualifyingSessionKey, driverNumber }) {
           laps={laps}
           lapColourMap={lapColourMap}
           onClear={() => setSelectedLapNums([])}
+          isMobile={isMobile}
         />
       )}
     </div>
@@ -793,7 +796,7 @@ function QualSubTab({ qualifyingSessionKey, driverNumber }) {
 // Main DriverPage component
 // ---------------------------------------------------------------------------
 
-export default function DriverPage({ raceSessionKey, qualifyingSessionKey, gmtOffset }) {
+export default function DriverPage({ raceSessionKey, qualifyingSessionKey, gmtOffset, isMobile }) {
   const [drivers, setDrivers] = useState([])
   const [selectedDriverNumber, setSelectedDriverNumber] = useState(null)
   const [activeSubTab, setActiveSubTab] = useState('Race')
@@ -842,7 +845,7 @@ export default function DriverPage({ raceSessionKey, qualifyingSessionKey, gmtOf
     border: `1px solid ${THEME.border}`,
     borderRadius: '6px',
     padding: '0.3rem 0.5rem',
-    fontSize: '0.875rem',
+    fontSize: isMobile ? '16px' : '0.875rem',
     cursor: 'pointer',
     outline: 'none',
     fontFamily: 'monospace',
@@ -904,13 +907,13 @@ export default function DriverPage({ raceSessionKey, qualifyingSessionKey, gmtOf
       {selectedDriverNumber != null && (
         <>
           {activeSubTab === 'Race' && raceSessionKey && (
-            <RaceSubTab key={selectedDriverNumber} raceSessionKey={raceSessionKey} driverNumber={selectedDriverNumber} />
+            <RaceSubTab key={selectedDriverNumber} raceSessionKey={raceSessionKey} driverNumber={selectedDriverNumber} isMobile={isMobile} />
           )}
           {activeSubTab === 'Race' && !raceSessionKey && (
             <p style={{ color: THEME.muted }}>No race session for this weekend.</p>
           )}
           {activeSubTab === 'Qualifying' && qualifyingSessionKey && (
-            <QualSubTab key={selectedDriverNumber} qualifyingSessionKey={qualifyingSessionKey} driverNumber={selectedDriverNumber} />
+            <QualSubTab key={selectedDriverNumber} qualifyingSessionKey={qualifyingSessionKey} driverNumber={selectedDriverNumber} isMobile={isMobile} />
           )}
           {activeSubTab === 'Qualifying' && !qualifyingSessionKey && (
             <p style={{ color: THEME.muted }}>No qualifying session for this weekend.</p>

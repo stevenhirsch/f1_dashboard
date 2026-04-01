@@ -1,4 +1,4 @@
-import Plot from 'react-plotly.js'
+import Plot from '../components/ResponsivePlot'
 import { useWeather } from '../hooks/useWeather'
 
 function shiftToLocal(isoString, gmtOffset) {
@@ -21,7 +21,7 @@ function formatOffsetLabel(gmtOffset) {
   return `UTC${sign}${match[2]}:${match[3]}`
 }
 
-export default function WeatherStrip({ sessionKey, gmtOffset, weatherData: propData }) {
+export default function WeatherStrip({ sessionKey, gmtOffset, weatherData: propData, isMobile }) {
   const { data: fetchedData, loading } = useWeather(propData != null ? null : sessionKey)
   const data = propData ?? fetchedData
   const loading_ = propData != null ? false : loading
@@ -88,46 +88,59 @@ export default function WeatherStrip({ sessionKey, gmtOffset, weatherData: propD
 
   return (
     <div>
-      <div style={{ display: 'flex', gap: '2rem', padding: '0.75rem 1rem 0.5rem' }}>
+      <div style={{ display: 'flex', gap: isMobile ? '1rem' : '2rem', padding: isMobile ? '0.5rem 0.75rem 0.25rem' : '0.75rem 1rem 0.5rem' }}>
         <div style={statStyle}>
-          <span style={statLabel}>Avg Air Temp</span>
-          <span style={{ ...statValue, color: '#60a5fa' }}>{avgAir}°C</span>
+          <span style={{ ...statLabel, fontSize: isMobile ? '0.65rem' : '0.7rem' }}>Avg Air Temp</span>
+          <span style={{ ...statValue, color: '#60a5fa', fontSize: isMobile ? '0.9rem' : '1rem' }}>{avgAir}°C</span>
         </div>
         <div style={statStyle}>
-          <span style={statLabel}>Avg Track Temp</span>
-          <span style={{ ...statValue, color: '#e10600' }}>{avgTrack}°C</span>
+          <span style={{ ...statLabel, fontSize: isMobile ? '0.65rem' : '0.7rem' }}>Avg Track Temp</span>
+          <span style={{ ...statValue, color: '#e10600', fontSize: isMobile ? '0.9rem' : '1rem' }}>{avgTrack}°C</span>
         </div>
         <div style={statStyle}>
-          <span style={statLabel}>Total Rainfall</span>
-          <span style={statValue}>{totalRain} mm</span>
+          <span style={{ ...statLabel, fontSize: isMobile ? '0.65rem' : '0.7rem' }}>Total Rainfall</span>
+          <span style={{ ...statValue, fontSize: isMobile ? '0.9rem' : '1rem' }}>{totalRain} mm</span>
         </div>
       </div>
     <Plot
       data={traces}
       layout={{
-        xaxis: { title: { text: `Time (${formatOffsetLabel(gmtOffset)})`, font: { color: '#a1a1aa' } }, type: 'date', fixedrange: true, ...axisBase },
+        xaxis: {
+          title: { text: `Time (${formatOffsetLabel(gmtOffset)})`, font: { color: '#a1a1aa', size: isMobile ? 9 : 12 } },
+          type: 'date',
+          fixedrange: true,
+          tickfont: { size: isMobile ? 8 : 11 },
+          ...axisBase,
+        },
         yaxis: {
-          title: { text: 'Temperature (°C)', font: { color: '#e10600' } },
+          title: { text: isMobile ? 'Temp (°C)' : 'Temperature (°C)', font: { color: '#e10600', size: isMobile ? 9 : 12 } },
           side: 'left',
           rangemode: 'tozero',
           fixedrange: true,
-          tickfont: { color: '#a1a1aa' },
+          tickfont: { color: '#a1a1aa', size: isMobile ? 8 : 11 },
           ...axisBase,
         },
         yaxis2: {
-          title: { text: 'Rainfall (mm)', font: { color: '#60a5fa' } },
+          title: { text: 'Rain (mm)', font: { color: '#60a5fa', size: isMobile ? 9 : 12 } },
           side: 'right',
           overlaying: 'y',
           showgrid: false,
           range: [0, maxRain * 1.3],
           rangemode: 'tozero',
           fixedrange: true,
-          tickfont: { color: '#60a5fa' },
+          tickfont: { color: '#60a5fa', size: isMobile ? 8 : 11 },
           linecolor: 'rgba(255,255,255,0.1)',
         },
-        legend: { orientation: 'h', y: -0.25, font: { color: '#fafafa' }, bgcolor: 'rgba(0,0,0,0)' },
-        margin: { l: 60, r: 70, t: 20, b: 80 },
-        height: 300,
+        legend: {
+          orientation: 'h',
+          y: -0.25,
+          font: { color: '#fafafa', size: isMobile ? 9 : 12 },
+          bgcolor: 'rgba(0,0,0,0)',
+        },
+        margin: isMobile
+          ? { l: 45, r: 50, t: 15, b: 65 }
+          : { l: 60, r: 70, t: 20, b: 80 },
+        height: isMobile ? 240 : 300,
         paper_bgcolor: '#18181b',
         plot_bgcolor: '#18181b',
         font: { color: '#fafafa' },

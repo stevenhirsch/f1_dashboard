@@ -1,4 +1,4 @@
-import Plot from 'react-plotly.js'
+import Plot from '../components/ResponsivePlot'
 import { compoundColour } from '../utils/compounds'
 import { assignPhases } from '../utils/qualifying'
 
@@ -44,7 +44,7 @@ function makeStripMarker(colour, isFresh) {
   }
 }
 
-function SectorBarChart({ laps, stints, pitStops, safetyCarPeriods, phaseEvents, height }) {
+function SectorBarChart({ laps, stints, pitStops, safetyCarPeriods, phaseEvents, height, isMobile }) {
   if (!laps || laps.length === 0) return <p style={{ color: '#a1a1aa' }}>No lap data.</p>
 
   const validLaps = laps.filter(l => l.lap_duration && l.lap_duration > 0)
@@ -326,13 +326,15 @@ function SectorBarChart({ laps, stints, pitStops, safetyCarPeriods, phaseEvents,
           y: -0.08, x: 0.5,
           xanchor: 'center',
           yanchor: 'top',
-          font: { size: 10, color: '#a1a1aa' },
+          font: { size: isMobile ? 9 : 10, color: '#a1a1aa' },
           bgcolor: 'transparent',
-          entrywidth: 90,
+          entrywidth: isMobile ? 70 : 90,
         },
         shapes,
         annotations,
-        margin: { l: 55, r: 20, t: 40, b: 50 },
+        margin: isMobile
+          ? { l: 45, r: 10, t: 30, b: 40 }
+          : { l: 55, r: 20, t: 40, b: 50 },
         height,
         paper_bgcolor: '#18181b',
         plot_bgcolor: '#18181b',
@@ -348,7 +350,7 @@ function SectorBarChart({ laps, stints, pitStops, safetyCarPeriods, phaseEvents,
 // Scatter chart (qualifying mode)
 // ---------------------------------------------------------------------------
 
-function ScatterChart({ laps, stints, phaseEvents, height }) {
+function ScatterChart({ laps, stints, phaseEvents, height, isMobile }) {
   if (!laps || laps.length === 0) return <p style={{ color: '#a1a1aa' }}>No lap data.</p>
 
   function getCompound(lapNumber) {
@@ -432,12 +434,14 @@ function ScatterChart({ laps, stints, phaseEvents, height }) {
         legend: {
           orientation: 'h',
           y: 1.08, x: 0,
-          font: { size: 10, color: '#a1a1aa' },
+          font: { size: isMobile ? 9 : 10, color: '#a1a1aa' },
           bgcolor: 'transparent',
         },
         shapes,
         annotations,
-        margin: { l: 55, r: 20, t: 30, b: 45 },
+        margin: isMobile
+          ? { l: 45, r: 10, t: 25, b: 35 }
+          : { l: 55, r: 20, t: 30, b: 45 },
         height,
         paper_bgcolor: '#18181b',
         plot_bgcolor: '#18181b',
@@ -472,10 +476,13 @@ export default function LapTimesChart({
   safetyCarPeriods,
   phaseEvents,
   mode = 'bars',
-  height = 340,
+  height,
+  isMobile,
 }) {
+  const defaultHeight = isMobile ? 280 : 340
+  const resolvedHeight = height ?? defaultHeight
   if (mode === 'scatter') {
-    return <ScatterChart laps={laps} stints={stints} phaseEvents={phaseEvents} height={height} />
+    return <ScatterChart laps={laps} stints={stints} phaseEvents={phaseEvents} height={resolvedHeight} isMobile={isMobile} />
   }
   return (
     <SectorBarChart
@@ -484,7 +491,8 @@ export default function LapTimesChart({
       pitStops={pitStops}
       safetyCarPeriods={safetyCarPeriods}
       phaseEvents={phaseEvents}
-      height={height}
+      height={resolvedHeight}
+      isMobile={isMobile}
     />
   )
 }

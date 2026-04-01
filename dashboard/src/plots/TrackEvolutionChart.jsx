@@ -1,4 +1,4 @@
-import Plot from 'react-plotly.js'
+import Plot from '../components/ResponsivePlot'
 import { assignPhases } from '../utils/qualifying'
 
 export default function TrackEvolutionChart({ laps, phaseEvents, driverMap }) {

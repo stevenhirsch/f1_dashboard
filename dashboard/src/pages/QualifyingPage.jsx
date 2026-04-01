@@ -274,7 +274,7 @@ function PhaseStintTable({ driverRows, driverMap, driverPhaseMap, activePhase, t
   )
 }
 
-function PhaseTabView({ laps, phaseEvents, stintsByDriver, driverMap, weatherData, gmtOffset, driverPhaseMap }) {
+function PhaseTabView({ laps, phaseEvents, stintsByDriver, driverMap, weatherData, gmtOffset, driverPhaseMap, isMobile }) {
   const phasedLaps = assignPhases(laps ?? [], phaseEvents ?? [])
   const phaseSet = new Set(phasedLaps.map(l => l._phase).filter(Boolean))
   const availablePhases = ['Q1', 'Q2', 'Q3'].filter(p => phaseSet.has(p))
@@ -356,25 +356,25 @@ function PhaseTabView({ laps, phaseEvents, stintsByDriver, driverMap, weatherDat
       </div>
 
       <div style={{ ...surfaceStyle, overflow: 'hidden', marginBottom: '1.5rem' }}>
-        <WeatherStrip gmtOffset={gmtOffset} weatherData={phaseWeather} />
+        <WeatherStrip gmtOffset={gmtOffset} weatherData={phaseWeather} isMobile={isMobile} />
       </div>
 
       <p style={{ color: THEME.muted, fontSize: '0.78rem', marginBottom: '0.5rem', marginTop: 0 }}>
         Best sector time per driver in {activePhase}. Color = time lost vs. fastest sector (green = matched fastest, red = slower).
       </p>
       <div style={{ ...surfaceStyle, padding: '0.5rem' }}>
-        <SectorDeltaHeatmap deltas={phaseDeltas} />
+        <SectorDeltaHeatmap deltas={phaseDeltas} isMobile={isMobile} />
       </div>
     </div>
   )
 }
 
-export default function QualifyingPage({ sessionKey, gmtOffset }) {
+export default function QualifyingPage({ sessionKey, gmtOffset, isMobile }) {
   const { data, loading } = useQualifyingData(sessionKey)
 
   if (!sessionKey) return <p style={{ color: THEME.muted }}>Select a session above.</p>
 
-  const sectionStyle = { marginBottom: '2rem' }
+  const sectionStyle = { marginBottom: isMobile ? '1.25rem' : '2rem' }
   const headingStyle = {
     fontSize: '0.75rem',
     fontWeight: 'bold',
@@ -429,7 +429,7 @@ export default function QualifyingPage({ sessionKey, gmtOffset }) {
         </div>
       </div>
 
-      <LazySection minHeight={900}>
+      <LazySection minHeight={isMobile ? 500 : 900}>
         <div style={sectionStyle}>
           <h2 style={headingStyle}>Session Analysis</h2>
           <PhaseTabView
@@ -440,6 +440,7 @@ export default function QualifyingPage({ sessionKey, gmtOffset }) {
             weatherData={weatherData}
             gmtOffset={gmtOffset}
             driverPhaseMap={driverPhaseMap}
+            isMobile={isMobile}
           />
         </div>
       </LazySection>

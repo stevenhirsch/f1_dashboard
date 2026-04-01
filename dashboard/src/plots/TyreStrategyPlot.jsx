@@ -1,4 +1,4 @@
-import Plot from 'react-plotly.js'
+import Plot from '../components/ResponsivePlot'
 import { useStints } from '../hooks/useStints'
 import { useRaceControl } from '../hooks/useRaceControl'
 import { COMPOUND_COLOURS, COMPOUND_ORDER, compoundColour } from '../utils/compounds'
@@ -29,7 +29,7 @@ function makeMarker(colour, isFresh) {
   }
 }
 
-export default function TyreStrategyPlot({ sessionKey }) {
+export default function TyreStrategyPlot({ sessionKey, isMobile }) {
   const { data: stintsByDriver, driverOrder, loading: stintsLoading } = useStints(sessionKey)
   const { safetyCarPeriods, loading: rcLoading } = useRaceControl(sessionKey)
 
@@ -153,27 +153,45 @@ export default function TyreStrategyPlot({ sessionKey }) {
     })
   }
 
-  const chartHeight = Math.max(420, driversSorted.length * 26 + 100)
+  const chartHeight = isMobile
+    ? Math.min(320, Math.max(240, driversSorted.length * 18 + 80))
+    : Math.max(420, driversSorted.length * 26 + 100)
 
   return (
     <Plot
       data={traces}
       layout={{
         barmode: 'overlay',
-        xaxis: { title: { text: 'Lap Number', font: { color: '#a1a1aa' } }, color: '#a1a1aa', gridcolor: 'rgba(255,255,255,0.07)', tickfont: { color: '#a1a1aa' }, fixedrange: true },
+        xaxis: {
+          title: { text: 'Lap Number', font: { color: '#a1a1aa', size: isMobile ? 10 : 12 } },
+          color: '#a1a1aa',
+          gridcolor: 'rgba(255,255,255,0.07)',
+          tickfont: { color: '#a1a1aa', size: isMobile ? 9 : 11 },
+          fixedrange: true,
+        },
         yaxis: {
           categoryorder: 'array',
           categoryarray: [...yLabels].reverse(),
           fixedrange: true,
           automargin: true,
           color: '#a1a1aa',
-          tickfont: { color: '#fafafa' },
+          tickfont: { color: '#fafafa', size: isMobile ? 9 : 11 },
           gridcolor: 'rgba(255,255,255,0.05)',
         },
         shapes,
         annotations,
-        legend: { orientation: 'h', x: 0, y: 1.08, xanchor: 'left', yanchor: 'bottom', font: { size: 11, color: '#fafafa' }, bgcolor: 'rgba(0,0,0,0)' },
-        margin: { l: 55, r: 20, t: 60, b: 50 },
+        legend: {
+          orientation: 'h',
+          x: 0,
+          y: 1.08,
+          xanchor: 'left',
+          yanchor: 'bottom',
+          font: { size: isMobile ? 9 : 11, color: '#fafafa' },
+          bgcolor: 'rgba(0,0,0,0)',
+        },
+        margin: isMobile
+          ? { l: 40, r: 10, t: 55, b: 35 }
+          : { l: 55, r: 20, t: 60, b: 50 },
         height: chartHeight,
         paper_bgcolor: '#18181b',
         plot_bgcolor: '#18181b',

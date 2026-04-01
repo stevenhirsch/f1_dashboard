@@ -1,4 +1,5 @@
-import Plot from 'react-plotly.js'
+import Plot from '../components/ResponsivePlot'
+import { useMobile } from '../hooks/useMobile'
 
 // Red (slow) → yellow → green (fast)
 const SPEED_COLORSCALE = [
@@ -63,7 +64,9 @@ function makeTraces(data, lapColours) {
   })
 }
 
-export default function TrackMapPlot({ data, lapColours, height = 380 }) {
+export default function TrackMapPlot({ data, lapColours, height }) {
+  const isMobile = useMobile()
+  const resolvedHeight = height ?? (isMobile ? 260 : 380)
   const hasData = data && Object.values(data).some(pts => pts.length > 0)
   if (!hasData) return null
 
@@ -75,9 +78,9 @@ export default function TrackMapPlot({ data, lapColours, height = 380 }) {
       layout={{
         xaxis: { ...AXIS_BASE, scaleanchor: 'y', scaleratio: 1, fixedrange: true },
         yaxis: { ...AXIS_BASE, fixedrange: true },
-        legend: { font: { size: 10, color: '#a1a1aa' }, bgcolor: 'transparent' },
+        legend: { font: { size: isMobile ? 9 : 10, color: '#a1a1aa' }, bgcolor: 'transparent' },
         margin: { l: 10, r: 10, t: 10, b: 10 },
-        height,
+        height: resolvedHeight,
         paper_bgcolor: '#18181b',
         plot_bgcolor:  '#18181b',
         font: { color: '#fafafa', family: 'monospace' },

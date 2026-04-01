@@ -1,4 +1,5 @@
-import Plot from 'react-plotly.js'
+import Plot from '../components/ResponsivePlot'
+import { useMobile } from '../hooks/useMobile'
 
 // 8 panels top → bottom, ~12% each with small gaps
 // Order: Speed, Power, Brake, Gear, Lift & Coast, Thr/Brk, RPM, DRS
@@ -36,7 +37,9 @@ const binaryAxis = (text) => ({
   ...AXIS_BASE,
 })
 
-export default function TelemetryChart({ data, lapColours, height = 740 }) {
+export default function TelemetryChart({ data, lapColours, height }) {
+  const isMobile = useMobile()
+  const resolvedHeight = height ?? (isMobile ? 520 : 740)
   if (!data || Object.keys(data).length === 0) return null
 
   const lapNums = Object.keys(data)
@@ -161,11 +164,13 @@ export default function TelemetryChart({ data, lapColours, height = 740 }) {
         legend: {
           orientation: 'h',
           x: 0, y: 1.03,
-          font: { size: 10, color: '#a1a1aa' },
+          font: { size: isMobile ? 9 : 10, color: '#a1a1aa' },
           bgcolor: 'transparent',
         },
-        margin: { l: 75, r: 20, t: 30, b: 40 },
-        height,
+        margin: isMobile
+          ? { l: 55, r: 10, t: 25, b: 35 }
+          : { l: 75, r: 20, t: 30, b: 40 },
+        height: resolvedHeight,
         paper_bgcolor: '#18181b',
         plot_bgcolor:  '#18181b',
         font: { color: '#fafafa', family: 'monospace' },

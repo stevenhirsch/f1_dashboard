@@ -1,7 +1,9 @@
-import Plot from 'react-plotly.js'
+import Plot from '../components/ResponsivePlot'
 import { useIntervals } from '../hooks/useIntervals'
+import { useMobile } from '../hooks/useMobile'
 
 export default function GapEvolutionChart({ sessionKey }) {
+  const isMobile = useMobile()
   const { data: intervals, loading } = useIntervals(sessionKey)
 
   if (loading) return <p>Loading gap evolution…</p>
@@ -49,14 +51,17 @@ export default function GapEvolutionChart({ sessionKey }) {
     <Plot
       data={traces}
       layout={{
-        title: { text: 'Gap to Leader', font: { size: 14 } },
-        xaxis: { title: 'Time', type: 'date' },
-        yaxis: { title: 'Gap (s)', autorange: 'reversed' },
-        legend: { orientation: 'h', y: -0.2, font: { size: 10 } },
-        margin: { l: 60, r: 20, t: 40, b: 80 },
-        height: 500,
-        paper_bgcolor: 'white',
-        plot_bgcolor: '#f8f8f8',
+        title: { text: 'Gap to Leader', font: { size: isMobile ? 12 : 14, color: '#fafafa' } },
+        xaxis: { title: 'Time', type: 'date', color: '#a1a1aa', tickfont: { color: '#a1a1aa' } },
+        yaxis: { title: 'Gap (s)', autorange: 'reversed', color: '#a1a1aa', tickfont: { color: '#a1a1aa' } },
+        legend: { orientation: 'h', y: -0.2, font: { size: isMobile ? 9 : 10, color: '#fafafa' } },
+        margin: isMobile
+          ? { l: 45, r: 10, t: 35, b: 65 }
+          : { l: 60, r: 20, t: 40, b: 80 },
+        height: isMobile ? 300 : 500,
+        paper_bgcolor: '#18181b',
+        plot_bgcolor: '#18181b',
+        font: { color: '#fafafa', family: 'monospace' },
       }}
       config={{ responsive: true, displayModeBar: false }}
       style={{ width: '100%' }}

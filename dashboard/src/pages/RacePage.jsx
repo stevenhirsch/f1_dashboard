@@ -40,7 +40,7 @@ function PositionChange({ racePos, gridPos, isDNF }) {
   return <span style={{ color: '#a1a1aa' }}>—</span>
 }
 
-function ResultsTable({ sessionKey, qualifyingSessionKey }) {
+function ResultsTable({ sessionKey, qualifyingSessionKey, isMobile }) {
   const { data, loading } = useRaceResults(sessionKey, qualifyingSessionKey)
 
   if (loading) return <p style={{ color: '#a1a1aa' }}>Loading results…</p>
@@ -49,23 +49,27 @@ function ResultsTable({ sessionKey, qualifyingSessionKey }) {
   const bestFlSpeed = Math.max(...data.map(r => r.fl_speed ?? 0))
   const bestMaxSpeed = Math.max(...data.map(r => r.max_speed ?? 0))
 
+  const cellPad = isMobile ? '0.3rem 0.4rem' : '0.45rem 0.75rem'
+  const tableFontSize = isMobile ? '0.78rem' : '0.85rem'
+  const headerFontSize = isMobile ? '0.68rem' : '0.75rem'
+
   return (
     <div style={{ overflowX: 'auto', WebkitOverflowScrolling: 'touch' }}>
     <table style={{
       borderCollapse: 'collapse',
       width: '100%',
-      fontSize: '0.85rem',
+      fontSize: tableFontSize,
       color: THEME.text,
     }}>
       <thead>
         <tr style={{ borderBottom: `1px solid ${THEME.border}`, textAlign: 'left' }}>
-          {['Pos', 'Driver', 'Team', 'Laps', 'Time / Gap', 'Pits', 'Fastest Lap Top Speed', 'Top Speed'].map(h => (
+          {['Pos', 'Driver', 'Team', 'Laps', 'Time / Gap', 'Pits', 'FL Speed', 'Top Speed'].map(h => (
             <th key={h} style={{
-              padding: '0.4rem 0.75rem',
+              padding: cellPad,
               whiteSpace: 'nowrap',
               color: THEME.muted,
               fontWeight: 'normal',
-              fontSize: '0.75rem',
+              fontSize: headerFontSize,
               textTransform: 'uppercase',
               letterSpacing: '0.05em',
             }}>{h}</th>
@@ -92,23 +96,23 @@ function ResultsTable({ sessionKey, qualifyingSessionKey }) {
                 background: i % 2 === 0 ? 'transparent' : THEME.tableAlt,
               }}
             >
-              <td style={{ padding: '0.45rem 0.75rem', fontWeight: 'bold', color: isDNF ? '#ef4444' : THEME.muted, whiteSpace: 'nowrap' }}>
+              <td style={{ padding: cellPad, fontWeight: 'bold', color: isDNF ? '#ef4444' : THEME.muted, whiteSpace: 'nowrap' }}>
                 {pos}
-                <span style={{ marginLeft: '0.35rem', fontSize: '0.75rem' }}>
+                <span style={{ marginLeft: '0.35rem', fontSize: isMobile ? '0.68rem' : '0.75rem' }}>
                   <PositionChange racePos={row.position} gridPos={row.grid_position} isDNF={isDNF} />
                 </span>
               </td>
-              <td style={{ padding: '0.45rem 0.75rem', color: colour, fontWeight: 'bold' }}>
+              <td style={{ padding: cellPad, color: colour, fontWeight: 'bold' }}>
                 {driver.name_acronym ?? row.driver_number}
               </td>
-              <td style={{ padding: '0.45rem 0.75rem', color: THEME.muted }}>{driver.team_name ?? '—'}</td>
-              <td style={{ padding: '0.45rem 0.75rem' }}>{row.number_of_laps ?? '—'}</td>
-              <td style={{ padding: '0.45rem 0.75rem' }}>{timeGap}</td>
-              <td style={{ padding: '0.45rem 0.75rem', color: THEME.muted }}>{row.pit_count ?? '—'}</td>
-              <td style={{ padding: '0.45rem 0.75rem', fontWeight: isTopFl ? 'bold' : 'normal', color: isTopFl ? '#facc15' : THEME.text }}>
+              <td style={{ padding: cellPad, color: THEME.muted }}>{driver.team_name ?? '—'}</td>
+              <td style={{ padding: cellPad }}>{row.number_of_laps ?? '—'}</td>
+              <td style={{ padding: cellPad }}>{timeGap}</td>
+              <td style={{ padding: cellPad, color: THEME.muted }}>{row.pit_count ?? '—'}</td>
+              <td style={{ padding: cellPad, fontWeight: isTopFl ? 'bold' : 'normal', color: isTopFl ? '#facc15' : THEME.text }}>
                 {row.fl_speed != null ? `${row.fl_speed}` : '—'}
               </td>
-              <td style={{ padding: '0.45rem 0.75rem', fontWeight: isTopMax ? 'bold' : 'normal', color: isTopMax ? '#facc15' : THEME.muted }}>
+              <td style={{ padding: cellPad, fontWeight: isTopMax ? 'bold' : 'normal', color: isTopMax ? '#facc15' : THEME.muted }}>
                 {row.max_speed != null ? `${row.max_speed}` : '—'}
               </td>
             </tr>
@@ -120,10 +124,10 @@ function ResultsTable({ sessionKey, qualifyingSessionKey }) {
   )
 }
 
-export default function RacePage({ sessionKey, qualifyingSessionKey, gmtOffset }) {
+export default function RacePage({ sessionKey, qualifyingSessionKey, gmtOffset, isMobile }) {
   if (!sessionKey) return <p style={{ color: '#a1a1aa' }}>Select a session above.</p>
 
-  const sectionStyle = { marginBottom: '2rem' }
+  const sectionStyle = { marginBottom: isMobile ? '1.25rem' : '2rem' }
   const headingStyle = {
     fontSize: '0.75rem',
     fontWeight: 'bold',
@@ -140,20 +144,20 @@ export default function RacePage({ sessionKey, qualifyingSessionKey, gmtOffset }
       <div style={sectionStyle}>
         <h2 style={headingStyle}>Race Results</h2>
         <div style={{ background: THEME.surface, borderRadius: '8px', border: `1px solid ${THEME.border}`, overflow: 'hidden' }}>
-          <ResultsTable sessionKey={sessionKey} qualifyingSessionKey={qualifyingSessionKey} />
+          <ResultsTable sessionKey={sessionKey} qualifyingSessionKey={qualifyingSessionKey} isMobile={isMobile} />
         </div>
       </div>
 
-      <LazySection minHeight={560}>
+      <LazySection minHeight={isMobile ? 340 : 560}>
         <div style={sectionStyle}>
           <h2 style={headingStyle}>Position History</h2>
           <div style={{ background: THEME.surface, borderRadius: '8px', border: `1px solid ${THEME.border}`, padding: '0.5rem' }}>
-            <RacePositionChart sessionKey={sessionKey} qualifyingSessionKey={qualifyingSessionKey} />
+            <RacePositionChart sessionKey={sessionKey} qualifyingSessionKey={qualifyingSessionKey} isMobile={isMobile} />
           </div>
         </div>
       </LazySection>
 
-      <LazySection minHeight={520}>
+      <LazySection minHeight={isMobile ? 340 : 520}>
         <div style={sectionStyle}>
           <h2 style={{ ...headingStyle, display: 'flex', alignItems: 'center' }}>
             Tyre Strategy
@@ -164,25 +168,25 @@ export default function RacePage({ sessionKey, qualifyingSessionKey, gmtOffset }
             } />
           </h2>
           <div style={{ background: THEME.surface, borderRadius: '8px', border: `1px solid ${THEME.border}`, padding: '0.5rem' }}>
-            <TyreStrategyPlot sessionKey={sessionKey} />
+            <TyreStrategyPlot sessionKey={sessionKey} isMobile={isMobile} />
           </div>
         </div>
       </LazySection>
 
-      <LazySection minHeight={480}>
+      <LazySection minHeight={isMobile ? 500 : 600}>
         <div style={sectionStyle}>
           <h2 style={headingStyle}>Lap Time Distribution</h2>
           <div style={{ background: THEME.surface, borderRadius: '8px', border: `1px solid ${THEME.border}`, padding: '0.5rem' }}>
-            <LapDistributionPlot sessionKey={sessionKey} />
+            <LapDistributionPlot sessionKey={sessionKey} isMobile={isMobile} />
           </div>
         </div>
       </LazySection>
 
-      <LazySection minHeight={380}>
+      <LazySection minHeight={isMobile ? 280 : 380}>
         <div style={sectionStyle}>
           <h2 style={headingStyle}>Weather</h2>
           <div style={{ background: THEME.surface, borderRadius: '8px', border: `1px solid ${THEME.border}`, padding: '0.5rem' }}>
-            <WeatherStrip sessionKey={sessionKey} gmtOffset={gmtOffset} />
+            <WeatherStrip sessionKey={sessionKey} gmtOffset={gmtOffset} isMobile={isMobile} />
           </div>
         </div>
       </LazySection>

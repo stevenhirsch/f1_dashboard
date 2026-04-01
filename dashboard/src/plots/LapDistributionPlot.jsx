@@ -1,4 +1,4 @@
-import Plot from 'react-plotly.js'
+import Plot from '../components/ResponsivePlot'
 import { useRaceLapDistribution } from '../hooks/useRaceLapDistribution'
 import { COMPOUND_COLOURS, COMPOUND_ORDER } from '../utils/compounds'
 
@@ -7,6 +7,14 @@ function formatLapTime(seconds) {
   const m = Math.floor(seconds / 60)
   const s = (seconds % 60).toFixed(3)
   return `${m}:${String(s).padStart(6, '0')}`
+}
+
+// Short format for mobile x-axis ticks — drops milliseconds to save space
+function formatLapTimeShort(seconds) {
+  if (seconds == null || !isFinite(seconds)) return '—'
+  const m = Math.floor(seconds / 60)
+  const s = String(Math.floor(seconds % 60)).padStart(2, '0')
+  return `${m}:${s}`
 }
 
 function getCompound(driverNumber, lapNumber, stintsByDriver) {
@@ -18,12 +26,12 @@ function getCompound(driverNumber, lapNumber, stintsByDriver) {
 }
 
 // Deterministic jitter: stable across renders, unique per driver+lap combination
-function jitter(driverNumber, lapNumber, spread = 0.3) {
+function jitter(driverNumber, lapNumber, spread = 0.25) {
   const hash = ((driverNumber * 2654435761) ^ (lapNumber * 2246822519)) >>> 0
   return (hash % 1000) / 1000 * spread - spread / 2
 }
 
-export default function LapDistributionPlot({ sessionKey }) {
+export default function LapDistributionPlot({ sessionKey, isMobile }) {
   const { data, loading } = useRaceLapDistribution(sessionKey)
 
   if (loading) return <p style={{ color: '#a1a1aa' }}>Loading lap distribution…</p>
@@ -59,10 +67,8 @@ export default function LapDistributionPlot({ sessionKey }) {
   )
   if (allCleanLaps.length === 0) return <p style={{ color: '#a1a1aa' }}>No lap data.</p>
   const sessionFastest = Math.min(...allCleanLaps.map(l => l.lap_duration))
-  // 1.15× catches pit-in laps while keeping all racing laps
   const lapCutoff = sessionFastest * 1.15
 
-  // Group filtered laps by driver, tagging each with its driver index for x placement
   const lapsByDriver = {}
   for (const lap of laps) {
     if (!lap.lap_duration || lap.lap_duration <= 0) continue
@@ -73,22 +79,24 @@ export default function LapDistributionPlot({ sessionKey }) {
     lapsByDriver[lap.driver_number].push(lap)
   }
 
-  // Assign each driver a numeric x position (0, 1, 2, …)
+  // Assign each driver a numeric y position (0 = P1, rendered at top via reversed y range)
+  const n = orderedDrivers.length
   const driverIndex = Object.fromEntries(orderedDrivers.map((r, i) => [r.driver_number, i]))
 
-  // Violin traces — one per driver at its numeric x0, team-coloured, no points
+  // Horizontal violin traces — team-coloured, one per driver
   const violinTraces = orderedDrivers.map(r => {
     const driver = driverMap[r.driver_number] ?? {}
     const rawColour = driver.team_colour ?? '888888'
     const colour = `#${rawColour.replace('#', '')}`
     const driverLaps = lapsByDriver[r.driver_number] ?? []
-    const xi = driverIndex[r.driver_number]
+    const yi = driverIndex[r.driver_number]
 
     return {
       type: 'violin',
-      x0: xi,
-      y: driverLaps.map(l => l.lap_duration),
-      width: 0.75,
+      orientation: 'h',
+      y0: yi,
+      x: driverLaps.map(l => l.lap_duration),
+      width: isMobile ? 0.72 : 0.78,
       fillcolor: colour + 'aa', // ~67% opacity
       line: { color: colour, width: 1.5 },
       points: false,
@@ -100,19 +108,20 @@ export default function LapDistributionPlot({ sessionKey }) {
     }
   })
 
-  // Scatter traces — one per compound, x positions jittered around each driver's index
+  // Scatter traces — compound-coloured dots, jittered vertically within each driver row
+  const jitterSpread = isMobile ? 0.2 : 0.25
   const compoundData = {}
   for (const r of orderedDrivers) {
     const driver = driverMap[r.driver_number] ?? {}
     const acronym = driver.name_acronym ?? String(r.driver_number)
-    const xi = driverIndex[r.driver_number]
+    const yi = driverIndex[r.driver_number]
     const driverLaps = lapsByDriver[r.driver_number] ?? []
 
     for (const lap of driverLaps) {
       const compound = getCompound(r.driver_number, lap.lap_number, stintsByDriver)
       if (!compoundData[compound]) compoundData[compound] = { x: [], y: [], text: [] }
-      compoundData[compound].x.push(xi + jitter(r.driver_number, lap.lap_number))
-      compoundData[compound].y.push(lap.lap_duration)
+      compoundData[compound].x.push(lap.lap_duration)
+      compoundData[compound].y.push(yi + jitter(r.driver_number, lap.lap_number, jitterSpread))
       compoundData[compound].text.push(
         `<b>${acronym}</b> · Lap ${lap.lap_number}<br>${formatLapTime(lap.lap_duration)}`
       )
@@ -131,71 +140,72 @@ export default function LapDistributionPlot({ sessionKey }) {
       hovertemplate: '%{text}<extra></extra>',
       marker: {
         color: COMPOUND_COLOURS[compound] ?? '#888888',
-        size: 6,
+        size: isMobile ? 4 : 5,
         opacity: 0.9,
         line: { color: 'rgba(0,0,0,0.35)', width: 0.5 },
       },
     }))
 
-  // X-axis: numeric tickvals at each driver index, custom labels with best lap + acronym
-  const n = orderedDrivers.length
-  const tickvals = orderedDrivers.map((_, i) => i)
-  const ticktext = orderedDrivers.map(r => {
-    const driver = driverMap[r.driver_number] ?? {}
-    const acronym = driver.name_acronym ?? String(r.driver_number)
-    const driverLaps = lapsByDriver[r.driver_number] ?? []
-    const best = driverLaps.length > 0 ? Math.min(...driverLaps.map(l => l.lap_duration)) : null
-    return `${formatLapTime(best)}<br><b>${acronym}</b>`
-  })
-
-  // Y-axis range and ticks every 5s formatted as M:SS.000
-  const allY = Object.values(lapsByDriver).flatMap(ls => ls.map(l => l.lap_duration))
-  const yMin = Math.min(...allY)
-  const yMax = Math.max(...allY)
-  const yPad = (yMax - yMin) * 0.05
-  const yRange = [yMin - yPad, yMax + yPad]
+  // X-axis: lap time range and ticks every 5s
+  const allX = Object.values(lapsByDriver).flatMap(ls => ls.map(l => l.lap_duration))
+  const xMin = Math.min(...allX)
+  const xMax = Math.max(...allX)
+  const xPad = (xMax - xMin) * 0.05
+  const xRange = [xMin - xPad, xMax + xPad]
 
   const tickInterval = 5
-  const tickStart = Math.ceil((yMin - yPad) / tickInterval) * tickInterval
-  const tickEnd = Math.floor((yMax + yPad) / tickInterval) * tickInterval
-  const yTickVals = []
-  for (let t = tickStart; t <= tickEnd; t += tickInterval) yTickVals.push(t)
-  const yTickText = yTickVals.map(t => formatLapTime(t))
+  const tickStart = Math.ceil((xMin - xPad) / tickInterval) * tickInterval
+  const tickEnd = Math.floor((xMax + xPad) / tickInterval) * tickInterval
+  const xTickVals = []
+  for (let t = tickStart; t <= tickEnd; t += tickInterval) xTickVals.push(t)
+  const xTickText = xTickVals.map(t => isMobile ? formatLapTimeShort(t) : formatLapTime(t))
+
+  // Y-axis: driver acronyms, P1 at top
+  const yTickVals = orderedDrivers.map((_, i) => i)
+  const yTickText = orderedDrivers.map(r => {
+    const driver = driverMap[r.driver_number] ?? {}
+    return driver.name_acronym ?? String(r.driver_number)
+  })
+
+  const chartHeight = isMobile
+    ? Math.max(420, n * 23 + 70)
+    : Math.max(500, n * 27 + 80)
 
   return (
     <Plot
       data={[...violinTraces, ...scatterTraces]}
       layout={{
         xaxis: {
-          title: { text: 'Driver', font: { size: 11, color: '#a1a1aa' } },
-          range: [-0.6, n - 0.4],
-          tickvals,
-          ticktext,
-          tickfont: { size: 10, color: '#a1a1aa', family: 'monospace' },
+          title: { text: 'Lap Time', font: { size: isMobile ? 10 : 11, color: '#a1a1aa' } },
+          range: xRange,
+          tickvals: xTickVals,
+          ticktext: xTickText,
+          tickfont: { size: isMobile ? 9 : 10, color: '#a1a1aa', family: 'monospace' },
           color: '#a1a1aa',
-          gridcolor: 'rgba(0,0,0,0)',
+          gridcolor: 'rgba(255,255,255,0.06)',
           fixedrange: true,
         },
         yaxis: {
-          title: { text: 'Lap Time', font: { size: 11, color: '#a1a1aa' } },
-          range: yRange,
           tickvals: yTickVals,
           ticktext: yTickText,
+          range: [n - 0.4, -0.6],  // reversed so P1 (index 0) sits at top
+          tickfont: { size: isMobile ? 9 : 10, color: '#fafafa', family: 'monospace' },
           color: '#a1a1aa',
-          gridcolor: 'rgba(255,255,255,0.06)',
-          tickfont: { size: 10, color: '#a1a1aa', family: 'monospace' },
+          gridcolor: 'rgba(255,255,255,0.05)',
           fixedrange: true,
         },
         legend: {
           orientation: 'h',
-          y: 1.06,
           x: 0,
-          font: { size: 11, color: '#a1a1aa' },
+          y: 1.04,
+          font: { size: isMobile ? 9 : 11, color: '#a1a1aa' },
           bgcolor: 'transparent',
-          title: { text: 'Tyre Compound  ', font: { size: 10, color: '#71717a' } },
+          title: { text: 'Tyre Compound  ', font: { size: isMobile ? 9 : 10, color: '#71717a' } },
         },
-        margin: { l: 90, r: 20, t: 30, b: 80 },
-        height: 480,
+        margin: isMobile
+          ? { l: 40, r: 10, t: 42, b: 50 }
+          : { l: 45, r: 20, t: 48, b: 60 },
+        height: chartHeight,
         paper_bgcolor: '#18181b',
         plot_bgcolor: '#18181b',
         font: { color: '#fafafa', family: 'monospace' },

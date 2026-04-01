@@ -1,4 +1,4 @@
-import Plot from 'react-plotly.js'
+import Plot from '../components/ResponsivePlot'
 import { COMPOUND_COLOURS, COMPOUND_ORDER, compoundColour } from '../utils/compounds'
 
 function capitalize(s) {

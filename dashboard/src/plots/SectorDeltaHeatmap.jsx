@@ -1,6 +1,6 @@
-import Plot from 'react-plotly.js'
+import Plot from '../components/ResponsivePlot'
 
-export default function SectorDeltaHeatmap({ deltas }) {
+export default function SectorDeltaHeatmap({ deltas, isMobile }) {
   if (!deltas || deltas.length === 0) return <p style={{ color: '#a1a1aa' }}>No sector data.</p>
   // Delta = driver's best sector time minus the theoretical minimum across all drivers.
   // Green (0) = matched the fastest sector; red = time lost vs. theoretical pole pace.
@@ -35,9 +35,10 @@ export default function SectorDeltaHeatmap({ deltas }) {
         zmax: maxDelta,
         showscale: true,
         colorbar: {
-          title: { text: 'Delta (s)', font: { color: '#a1a1aa', size: 10 } },
-          tickfont: { color: '#a1a1aa' },
-          thickness: 12,
+          title: { text: isMobile ? '' : 'Delta (s)', font: { color: '#a1a1aa', size: 10 } },
+          tickfont: { color: '#a1a1aa', size: isMobile ? 8 : 10 },
+          thickness: isMobile ? 8 : 12,
+          len: isMobile ? 0.8 : 1,
         },
         hovertemplate:
           '<b>%{y}</b> — %{x}<br>Sector time: %{text}s<br>Delta: +%{z:.3f}s<extra></extra>',
@@ -49,17 +50,21 @@ export default function SectorDeltaHeatmap({ deltas }) {
           categoryarray: drivers,
           fixedrange: true,
           color: '#a1a1aa',
-          tickfont: { color: '#fafafa', size: 11 },
+          tickfont: { color: '#fafafa', size: isMobile ? 9 : 11 },
           gridcolor: 'rgba(255,255,255,0.05)',
         },
         xaxis: {
           fixedrange: true,
           color: '#a1a1aa',
-          tickfont: { color: '#a1a1aa' },
+          tickfont: { color: '#a1a1aa', size: isMobile ? 10 : 12 },
           side: 'top',
         },
-        margin: { l: 55, r: 80, t: 30, b: 20 },
-        height: Math.max(300, deltas.length * 24 + 60),
+        margin: isMobile
+          ? { l: 45, r: 50, t: 25, b: 10 }
+          : { l: 55, r: 80, t: 30, b: 20 },
+        height: isMobile
+          ? Math.min(340, Math.max(200, deltas.length * 18 + 50))
+          : Math.max(300, deltas.length * 24 + 60),
         paper_bgcolor: '#18181b',
         plot_bgcolor: '#18181b',
         font: { color: '#fafafa', family: 'monospace' },

@@ -1,5 +1,6 @@
-import Plot from 'react-plotly.js'
+import Plot from '../components/ResponsivePlot'
 import { coastingIntervals } from '../utils/telemetry'
+import { useMobile } from '../hooks/useMobile'
 
 /**
  * Horizontal Gantt-style chart showing coasting zones (throttle < 1 % AND
@@ -10,6 +11,7 @@ import { coastingIntervals } from '../utils/telemetry'
  * (total coasting metres and % of lap) is appended to each row label.
  */
 export default function CoastingChart({ data, lapColours, height = 160 }) {
+  const isMobile = useMobile()
   if (!data || Object.keys(data).length === 0) return null
 
   const lapNums = Object.keys(data)
@@ -28,7 +30,11 @@ export default function CoastingChart({ data, lapColours, height = 160 }) {
     const pct = maxDist > 0 ? ((totalCoast / maxDist) * 100).toFixed(1) : '—'
 
     tickVals.push(i)
-    tickText.push(`Lap ${lapNum}  ${totalCoast}m (${pct}%)`)
+    // Shorter label on mobile to fit smaller left margin
+    tickText.push(isMobile
+      ? `L${lapNum} (${pct}%)`
+      : `Lap ${lapNum}  ${totalCoast}m (${pct}%)`
+    )
 
     // Full-lap background bar
     traces.push({
@@ -74,7 +80,7 @@ export default function CoastingChart({ data, lapColours, height = 160 }) {
         yaxis: {
           tickvals: tickVals,
           ticktext: tickText,
-          tickfont: { size: 10, color: '#a1a1aa' },
+          tickfont: { size: isMobile ? 9 : 10, color: '#a1a1aa' },
           color: '#a1a1aa',
           gridcolor: 'rgba(255,255,255,0.06)',
           zeroline: false,
@@ -82,7 +88,9 @@ export default function CoastingChart({ data, lapColours, height = 160 }) {
           fixedrange: true,
         },
         shapes,
-        margin: { l: 170, r: 20, t: 10, b: 40 },
+        margin: isMobile
+          ? { l: 90, r: 10, t: 10, b: 35 }
+          : { l: 170, r: 20, t: 10, b: 40 },
         height: dynamicHeight,
         paper_bgcolor: '#18181b',
         plot_bgcolor:  '#18181b',

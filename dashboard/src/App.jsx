@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import { useSessionSelector } from './hooks/useSessionSelector'
+import { useMobile } from './hooks/useMobile'
 import RacePage from './pages/RacePage'
 import QualifyingPage from './pages/QualifyingPage'
 import DriverPage from './pages/DriverPage'
@@ -14,16 +15,17 @@ const THEME = {
   inputBg: '#27272a',
 }
 
-const selectStyle = {
+// fontSize >= 16px on mobile prevents iOS Safari auto-zoom on focus
+const makeSelectStyle = (isMobile) => ({
   background: THEME.inputBg,
   color: THEME.text,
   border: `1px solid ${THEME.border}`,
   borderRadius: '6px',
   padding: '0.3rem 0.5rem',
-  fontSize: '0.875rem',
+  fontSize: isMobile ? '16px' : '0.875rem',
   cursor: 'pointer',
   outline: 'none',
-}
+})
 
 const labelStyle = {
   color: THEME.muted,
@@ -129,6 +131,7 @@ export default function App() {
   const [activeMode, setActiveMode] = useState('Dashboard') // 'Dashboard' | 'Chat'
   const [activeTab, setActiveTab] = useState('Race')
   const selector = useSessionSelector()
+  const isMobile = useMobile()
 
   return (
     <div style={{ fontFamily: 'monospace', background: THEME.bg, minHeight: '100vh', color: THEME.text }}>
@@ -153,8 +156,9 @@ export default function App() {
           {/* Weekend selector: Year, Weekend, Event (Event only on sprint weekends) */}
           <div style={{
             display: 'flex',
-            gap: '1.5rem',
-            padding: '0.75rem 1.5rem',
+            flexDirection: isMobile ? 'column' : 'row',
+            gap: isMobile ? '0.5rem' : '1.5rem',
+            padding: isMobile ? '0.5rem 0.75rem' : '0.75rem 1.5rem',
             borderBottom: `1px solid ${THEME.border}`,
             flexWrap: 'wrap',
             background: THEME.surface,
@@ -162,7 +166,7 @@ export default function App() {
             <label style={labelStyle}>
               <span>Year</span>
               <select
-                style={selectStyle}
+                style={makeSelectStyle(isMobile)}
                 value={selector.selectedYear ?? ''}
                 onChange={e => selector.setSelectedYear(Number(e.target.value))}
               >
@@ -175,7 +179,7 @@ export default function App() {
             <label style={labelStyle}>
               <span>Weekend</span>
               <select
-                style={selectStyle}
+                style={makeSelectStyle(isMobile)}
                 value={selector.selectedMeetingKey ?? ''}
                 onChange={e => selector.setSelectedMeetingKey(Number(e.target.value))}
               >
@@ -189,7 +193,7 @@ export default function App() {
               <label style={labelStyle}>
                 <span>Event</span>
                 <select
-                  style={selectStyle}
+                  style={makeSelectStyle(isMobile)}
                   value={selector.selectedEvent}
                   onChange={e => selector.setSelectedEvent(e.target.value)}
                 >
@@ -204,7 +208,7 @@ export default function App() {
           {/* Tab bar */}
           <div style={{
             display: 'flex',
-            padding: '0 1.5rem',
+            padding: isMobile ? '0 0.25rem' : '0 1.5rem',
             borderBottom: `1px solid ${THEME.border}`,
             background: THEME.surface,
           }}>
@@ -219,15 +223,15 @@ export default function App() {
           </div>
 
           {/* Tab content */}
-          <div style={{ padding: '1.25rem 1.5rem' }}>
+          <div style={{ padding: isMobile ? '0.5rem 0.5rem' : '1.25rem 1.5rem' }}>
             {activeTab === 'Race' && (
-              <RacePage sessionKey={selector.raceSessionKey} qualifyingSessionKey={selector.qualifyingSessionKey} gmtOffset={selector.gmtOffset} />
+              <RacePage sessionKey={selector.raceSessionKey} qualifyingSessionKey={selector.qualifyingSessionKey} gmtOffset={selector.gmtOffset} isMobile={isMobile} />
             )}
             {activeTab === 'Qualifying' && (
-              <QualifyingPage sessionKey={selector.qualifyingSessionKey} gmtOffset={selector.gmtOffset} />
+              <QualifyingPage sessionKey={selector.qualifyingSessionKey} gmtOffset={selector.gmtOffset} isMobile={isMobile} />
             )}
             {activeTab === 'Driver' && (
-              <DriverPage raceSessionKey={selector.raceSessionKey} qualifyingSessionKey={selector.qualifyingSessionKey} gmtOffset={selector.gmtOffset} />
+              <DriverPage raceSessionKey={selector.raceSessionKey} qualifyingSessionKey={selector.qualifyingSessionKey} gmtOffset={selector.gmtOffset} isMobile={isMobile} />
             )}
           </div>
         </>

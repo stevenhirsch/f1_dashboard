@@ -1,4 +1,4 @@
-import Plot from 'react-plotly.js'
+import Plot from '../components/ResponsivePlot'
 import { useRacePositionHistory } from '../hooks/useRacePositionHistory'
 
 // Binary search: largest index i where arr[i] <= target. Returns -1 if none.
@@ -13,7 +13,7 @@ function bisectRight(arr, target) {
   return lo
 }
 
-export default function RacePositionChart({ sessionKey, qualifyingSessionKey }) {
+export default function RacePositionChart({ sessionKey, qualifyingSessionKey, isMobile }) {
   const { data, loading } = useRacePositionHistory(sessionKey, qualifyingSessionKey)
 
   if (loading) return <p style={{ color: '#a1a1aa' }}>Loading position history…</p>
@@ -242,10 +242,10 @@ export default function RacePositionChart({ sessionKey, qualifyingSessionKey }) 
       xref: 'x', yref: 'y',
       text: driver.name_acronym ?? String(dn),
       showarrow: false,
-      font: { color: colour, size: 10, family: 'monospace' },
+      font: { color: colour, size: isMobile ? 8 : 10, family: 'monospace' },
       xanchor: isDNF ? 'center' : 'left',
       yanchor: 'middle',
-      xshift: isDNF ? 0 : 6,
+      xshift: isDNF ? 0 : 5,
       // DNF labels sit inline with a slight vertical offset to reduce overlap
       yshift: isDNF ? -10 : 0,
     })
@@ -258,24 +258,24 @@ export default function RacePositionChart({ sessionKey, qualifyingSessionKey }) 
       data={[...driverTraces, ...legendTraces]}
       layout={{
         xaxis: {
-          title: { text: 'Lap', font: { size: 11, color: '#a1a1aa' } },
-          range: [-0.5, maxLap + 5],  // extra room for right-side labels
+          title: { text: 'Lap', font: { size: isMobile ? 10 : 11, color: '#a1a1aa' } },
+          range: [-0.5, maxLap + (isMobile ? 3 : 5)],  // extra room for right-side labels
           color: '#a1a1aa',
           gridcolor: 'rgba(255,255,255,0.06)',
-          tickfont: { size: 10, color: '#a1a1aa' },
+          tickfont: { size: 9, color: '#a1a1aa' },
           dtick: 5,
           tick0: 0,
           fixedrange: true,
         },
         yaxis: {
-          title: { text: 'Position', font: { size: 11, color: '#a1a1aa' } },
+          title: { text: 'Pos', font: { size: isMobile ? 10 : 11, color: '#a1a1aa' } },
           range: [numDrivers + 0.5, 0.5],  // P1 at top
           tickmode: 'linear',
           tick0: 1,
           dtick: 2,
           color: '#a1a1aa',
           gridcolor: 'rgba(255,255,255,0.06)',
-          tickfont: { size: 10, color: '#a1a1aa' },
+          tickfont: { size: 9, color: '#a1a1aa' },
           fixedrange: true,
         },
         legend: {
@@ -288,8 +288,10 @@ export default function RacePositionChart({ sessionKey, qualifyingSessionKey }) 
         },
         shapes,
         annotations,
-        margin: { l: 50, r: 65, t: 20, b: 50 },
-        height: 560,
+        margin: isMobile
+          ? { l: 35, r: 45, t: 15, b: 35 }
+          : { l: 50, r: 65, t: 20, b: 50 },
+        height: isMobile ? 320 : 560,
         paper_bgcolor: '#18181b',
         plot_bgcolor: '#18181b',
         font: { color: '#fafafa', family: 'monospace' },
