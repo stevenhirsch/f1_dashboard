@@ -61,6 +61,26 @@ export function useRaceResults(sessionKey, qualifyingSessionKey) {
         fl_speed: speedStats[r.driver_number]?.fl_speed ?? null,
         max_speed: speedStats[r.driver_number]?.max_speed ?? null,
       }))
+
+      // Sort order:
+      //   1. Classified finishers with a position (normal finishers + lapped drivers)
+      //   2. Classified finishers with null position (many laps down, e.g. +15 LAPS) — by laps desc
+      //   3. DNF — by laps completed desc
+      //   4. DNS
+      //   5. DSQ
+      function sortKey(r) {
+        if (r.dsq) return 4
+        if (r.dns) return 3
+        if (r.dnf) return 2
+        if (r.position == null) return 1  // classified but position missing
+        return 0
+      }
+      merged.sort((a, b) => {
+        const ka = sortKey(a), kb = sortKey(b)
+        if (ka !== kb) return ka - kb
+        if (ka === 0) return a.position - b.position          // both have positions
+        return (b.number_of_laps ?? 0) - (a.number_of_laps ?? 0)  // sort by laps desc within group
+      })
       setData(merged)
       setLoading(false)
     })

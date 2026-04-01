@@ -56,10 +56,10 @@ export function useSessionSelector() {
       .from('races')
       .select('meeting_key, meeting_name, date_start, gmt_offset')
       .eq('year', selectedYear)
-      .order('date_start', { ascending: false })
+      .order('meeting_key', { ascending: true })
       .then(({ data }) => {
         setMeetings(data ?? [])
-        const first = data?.[0] ?? null
+        const first = data?.[data.length - 1] ?? null
         setSelectedMeetingKey(first?.meeting_key ?? null)
         setGmtOffset(first?.gmt_offset ?? null)
       })

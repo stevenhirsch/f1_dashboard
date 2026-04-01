@@ -133,8 +133,15 @@ def ingest_session(client: Client, session_key: int) -> dict | None:
 def ingest_drivers(client: Client, session_key: int) -> list[dict]:
     """Upsert drivers for a session into `drivers`."""
     drivers = openf1.get_drivers(session_key)
-    rows = [
-        {
+    # Deduplicate by (session_key, driver_number) — OpenF1 occasionally returns
+    # duplicate entries for the same driver (e.g. team changes, data artifacts).
+    # ON CONFLICT DO UPDATE cannot affect the same row twice in one batch.
+    seen: dict[tuple, dict] = {}
+    for d in drivers:
+        if not (d.get("session_key") and d.get("driver_number") is not None):
+            continue
+        key = (d["session_key"], d["driver_number"])
+        seen[key] = {
             "session_key":    d.get("session_key"),
             "driver_number":  d.get("driver_number"),
             "name_acronym":   d.get("name_acronym"),
@@ -145,9 +152,7 @@ def ingest_drivers(client: Client, session_key: int) -> list[dict]:
             "country_code":   d.get("country_code"),
             "headshot_url":   d.get("headshot_url"),
         }
-        for d in drivers
-        if d.get("session_key") and d.get("driver_number") is not None
-    ]
+    rows = list(seen.values())
     _upsert(client, "drivers", rows)
     return drivers
 

@@ -1,5 +1,7 @@
 import { useRaceResults } from '../hooks/useRaceResults'
+import RacePositionChart from '../plots/RacePositionChart'
 import TyreStrategyPlot from '../plots/TyreStrategyPlot'
+import LapDistributionPlot from '../plots/LapDistributionPlot'
 import WeatherStrip from '../plots/WeatherStrip'
 import InfoTooltip from '../components/InfoTooltip'
 import LazySection from '../components/LazySection'
@@ -57,7 +59,7 @@ function ResultsTable({ sessionKey, qualifyingSessionKey }) {
     }}>
       <thead>
         <tr style={{ borderBottom: `1px solid ${THEME.border}`, textAlign: 'left' }}>
-          {['Pos', 'Driver', 'Team', 'Laps', 'Time / Gap', 'Pits', 'FL Speed', 'Top Speed'].map(h => (
+          {['Pos', 'Driver', 'Team', 'Laps', 'Time / Gap', 'Pits', 'Fastest Lap Top Speed', 'Top Speed'].map(h => (
             <th key={h} style={{
               padding: '0.4rem 0.75rem',
               whiteSpace: 'nowrap',
@@ -142,6 +144,15 @@ export default function RacePage({ sessionKey, qualifyingSessionKey, gmtOffset }
         </div>
       </div>
 
+      <LazySection minHeight={560}>
+        <div style={sectionStyle}>
+          <h2 style={headingStyle}>Position History</h2>
+          <div style={{ background: THEME.surface, borderRadius: '8px', border: `1px solid ${THEME.border}`, padding: '0.5rem' }}>
+            <RacePositionChart sessionKey={sessionKey} qualifyingSessionKey={qualifyingSessionKey} />
+          </div>
+        </div>
+      </LazySection>
+
       <LazySection minHeight={520}>
         <div style={sectionStyle}>
           <h2 style={{ ...headingStyle, display: 'flex', alignItems: 'center' }}>
@@ -154,6 +165,15 @@ export default function RacePage({ sessionKey, qualifyingSessionKey, gmtOffset }
           </h2>
           <div style={{ background: THEME.surface, borderRadius: '8px', border: `1px solid ${THEME.border}`, padding: '0.5rem' }}>
             <TyreStrategyPlot sessionKey={sessionKey} />
+          </div>
+        </div>
+      </LazySection>
+
+      <LazySection minHeight={480}>
+        <div style={sectionStyle}>
+          <h2 style={headingStyle}>Lap Time Distribution</h2>
+          <div style={{ background: THEME.surface, borderRadius: '8px', border: `1px solid ${THEME.border}`, padding: '0.5rem' }}>
+            <LapDistributionPlot sessionKey={sessionKey} />
           </div>
         </div>
       </LazySection>

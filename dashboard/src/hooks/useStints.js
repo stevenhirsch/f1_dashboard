@@ -19,9 +19,8 @@ export function useStints(sessionKey) {
         .order('stint_number'),
       supabase
         .from('race_results')
-        .select('driver_number, position')
-        .eq('session_key', sessionKey)
-        .order('position'),
+        .select('driver_number, position, dnf, dns, dsq, number_of_laps')
+        .eq('session_key', sessionKey),
       supabase
         .from('drivers')
         .select('driver_number, name_acronym')
@@ -33,11 +32,25 @@ export function useStints(sessionKey) {
         (driversRes.data ?? []).map(d => [d.driver_number, d])
       )
 
-      const order = results.map(r => ({
-        driver_number: r.driver_number,
-        name_acronym: driverMap[r.driver_number]?.name_acronym ?? String(r.driver_number),
-        position: r.position ?? 999,
-      }))
+      function sortKey(r) {
+        if (r.dsq) return 4
+        if (r.dns) return 3
+        if (r.dnf) return 2
+        if (r.position == null) return 1  // classified but position missing (many laps down)
+        return 0
+      }
+      const order = [...results]
+        .sort((a, b) => {
+          const ka = sortKey(a), kb = sortKey(b)
+          if (ka !== kb) return ka - kb
+          if (ka === 0) return a.position - b.position
+          return (b.number_of_laps ?? 0) - (a.number_of_laps ?? 0)
+        })
+        .map(r => ({
+          driver_number: r.driver_number,
+          name_acronym: driverMap[r.driver_number]?.name_acronym ?? String(r.driver_number),
+          position: r.position ?? 999,
+        }))
       setDriverOrder(order)
 
       const indexed = {}

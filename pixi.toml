@@ -10,6 +10,7 @@ notebook = "marimo edit dashboard.py"
 
 [feature.pipeline.tasks]
 test = "pytest pipeline/tests/ -v"
+check-meetings = "curl -s 'https://api.openf1.org/v1/meetings?year=2026'"
 
 [dependencies]
 marimo = ">=0.20.4,<0.21"
