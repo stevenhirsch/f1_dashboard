@@ -328,6 +328,25 @@ All tables populated correctly for meeting 1280 (2026 Chinese GP).
 
 ## Where to Pick Up Next
 
+### Season Tab — Immediate Backlog (pick up here first)
+
+**1. Constructor DNS + DSQ columns (full stack)**
+- Schema: `ALTER TABLE season_constructor_stats ADD COLUMN IF NOT EXISTS dns_count integer; ALTER TABLE season_constructor_stats ADD COLUMN IF NOT EXISTS dsq_count integer;`
+- Pipeline (`ingest_season_constructor_stats`): add `dns_count` and `dsq_count` to `_new_team_state()`, accumulate in race session loop alongside `dnf_count`, emit in rows dict
+- Re-run: `pixi run -e pipeline python pipeline/ingest.py --season-stats 2026`
+- Frontend: add DNS and DSQ columns to `ConstructorStatsTable` in `SeasonPage.jsx` (red-coloured when non-zero, matching driver table pattern)
+
+**2. Driver DNS column (frontend only — no pipeline work needed)**
+- `dns_count` already exists in `season_driver_stats`
+- Add column to `DriverStatsTable` in `SeasonPage.jsx` between DSQ and W vs TM
+
+**3. Pit stop `stop_duration` coverage**
+- Currently only Shanghai (round 2) has `stop_duration` populated in OpenF1 for 2026; Melbourne and Suzuka are null
+- Re-check after OpenF1 backfills data, then re-ingest those sessions
+- When resolved, pit stop violin and stats table will show all constructors across all rounds
+
+---
+
 ### Phase 6 — Driver Tab, Part B
 
 Phase 5 pipeline is complete. See `product_roadmap.md` for full Phase 6 scope. The derived metrics in `lap_metrics` and `stint_metrics` are ready to surface in the frontend.

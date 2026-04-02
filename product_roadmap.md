@@ -439,6 +439,29 @@ When a formula changes, run `ingest.py --recompute --session <session_key>` to r
 
 ---
 
+### Season Tab — Backlog Items
+- Status: Partially complete (built 2026-04-01)
+
+**Completed:**
+- Driver standings table: total pts, race pts, sprint pts, % of team pts, wins, podiums, fastest laps, DNF, DSQ, W vs TM, W% vs TM, laps led, laps led %, laps completed, distance driven
+- Constructor standings table: total pts, race pts, sprint pts, wins, podiums, DNF, laps led, laps led %, laps completed, distance driven
+- Points progression line charts (drivers + constructors), coloured by team colour
+- Pit stop violin plot (horizontal, sorted fastest → slowest constructor, points coloured by race)
+- Pit stop statistics table (fastest highlighted gold, fastest mean highlighted gold)
+- `--season-stats YEAR` and `--backfill-circuit-lengths` CLI flags added to pipeline
+- `circuit_length_km` stored in `races` table via `CIRCUIT_LENGTHS_KM` static lookup
+- `laps_led` and `distance_km` computed in both `season_driver_stats` and `season_constructor_stats`
+
+**Pending:**
+- Constructor DNS + DSQ columns:
+  - Schema: `ALTER TABLE season_constructor_stats ADD COLUMN IF NOT EXISTS dns_count integer; ALTER TABLE season_constructor_stats ADD COLUMN IF NOT EXISTS dsq_count integer;`
+  - Pipeline: add to `_new_team_state()`, accumulate, emit
+  - Re-run `--season-stats 2026`, add columns to `ConstructorStatsTable`
+- Driver DNS column (frontend only): `dns_count` exists in DB — add to `DriverStatsTable` in `SeasonPage.jsx`
+- Pit stop `stop_duration` coverage: OpenF1 only has stationary time for Shanghai in 2026; re-check after backfill
+
+---
+
 ### Phase 6 — Driver Tab, Part B
 - Status: Incomplete
 *Surfaces derived metrics from Phase 5.*

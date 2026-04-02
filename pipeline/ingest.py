@@ -78,6 +78,37 @@ def _query_in(client: Client, table: str, select: str, column: str, values: list
 
 
 # ---------------------------------------------------------------------------
+# Static circuit length lookup (OpenF1 API does not expose this field).
+# Keyed by circuit_short_name as returned by the OpenF1 meetings endpoint.
+# ---------------------------------------------------------------------------
+CIRCUIT_LENGTHS_KM: dict[str, float] = {
+    'Sakhir':            5.412,  # Bahrain
+    'Jeddah':            6.174,  # Saudi Arabia
+    'Melbourne':         5.303,  # Australia
+    'Suzuka':            5.807,  # Japan
+    'Shanghai':          5.451,  # China
+    'Miami':             5.410,  # Miami
+    'Imola':             4.909,  # Emilia-Romagna
+    'Monte Carlo':       3.337,  # Monaco
+    'Montreal':          4.361,  # Canada
+    'Catalunya':         4.675,  # Spain (Barcelona)
+    'Spielberg':         4.318,  # Austria
+    'Silverstone':       5.891,  # Great Britain
+    'Hungaroring':       4.381,  # Hungary
+    'Spa-Francorchamps': 7.004,  # Belgium
+    'Zandvoort':         4.259,  # Netherlands
+    'Monza':             5.793,  # Italy
+    'Baku':              6.003,  # Azerbaijan
+    'Singapore':         4.940,  # Singapore
+    'Austin':            5.513,  # USA (COTA)
+    'Mexico City':       4.304,  # Mexico
+    'Interlagos':        4.309,  # Brazil
+    'Las Vegas':         6.201,  # Las Vegas
+    'Lusail':            5.419,  # Qatar
+    'Yas Marina':        5.281,  # Abu Dhabi
+}
+
+# ---------------------------------------------------------------------------
 # Per-table ingest functions
 # ---------------------------------------------------------------------------
 
@@ -101,9 +132,31 @@ def ingest_meeting(client: Client, meeting_key: int) -> dict | None:
         "date_start":         m.get("date_start"),
         "circuit_type":       m.get("circuit_type"),
         "gmt_offset":         m.get("gmt_offset"),
+        "circuit_length_km":  CIRCUIT_LENGTHS_KM.get(m.get("circuit_short_name") or ''),
     }
     _upsert(client, "races", [row])
     return m
+
+
+def backfill_circuit_lengths(client: Client) -> None:
+    """Update circuit_length_km for all meetings already in the races table
+    using the static CIRCUIT_LENGTHS_KM lookup (OpenF1 does not expose this field)."""
+    races_resp = client.table('races').select('meeting_key, circuit_short_name').execute()
+    meetings = races_resp.data or []
+    print(f"Backfilling circuit_length_km for {len(meetings)} meetings...")
+    updated = skipped = 0
+    for m in meetings:
+        mk = m['meeting_key']
+        short_name = m.get('circuit_short_name') or ''
+        length = CIRCUIT_LENGTHS_KM.get(short_name)
+        if length is not None:
+            client.table('races').update({'circuit_length_km': length}).eq('meeting_key', mk).execute()
+            print(f"  meeting {mk} ({short_name}): {length} km")
+            updated += 1
+        else:
+            print(f"  meeting {mk} ({short_name!r}): not in lookup table — add to CIRCUIT_LENGTHS_KM")
+            skipped += 1
+    print(f"Done: {updated} updated, {skipped} skipped")
 
 
 def ingest_session(client: Client, session_key: int) -> dict | None:
@@ -715,11 +768,14 @@ def ingest_season_driver_stats(client: Client, year: int) -> None:
     all_year_meetings.sort(key=lambda m: m.get("date_start") or "")
     meeting_order = {m["meeting_key"]: i + 1 for i, m in enumerate(all_year_meetings)}
 
-    races_resp = client.table('races').select('meeting_key,date_start').eq('year', year).execute()
+    races_resp = client.table('races').select('meeting_key,date_start,circuit_length_km').eq('year', year).execute()
     meetings = sorted(races_resp.data or [], key=lambda m: m.get('date_start') or '')
     if not meetings:
         return
     meeting_keys = [m['meeting_key'] for m in meetings]
+    circuit_len_by_mk: dict[int, float | None] = {
+        m['meeting_key']: m.get('circuit_length_km') for m in meetings
+    }
 
     # 2. Sessions for these meetings.
     sessions_resp = (
@@ -764,6 +820,9 @@ def ingest_season_driver_stats(client: Client, year: int) -> None:
     # 3. Batch-read all needed tables.
     race_results = _query_in(client, 'race_results',
         'session_key,driver_number,position,number_of_laps,dnf,dns,dsq,fastest_lap_flag,points',
+        'session_key', race_sk)
+    laps_raw = _query_in(client, 'laps',
+        'session_key,driver_number,lap_number,date_start',
         'session_key', race_sk)
     champ_drv = _query_in(client, 'championship_drivers',
         'session_key,driver_number,points_current',
@@ -810,6 +869,19 @@ def ingest_season_driver_stats(client: Client, year: int) -> None:
     for ps in pit_stops:
         ps_count_by_sk[ps['session_key']][ps['driver_number']] += 1
 
+    # Laps led: for each (session, lap_number) find the driver with the earliest
+    # date_start — they crossed the timing line first and were leading that lap.
+    _lap_starts: dict[tuple[int, int], list[tuple]] = defaultdict(list)
+    for lap in laps_raw:
+        ds = lap.get('date_start')
+        if ds is not None:
+            _lap_starts[(lap['session_key'], lap['lap_number'])].append((ds, lap['driver_number']))
+    laps_led_by_sk: dict[int, dict[int, int]] = defaultdict(lambda: defaultdict(int))
+    for (sk, _ln), entries in _lap_starts.items():
+        if entries:
+            entries.sort()
+            laps_led_by_sk[sk][entries[0][1]] += 1
+
     # Pole per qualifying session: session_key -> driver_number
     pole_by_qual_sk: dict[int, int] = {}
     for sg in starting_grid:
@@ -846,7 +918,8 @@ def ingest_season_driver_stats(client: Client, year: int) -> None:
             # Combined totals
             'races_entered': 0, 'races_classified': 0,
             'dnf_count': 0, 'dns_count': 0, 'dsq_count': 0,
-            'laps_completed': 0, 'wins': 0, 'podiums': 0, 'poles': 0,
+            'laps_completed': 0, 'laps_led': 0, 'distance_km': 0.0,
+            'wins': 0, 'podiums': 0, 'poles': 0,
             'fastest_laps': 0, 'wins_over_teammate': 0,
             'total_overtakes_made': 0, 'total_overtakes_suffered': 0,
             'total_pit_stops': 0, 'qual_gaps': [],
@@ -895,7 +968,12 @@ def ingest_season_driver_stats(client: Client, year: int) -> None:
                     c['sprint_dnf_count' if is_sprint else 'race_dnf_count'] += 1
                 else:
                     c['races_classified'] += 1
-                c['laps_completed'] += rr.get('number_of_laps') or 0
+                laps_in_session = rr.get('number_of_laps') or 0
+                c['laps_completed'] += laps_in_session
+                c['laps_led']       += laps_led_by_sk[sk].get(dn, 0)
+                ckm = circuit_len_by_mk.get(mk)
+                if ckm:
+                    c['distance_km'] += laps_in_session * ckm
                 pos = rr.get('position')
                 if pos == 1:
                     c['wins'] += 1
@@ -992,6 +1070,8 @@ def ingest_season_driver_stats(client: Client, year: int) -> None:
                 'sprint_dns_count':           c['sprint_dns_count'],
                 'sprint_dsq_count':           c['sprint_dsq_count'],
                 'laps_completed':             c['laps_completed'],
+                'laps_led':                   c['laps_led'],
+                'distance_km':                round(c['distance_km'], 3) if c['distance_km'] else None,
                 'wins':                       c['wins'],
                 'race_wins':                  c['race_wins'],
                 'sprint_wins':                c['sprint_wins'],
@@ -1028,11 +1108,14 @@ def ingest_season_constructor_stats(client: Client, year: int) -> None:
     all_year_meetings.sort(key=lambda m: m.get("date_start") or "")
     meeting_order = {m["meeting_key"]: i + 1 for i, m in enumerate(all_year_meetings)}
 
-    races_resp = client.table('races').select('meeting_key,date_start').eq('year', year).execute()
+    races_resp = client.table('races').select('meeting_key,date_start,circuit_length_km').eq('year', year).execute()
     meetings = sorted(races_resp.data or [], key=lambda m: m.get('date_start') or '')
     if not meetings:
         return
     meeting_keys = [m['meeting_key'] for m in meetings]
+    circuit_len_by_mk: dict[int, float | None] = {
+        m['meeting_key']: m.get('circuit_length_km') for m in meetings
+    }
 
     # 2. Sessions for these meetings.
     sessions_resp = (
@@ -1073,6 +1156,9 @@ def ingest_season_constructor_stats(client: Client, year: int) -> None:
     # 3. Batch-read tables.
     race_results = _query_in(client, 'race_results',
         'session_key,driver_number,position,number_of_laps,dnf,dns,dsq,fastest_lap_flag,points',
+        'session_key', race_sk)
+    laps_raw = _query_in(client, 'laps',
+        'session_key,driver_number,lap_number,date_start',
         'session_key', race_sk)
     champ_teams = _query_in(client, 'championship_teams',
         'session_key,team_name,points_current',
@@ -1127,12 +1213,29 @@ def ingest_season_constructor_stats(client: Client, year: int) -> None:
     # All team names.
     all_teams: set[str] = {d['team_name'] for d in drivers_raw if d.get('team_name')}
 
+    # Laps led per team per session: for each (session, lap_number) find the driver
+    # with the earliest date_start, look up their team, credit that team.
+    _clap_starts: dict[tuple[int, int], list[tuple]] = defaultdict(list)
+    for lap in laps_raw:
+        ds = lap.get('date_start')
+        if ds is not None:
+            _clap_starts[(lap['session_key'], lap['lap_number'])].append((ds, lap['driver_number']))
+    constructor_laps_led_by_sk: dict[int, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    for (sk, _ln), entries in _clap_starts.items():
+        if entries:
+            entries.sort()
+            leader_dn = entries[0][1]
+            leader_team = team_by_sk_dn.get((sk, leader_dn))
+            if leader_team:
+                constructor_laps_led_by_sk[sk][leader_team] += 1
+
     # 5. Accumulate.
     def _new_team_state() -> dict:
         return {
             # Combined
             'wins': 0, 'podiums': 0, 'poles': 0, 'fastest_laps': 0,
             'races_entered': 0, 'dnf_count': 0, 'laps_completed': 0,
+            'laps_led': 0, 'distance_km': 0.0,
             'total_pit_stops': 0,
             # Race-specific
             'race_entries': 0, 'race_wins': 0, 'race_podiums': 0, 'race_poles': 0,
@@ -1172,7 +1275,11 @@ def ingest_season_constructor_stats(client: Client, year: int) -> None:
                 if rr.get('dnf') and not rr.get('dns') and not rr.get('dsq'):
                     c['dnf_count'] += 1
                     c['sprint_dnf_count' if is_sprint else 'race_dnf_count'] += 1
-                c['laps_completed'] += rr.get('number_of_laps') or 0
+                laps_in_session = rr.get('number_of_laps') or 0
+                c['laps_completed'] += laps_in_session
+                ckm = circuit_len_by_mk.get(mk)
+                if ckm:
+                    c['distance_km'] += laps_in_session * ckm
                 pos = rr.get('position')
                 if pos == 1:
                     c['wins'] += 1
@@ -1183,6 +1290,11 @@ def ingest_season_constructor_stats(client: Client, year: int) -> None:
                 if rr.get('fastest_lap_flag'):
                     c['fastest_laps'] += 1
                 c['total_pit_stops'] += ps_count_by_sk[sk].get(dn, 0)
+
+            # Laps led credit per team for this session.
+            for team_name, led_count in constructor_laps_led_by_sk.get(sk, {}).items():
+                if team_name in state:
+                    state[team_name]['laps_led'] += led_count
 
             for team, pts in ct_pts_by_sk.get(sk, {}).items():
                 if pts is not None:
@@ -1234,6 +1346,8 @@ def ingest_season_constructor_stats(client: Client, year: int) -> None:
                 'race_dnf_count':    c['race_dnf_count'],
                 'sprint_dnf_count':  c['sprint_dnf_count'],
                 'laps_completed':    c['laps_completed'],
+                'laps_led':          c['laps_led'],
+                'distance_km':       round(c['distance_km'], 3) if c['distance_km'] else None,
                 'total_pit_stops':   c['total_pit_stops'],
             })
 
@@ -2681,6 +2795,10 @@ def main() -> None:
     group.add_argument("--session",  type=int, metavar="SESSION_KEY",  help="Ingest a single session")
     group.add_argument("--meeting",  type=int, metavar="MEETING_KEY",  help="Ingest all sessions in a meeting")
     group.add_argument("--year",     type=int, metavar="YEAR",         help="Ingest all meetings for a year")
+    group.add_argument("--season-stats", type=int, metavar="YEAR",
+                        help="Recompute season driver/constructor stats for a year (no re-ingestion)")
+    group.add_argument("--backfill-circuit-lengths", action="store_true",
+                        help="Backfill circuit_length_km for all meetings already in the races table")
     parser.add_argument("--recompute", action="store_true",
                         help="Regenerate derived metrics without re-fetching raw data")
     args = parser.parse_args()
@@ -2699,6 +2817,14 @@ def main() -> None:
         process_meeting(client, args.meeting, recompute=args.recompute)
     elif args.year:
         process_year(client, args.year, recompute=args.recompute)
+    elif args.season_stats:
+        year = args.season_stats
+        print(f"Recomputing season stats for {year}...")
+        ingest_season_driver_stats(client, year)
+        ingest_season_constructor_stats(client, year)
+        print(f"✓ Season stats for {year} complete")
+    elif args.backfill_circuit_lengths:
+        backfill_circuit_lengths(client)
 
 
 if __name__ == "__main__":

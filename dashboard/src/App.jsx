@@ -4,6 +4,7 @@ import { useMobile } from './hooks/useMobile'
 import RacePage from './pages/RacePage'
 import QualifyingPage from './pages/QualifyingPage'
 import DriverPage from './pages/DriverPage'
+import SeasonPage from './pages/SeasonPage'
 
 const THEME = {
   bg: '#09090b',
@@ -176,20 +177,22 @@ export default function App() {
               </select>
             </label>
 
-            <label style={labelStyle}>
-              <span>Weekend</span>
-              <select
-                style={makeSelectStyle(isMobile)}
-                value={selector.selectedMeetingKey ?? ''}
-                onChange={e => selector.setSelectedMeetingKey(Number(e.target.value))}
-              >
-                {selector.meetings.map(m => (
-                  <option key={m.meeting_key} value={m.meeting_key}>{m.meeting_name}</option>
-                ))}
-              </select>
-            </label>
+            {activeTab !== 'Season' && (
+              <label style={labelStyle}>
+                <span>Weekend</span>
+                <select
+                  style={makeSelectStyle(isMobile)}
+                  value={selector.selectedMeetingKey ?? ''}
+                  onChange={e => selector.setSelectedMeetingKey(Number(e.target.value))}
+                >
+                  {selector.meetings.map(m => (
+                    <option key={m.meeting_key} value={m.meeting_key}>{m.meeting_name}</option>
+                  ))}
+                </select>
+              </label>
+            )}
 
-            {selector.isSprintWeekend && (
+            {activeTab !== 'Season' && selector.isSprintWeekend && (
               <label style={labelStyle}>
                 <span>Event</span>
                 <select
@@ -212,7 +215,7 @@ export default function App() {
             borderBottom: `1px solid ${THEME.border}`,
             background: THEME.surface,
           }}>
-            {['Race', 'Qualifying', 'Driver'].map(tab => (
+            {['Season', 'Race', 'Qualifying', 'Driver'].map(tab => (
               <TabButton
                 key={tab}
                 label={tab}
@@ -232,6 +235,9 @@ export default function App() {
             )}
             {activeTab === 'Driver' && (
               <DriverPage raceSessionKey={selector.raceSessionKey} qualifyingSessionKey={selector.qualifyingSessionKey} gmtOffset={selector.gmtOffset} isMobile={isMobile} />
+            )}
+            {activeTab === 'Season' && (
+              <SeasonPage year={selector.selectedYear} isMobile={isMobile} />
             )}
           </div>
         </>
