@@ -48,7 +48,7 @@ export default function InfoTooltip({ content, width = 280, placement = 'top' })
           flexShrink: 0,
         }}
       >
-        ?
+        i
       </button>
 
       {visible && (

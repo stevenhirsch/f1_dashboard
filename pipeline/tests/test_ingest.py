@@ -12,6 +12,8 @@ from ingest import (
     _brake_zone_stats,
     _build_neutralized_periods,
     _compute_lap_metrics,
+    _compute_laps_led_by_sk,
+    _query_in_all,
     _compute_qualifying_best_per_phase,
     _find_brake_zones,
     _get_compound_for_lap,
@@ -4487,6 +4489,8 @@ class TestIngestSeasonDriverStats(unittest.TestCase):
             # .select().eq()... or .select().in_()... both lead to .execute().data
             m.select.return_value.eq.return_value.execute.return_value.data = data
             m.select.return_value.in_.return_value.execute.return_value.data = data
+            # _query_in_all uses .range().execute().data (pagination — one page, then empty)
+            m.select.return_value.in_.return_value.range.return_value.execute.return_value.data = data
             m.upsert.return_value.execute.return_value = MagicMock()
             return m
 
@@ -4864,6 +4868,8 @@ class TestIngestSeasonConstructorStats(unittest.TestCase):
             m = MagicMock()
             m.select.return_value.eq.return_value.execute.return_value.data = data
             m.select.return_value.in_.return_value.execute.return_value.data = data
+            # _query_in_all uses .range().execute().data (pagination — one page, then empty)
+            m.select.return_value.in_.return_value.range.return_value.execute.return_value.data = data
 
             def capture(rows, **kwargs):
                 if name == 'season_constructor_stats':
@@ -4997,6 +5003,197 @@ class TestIngestSeasonConstructorStats(unittest.TestCase):
         self.assertIn('round_number', rows[0])
         self.assertIn('team_name', rows[0])
         self.assertEqual(rows[0]['year'], 2026)
+
+
+class TestQueryInAll(unittest.TestCase):
+    """Unit tests for _query_in_all pagination helper."""
+
+    def _client(self, pages: list[list[dict]]) -> MagicMock:
+        """Build a mock client whose paginated calls return successive pages."""
+        page_iter = iter(pages)
+
+        def range_side(*_args, **_kwargs):
+            m = MagicMock()
+            try:
+                page = next(page_iter)
+            except StopIteration:
+                page = []
+            m.execute.return_value.data = page
+            return m
+
+        m_in = MagicMock()
+        m_in.range.side_effect = range_side
+
+        m_select = MagicMock()
+        m_select.in_.return_value = m_in
+
+        m_table = MagicMock()
+        m_table.select.return_value = m_select
+
+        client = MagicMock()
+        client.table.return_value = m_table
+        return client
+
+    def test_empty_values_returns_empty(self):
+        client = MagicMock()
+        result = _query_in_all(client, 'laps', 'session_key', 'session_key', [])
+        self.assertEqual(result, [])
+        client.table.assert_not_called()
+
+    def test_single_page_returns_all_rows(self):
+        rows = [{'id': i} for i in range(5)]
+        client = self._client([rows, []])
+        result = _query_in_all(client, 'laps', 'id', 'session_key', [1])
+        self.assertEqual(result, rows)
+
+    def test_two_full_pages_then_empty(self):
+        page1 = [{'id': i} for i in range(1000)]
+        page2 = [{'id': i} for i in range(1000, 1500)]
+        client = self._client([page1, page2, []])
+        result = _query_in_all(client, 'laps', 'id', 'session_key', [1])
+        self.assertEqual(len(result), 1500)
+        self.assertEqual(result, page1 + page2)
+
+    def test_exactly_1000_rows_triggers_second_request(self):
+        # A full page of exactly 1000 rows must trigger a second request
+        page1 = [{'id': i} for i in range(1000)]
+        client = self._client([page1, []])
+        result = _query_in_all(client, 'laps', 'id', 'session_key', [1])
+        self.assertEqual(len(result), 1000)
+
+    def test_partial_last_page_stops_pagination(self):
+        page1 = [{'id': i} for i in range(1000)]
+        page2 = [{'id': i} for i in range(1000, 1050)]
+        client = self._client([page1, page2])
+        result = _query_in_all(client, 'laps', 'id', 'session_key', [1])
+        self.assertEqual(len(result), 1050)
+
+
+class TestComputeLapsLedBySk(unittest.TestCase):
+    """Unit tests for _compute_laps_led_by_sk."""
+
+    def _lap(self, sk, dn, ln, ds):
+        return {'session_key': sk, 'driver_number': dn, 'lap_number': ln, 'date_start': ds}
+
+    def _rr(self, sk, dn, laps):
+        return {'session_key': sk, 'driver_number': dn, 'number_of_laps': laps}
+
+    def _pos(self, sk, dn, date, pos):
+        return {'session_key': sk, 'driver_number': dn, 'date': date, 'position': pos}
+
+    # --- primary method ---
+
+    def test_single_driver_leads_every_lap(self):
+        laps = [
+            self._lap(1, 44, 1, '2026-01-01T13:00:00'),
+            self._lap(1, 44, 2, '2026-01-01T13:01:30'),
+        ]
+        rr = [self._rr(1, 44, 2)]
+        result = _compute_laps_led_by_sk(laps, rr, [])
+        self.assertEqual(result[1][44], 2)
+
+    def test_leader_is_earliest_date_start(self):
+        # driver 44 starts lap 1 earlier than driver 1 → 44 leads
+        laps = [
+            self._lap(1, 44, 1, '2026-01-01T13:00:00'),
+            self._lap(1,  1, 1, '2026-01-01T13:00:05'),
+        ]
+        rr = [self._rr(1, 44, 1), self._rr(1, 1, 1)]
+        result = _compute_laps_led_by_sk(laps, rr, [])
+        self.assertEqual(result[1][44], 1)
+        self.assertEqual(result[1].get(1, 0), 0)
+
+    def test_null_date_start_excluded_from_primary(self):
+        # Only driver 1 has date_start; driver 44 has null → driver 1 credited
+        laps = [
+            self._lap(1, 44, 1, None),
+            self._lap(1,  1, 1, '2026-01-01T13:00:05'),
+        ]
+        rr = [self._rr(1, 44, 1), self._rr(1, 1, 1)]
+        result = _compute_laps_led_by_sk(laps, rr, [])
+        self.assertEqual(result[1][1], 1)
+        self.assertEqual(result[1].get(44, 0), 0)
+
+    def test_sum_equals_total_laps_all_date_start_present(self):
+        laps = [
+            self._lap(1, 44, 1, '2026-01-01T13:00:00'),
+            self._lap(1,  1, 1, '2026-01-01T13:00:05'),
+            self._lap(1, 44, 2, '2026-01-01T13:01:30'),
+            self._lap(1,  1, 2, '2026-01-01T13:01:35'),
+        ]
+        rr = [self._rr(1, 44, 2), self._rr(1, 1, 2)]
+        result = _compute_laps_led_by_sk(laps, rr, [])
+        total = sum(result[1].values())
+        self.assertEqual(total, 2)
+
+    # --- fallback via position table ---
+
+    def test_missing_lap_filled_from_position_table(self):
+        # Lap 2 has no date_start for any driver → use position table
+        laps = [
+            self._lap(1, 44, 1, '2026-01-01T13:00:00'),
+            self._lap(1,  1, 1, '2026-01-01T13:00:05'),
+            # lap 2: all drivers have null date_start
+            self._lap(1, 44, 2, None),
+            self._lap(1,  1, 2, None),
+            self._lap(1, 44, 3, '2026-01-01T13:03:00'),
+            self._lap(1,  1, 3, '2026-01-01T13:03:05'),
+        ]
+        rr = [self._rr(1, 44, 3), self._rr(1, 1, 3)]
+        # Position table says driver 44 was P1 throughout
+        pos = [self._pos(1, 44, '2026-01-01T13:00:00', 1)]
+        result = _compute_laps_led_by_sk(laps, rr, pos)
+        # laps 1 and 3 → driver 44; lap 2 fallback → driver 44
+        self.assertEqual(result[1][44], 3)
+        total = sum(result[1].values())
+        self.assertEqual(total, 3)
+
+    def test_fallback_picks_correct_leader_from_position_change(self):
+        # Driver 44 leads first two laps, driver 1 leads lap 3 (missing date_start)
+        laps = [
+            self._lap(1, 44, 1, '2026-01-01T13:00:00'),
+            self._lap(1,  1, 1, '2026-01-01T13:00:05'),
+            self._lap(1, 44, 2, '2026-01-01T13:01:30'),
+            self._lap(1,  1, 2, '2026-01-01T13:01:35'),
+            self._lap(1, 44, 3, None),
+            self._lap(1,  1, 3, None),
+        ]
+        rr = [self._rr(1, 44, 3), self._rr(1, 1, 3)]
+        # Driver 1 overtook at 13:02:45 — after lap 2 started but before where lap 3 is estimated
+        pos = [
+            self._pos(1, 44, '2026-01-01T13:00:00', 1),
+            self._pos(1,  1, '2026-01-01T13:02:45', 1),
+        ]
+        result = _compute_laps_led_by_sk(laps, rr, pos)
+        # Lap 3 start is estimated around 13:03:00, which is after 13:02:45 → driver 1 leads
+        self.assertEqual(result[1][1], 1)   # leads lap 3
+        self.assertEqual(result[1][44], 2)  # leads laps 1 and 2
+        self.assertEqual(sum(result[1].values()), 3)
+
+    def test_no_position_rows_missing_laps_uncredited(self):
+        # Lap 2 has no date_start, no position data → lap 2 goes uncredited
+        laps = [
+            self._lap(1, 44, 1, '2026-01-01T13:00:00'),
+            self._lap(1, 44, 2, None),
+        ]
+        rr = [self._rr(1, 44, 2)]
+        result = _compute_laps_led_by_sk(laps, rr, [])
+        self.assertEqual(result[1][44], 1)
+        self.assertEqual(sum(result[1].values()), 1)  # lap 2 uncredited
+
+    def test_empty_laps_and_results(self):
+        result = _compute_laps_led_by_sk([], [], [])
+        self.assertEqual(dict(result), {})
+
+    def test_multiple_sessions_independent(self):
+        laps = [
+            self._lap(1, 44, 1, '2026-01-01T13:00:00'),
+            self._lap(2, 33, 1, '2026-01-15T14:00:00'),
+        ]
+        rr = [self._rr(1, 44, 1), self._rr(2, 33, 1)]
+        result = _compute_laps_led_by_sk(laps, rr, [])
+        self.assertEqual(result[1][44], 1)
+        self.assertEqual(result[2][33], 1)
 
 
 if __name__ == "__main__":

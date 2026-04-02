@@ -1,7 +1,7 @@
 # F1 Dashboard — Progress Log
 
 ## Current Status
-**Phase 5 (Derived Metrics Pipeline) complete. All pipeline functions implemented and validated: car-data metrics, lap flags, sector bests, brake entry speed ranks, battle states, stint metrics, championship gap fields, and season stats. 366 tests passing. Next: Phase 6 (Driver Tab, Part B) — surface derived metrics in the frontend. Backfill ingestion ongoing in background.**
+**Phase 5 (Derived Metrics Pipeline) complete. Season Tab UI polished: laps led accuracy fixed (position-table fallback + Supabase pagination), DNS column, renamed overtakes columns, corrected Led %  and W% vs Teammate denominators, dashed teammate lines in points chart. 380 tests passing. Next: Phase 6 (Driver Tab, Part B) — surface derived metrics in the frontend. Backfill ingestion ongoing in background.**
 
 ---
 
@@ -328,7 +328,14 @@ All tables populated correctly for meeting 1280 (2026 Chinese GP).
 
 ## Where to Pick Up Next
 
-### Season Tab — Immediate Backlog (pick up here first)
+### Season Tab — Immediate Backlog (pick up here next)
+
+**Completed 2026-04-02:**
+- Driver DNS column added to `DriverStatsTable` ✅
+- Overtakes/Overtaken renamed to "Pos Gained" / "Pos Lost"; Led % and W% vs Teammate denominators fixed ✅
+- `_query_in_all()` pagination fix + `_compute_laps_led_by_sk()` laps led accuracy fix ✅
+- Dashed teammate lines in `DriverPointsTrendChart` ✅
+- `InfoTooltip` `?` → `i`; info bubbles added to Driver Standings header and DriverPage overtakes card ✅
 
 **1. Constructor DNS + DSQ columns (full stack)**
 - Schema: `ALTER TABLE season_constructor_stats ADD COLUMN IF NOT EXISTS dns_count integer; ALTER TABLE season_constructor_stats ADD COLUMN IF NOT EXISTS dsq_count integer;`
@@ -336,11 +343,7 @@ All tables populated correctly for meeting 1280 (2026 Chinese GP).
 - Re-run: `pixi run -e pipeline python pipeline/ingest.py --season-stats 2026`
 - Frontend: add DNS and DSQ columns to `ConstructorStatsTable` in `SeasonPage.jsx` (red-coloured when non-zero, matching driver table pattern)
 
-**2. Driver DNS column (frontend only — no pipeline work needed)**
-- `dns_count` already exists in `season_driver_stats`
-- Add column to `DriverStatsTable` in `SeasonPage.jsx` between DSQ and W vs TM
-
-**3. Pit stop `stop_duration` coverage**
+**2. Pit stop `stop_duration` coverage**
 - Currently only Shanghai (round 2) has `stop_duration` populated in OpenF1 for 2026; Melbourne and Suzuka are null
 - Re-check after OpenF1 backfills data, then re-ingest those sessions
 - When resolved, pit stop violin and stats table will show all constructors across all rounds

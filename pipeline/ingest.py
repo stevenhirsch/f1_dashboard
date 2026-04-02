@@ -30,6 +30,7 @@ import statistics
 import sys
 import time
 from collections import defaultdict
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import httpx
@@ -75,6 +76,32 @@ def _query_in(client: Client, table: str, select: str, column: str, values: list
     if not values:
         return []
     return client.table(table).select(select).in_(column, values).execute().data or []
+
+
+def _query_in_all(client: Client, table: str, select: str, column: str, values: list) -> list[dict]:
+    """Like _query_in but paginates to retrieve all rows, bypassing Supabase's default row limit.
+
+    Use this for tables that can exceed ~1000 rows across multiple sessions (e.g. laps, position).
+    """
+    if not values:
+        return []
+    PAGE = 1000
+    all_rows: list[dict] = []
+    start = 0
+    while True:
+        chunk = (
+            client.table(table)
+            .select(select)
+            .in_(column, values)
+            .range(start, start + PAGE - 1)
+            .execute()
+            .data or []
+        )
+        all_rows.extend(chunk)
+        if len(chunk) < PAGE:
+            break
+        start += PAGE
+    return all_rows
 
 
 # ---------------------------------------------------------------------------
@@ -756,6 +783,118 @@ def ingest_championship_teams(client: Client, session_key: int) -> None:
     _upsert(client, "championship_teams", rows)
 
 
+def _compute_laps_led_by_sk(
+    laps_raw: list[dict],
+    race_results: list[dict],
+    position_rows: list[dict],
+) -> dict[int, dict[int, int]]:
+    """Return {session_key: {driver_number: laps_led_count}}.
+
+    Primary method: for each (session, lap_number) find the driver whose
+    date_start is earliest — they crossed the line first and were leading.
+    Fallback: for laps where every driver has a null date_start, estimate the
+    lap's start time by linear interpolation from neighbouring known laps and
+    look up who held P1 in the position table at that moment.
+    """
+    # --- Primary: date_start-based attribution ---
+    _lap_starts: dict[tuple[int, int], list[tuple]] = defaultdict(list)
+    for lap in laps_raw:
+        ds = lap.get('date_start')
+        if ds is not None:
+            _lap_starts[(lap['session_key'], lap['lap_number'])].append(
+                (ds, lap['driver_number'])
+            )
+
+    laps_led: dict[int, dict[int, int]] = defaultdict(lambda: defaultdict(int))
+    for (sk, _ln), entries in _lap_starts.items():
+        if entries:
+            entries.sort()
+            laps_led[sk][entries[0][1]] += 1
+
+    # --- Find which laps have no date_start at all ---
+    total_laps_by_sk: dict[int, int] = defaultdict(int)
+    for rr in race_results:
+        sk = rr['session_key']
+        n = rr.get('number_of_laps') or 0
+        total_laps_by_sk[sk] = max(total_laps_by_sk[sk], n)
+
+    missing: list[tuple[int, int]] = []
+    for sk, total in total_laps_by_sk.items():
+        for ln in range(1, total + 1):
+            if (sk, ln) not in _lap_starts:
+                missing.append((sk, ln))
+
+    if not missing or not position_rows:
+        return laps_led
+
+    # --- Build P1 event timeline per session (sorted by date) ---
+    p1_events_by_sk: dict[int, list[tuple[str, int]]] = defaultdict(list)
+    for p in position_rows:
+        if p.get('position') == 1 and p.get('date') and p.get('driver_number') is not None:
+            p1_events_by_sk[p['session_key']].append((p['date'], p['driver_number']))
+    for sk in p1_events_by_sk:
+        p1_events_by_sk[sk].sort()
+
+    # --- Build per-session sorted list of known lap start times ---
+    known_start_by_skln: dict[tuple[int, int], str] = {}
+    for lap in laps_raw:
+        ds = lap.get('date_start')
+        if ds is not None:
+            key = (lap['session_key'], lap['lap_number'])
+            if key not in known_start_by_skln or ds < known_start_by_skln[key]:
+                known_start_by_skln[key] = ds
+
+    sk_sorted_laps: dict[int, list[tuple[int, str]]] = defaultdict(list)
+    for (sk, ln), t in known_start_by_skln.items():
+        sk_sorted_laps[sk].append((ln, t))
+    for sk in sk_sorted_laps:
+        sk_sorted_laps[sk].sort()
+
+    def _leader_at(sk: int, t_str: str) -> int | None:
+        events = p1_events_by_sk.get(sk, [])
+        if not events:
+            return None
+        dates = [e[0] for e in events]
+        idx = bisect.bisect_right(dates, t_str) - 1
+        return events[idx][1] if idx >= 0 else events[0][1]
+
+    def _estimate_start(sk: int, ln: int) -> str | None:
+        known = sk_sorted_laps.get(sk, [])
+        if not known:
+            return None
+        lap_nums = [x[0] for x in known]
+        idx = bisect.bisect_right(lap_nums, ln)  # first index where lap_num > ln
+        if idx == 0:
+            ln1, t1 = known[0]
+            ln2, t2 = known[1] if len(known) > 1 else known[0]
+        elif idx >= len(known):
+            ln2, t2 = known[-1]
+            ln1, t1 = known[-2] if len(known) > 1 else known[-1]
+        else:
+            ln1, t1 = known[idx - 1]
+            ln2, t2 = known[idx]
+        if ln1 == ln2:
+            return t1
+        try:
+            dt1 = datetime.fromisoformat(t1.replace('Z', '+00:00'))
+            dt2 = datetime.fromisoformat(t2.replace('Z', '+00:00'))
+            frac = (ln - ln1) / (ln2 - ln1)
+            est = dt1 + timedelta(seconds=(dt2 - dt1).total_seconds() * frac)
+            return est.isoformat()
+        except Exception:
+            return None
+
+    for sk, ln in missing:
+        t_est = _estimate_start(sk, ln)
+        if t_est is None:
+            continue
+        leader = _leader_at(sk, t_est)
+        if leader is not None:
+            laps_led[sk][leader] += 1
+
+    return laps_led
+
+
 def ingest_season_driver_stats(client: Client, year: int) -> None:
     """Compute and upsert cumulative per-driver season stats, one row per (year, round, driver)."""
     # 1. Build canonical round order from the full F1 calendar (OpenF1), then restrict
@@ -821,7 +960,7 @@ def ingest_season_driver_stats(client: Client, year: int) -> None:
     race_results = _query_in(client, 'race_results',
         'session_key,driver_number,position,number_of_laps,dnf,dns,dsq,fastest_lap_flag,points',
         'session_key', race_sk)
-    laps_raw = _query_in(client, 'laps',
+    laps_raw = _query_in_all(client, 'laps',
         'session_key,driver_number,lap_number,date_start',
         'session_key', race_sk)
     champ_drv = _query_in(client, 'championship_drivers',
@@ -844,6 +983,9 @@ def ingest_season_driver_stats(client: Client, year: int) -> None:
         'session_key', all_sk)
     champ_teams = _query_in(client, 'championship_teams',
         'session_key,team_name,points_current',
+        'session_key', race_sk)
+    position_rows = _query_in_all(client, 'position',
+        'session_key,driver_number,date,position',
         'session_key', race_sk)
 
     # 4. Build lookup indexes.
@@ -869,18 +1011,9 @@ def ingest_season_driver_stats(client: Client, year: int) -> None:
     for ps in pit_stops:
         ps_count_by_sk[ps['session_key']][ps['driver_number']] += 1
 
-    # Laps led: for each (session, lap_number) find the driver with the earliest
-    # date_start — they crossed the timing line first and were leading that lap.
-    _lap_starts: dict[tuple[int, int], list[tuple]] = defaultdict(list)
-    for lap in laps_raw:
-        ds = lap.get('date_start')
-        if ds is not None:
-            _lap_starts[(lap['session_key'], lap['lap_number'])].append((ds, lap['driver_number']))
-    laps_led_by_sk: dict[int, dict[int, int]] = defaultdict(lambda: defaultdict(int))
-    for (sk, _ln), entries in _lap_starts.items():
-        if entries:
-            entries.sort()
-            laps_led_by_sk[sk][entries[0][1]] += 1
+    # Laps led: primary method uses date_start; position table fills in laps
+    # where every driver's date_start is null so sum(laps_led) == total race laps.
+    laps_led_by_sk = _compute_laps_led_by_sk(laps_raw, race_results, position_rows)
 
     # Pole per qualifying session: session_key -> driver_number
     pole_by_qual_sk: dict[int, int] = {}
@@ -1157,7 +1290,7 @@ def ingest_season_constructor_stats(client: Client, year: int) -> None:
     race_results = _query_in(client, 'race_results',
         'session_key,driver_number,position,number_of_laps,dnf,dns,dsq,fastest_lap_flag,points',
         'session_key', race_sk)
-    laps_raw = _query_in(client, 'laps',
+    laps_raw = _query_in_all(client, 'laps',
         'session_key,driver_number,lap_number,date_start',
         'session_key', race_sk)
     champ_teams = _query_in(client, 'championship_teams',
@@ -1172,6 +1305,9 @@ def ingest_season_constructor_stats(client: Client, year: int) -> None:
     drivers_raw = _query_in(client, 'drivers',
         'session_key,driver_number,team_name',
         'session_key', all_sk)
+    position_rows = _query_in_all(client, 'position',
+        'session_key,driver_number,date,position',
+        'session_key', race_sk)
 
     # 4. Build indexes.
     rr_by_sk: dict[int, dict[int, dict]] = defaultdict(dict)
@@ -1213,21 +1349,16 @@ def ingest_season_constructor_stats(client: Client, year: int) -> None:
     # All team names.
     all_teams: set[str] = {d['team_name'] for d in drivers_raw if d.get('team_name')}
 
-    # Laps led per team per session: for each (session, lap_number) find the driver
-    # with the earliest date_start, look up their team, credit that team.
-    _clap_starts: dict[tuple[int, int], list[tuple]] = defaultdict(list)
-    for lap in laps_raw:
-        ds = lap.get('date_start')
-        if ds is not None:
-            _clap_starts[(lap['session_key'], lap['lap_number'])].append((ds, lap['driver_number']))
+    # Laps led per driver per session (with position-table fallback for null date_start laps).
+    driver_laps_led_by_sk = _compute_laps_led_by_sk(laps_raw, race_results, position_rows)
+
+    # Map driver-level laps_led to team level.
     constructor_laps_led_by_sk: dict[int, dict[str, int]] = defaultdict(lambda: defaultdict(int))
-    for (sk, _ln), entries in _clap_starts.items():
-        if entries:
-            entries.sort()
-            leader_dn = entries[0][1]
-            leader_team = team_by_sk_dn.get((sk, leader_dn))
-            if leader_team:
-                constructor_laps_led_by_sk[sk][leader_team] += 1
+    for sk, driver_counts in driver_laps_led_by_sk.items():
+        for dn, cnt in driver_counts.items():
+            team = team_by_sk_dn.get((sk, dn))
+            if team:
+                constructor_laps_led_by_sk[sk][team] += cnt
 
     # 5. Accumulate.
     def _new_team_state() -> dict:

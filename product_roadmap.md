@@ -112,6 +112,16 @@ circuits             — static reference table: circuit_key, name, location, co
                        not part of the automated ingest workflow
 ```
 
+### Known Metric Limitations
+
+**W% vs Teammate** — denominator is the sum of `wins_over_teammate` across both teammates (i.e. total races where a head-to-head result existed). DNS, DSQ, and unclassified DNF races where neither driver earns a win are naturally excluded from both numerator and denominator, so percentages always sum to 100% within a team. A race only contributes to the denominator if one of the two drivers beat the other.
+
+**Positions Gained / Positions Lost** — sourced from OpenF1's `/overtakes` endpoint, which counts every position change per race including those caused by pit stops. OpenF1 notes this data may be incomplete. Treat these as approximate activity counts rather than precise on-track overtake tallies.
+
+**Laps Led %** — expressed as a percentage of the maximum `laps_completed` across all drivers in the season (i.e. the total number of race laps run). Rounds to the nearest integer; the column will typically sum to 100% ± 1 due to rounding.
+
+---
+
 ### Ingestion Principles
 
 - All writes use **upsert** keyed on natural identifiers — e.g. `(session_key, driver_number, lap_number)` — running the pipeline twice produces no duplicates
@@ -440,24 +450,29 @@ When a formula changes, run `ingest.py --recompute --session <session_key>` to r
 ---
 
 ### Season Tab — Backlog Items
-- Status: Partially complete (built 2026-04-01)
+- Status: Partially complete (built 2026-04-01, UI polished 2026-04-02)
 
 **Completed:**
-- Driver standings table: total pts, race pts, sprint pts, % of team pts, wins, podiums, fastest laps, DNF, DSQ, W vs TM, W% vs TM, laps led, laps led %, laps completed, distance driven
-- Constructor standings table: total pts, race pts, sprint pts, wins, podiums, DNF, laps led, laps led %, laps completed, distance driven
-- Points progression line charts (drivers + constructors), coloured by team colour
+- Driver standings table: total pts, race pts, sprint pts, % of team pts, wins, podiums, fastest laps, DNF, DSQ, DNS, W vs TM, W% vs TM, laps led, laps led %, laps completed, distance driven
+- Constructor standings table: total pts, race pts, sprint pts, wins, podiums, DNF, laps led, laps led %, total laps, distance driven
+- Points progression line charts (drivers + constructors), coloured by team colour; second driver per constructor uses a dashed line to distinguish same-colour traces
 - Pit stop violin plot (horizontal, sorted fastest → slowest constructor, points coloured by race)
 - Pit stop statistics table (fastest highlighted gold, fastest mean highlighted gold)
 - `--season-stats YEAR` and `--backfill-circuit-lengths` CLI flags added to pipeline
 - `circuit_length_km` stored in `races` table via `CIRCUIT_LENGTHS_KM` static lookup
 - `laps_led` and `distance_km` computed in both `season_driver_stats` and `season_constructor_stats`
+- `_query_in_all()` — paginated Supabase query (`.range()`) to bypass implicit 1000-row limit; used for `laps` and `position` fetches in season stats
+- `_compute_laps_led_by_sk()` — accurate laps led with `date_start`-based leader detection and `position` table fallback for laps where all drivers have null `date_start`; `sum(laps_led)` now equals total season race laps
+- Driver DNS column added to `DriverStatsTable`
+- Overtakes/Overtaken columns renamed to "Pos Gained" / "Pos Lost"; Led % denominator fixed to `totalSeasonLaps`; W% vs Teammate denominator fixed to total `wins_over_teammate` across both teammates
+- Constructor Led % denominator sourced from driver-level `totalSeasonLaps` (avoids 2× inflation from combined `laps_completed`); "Laps" column renamed "Total Laps"
+- `InfoTooltip` label changed from `?` to `i` globally; info bubble added to Driver Standings header (explains Pos Gained/Lost and W% vs Teammate); info bubble added to DriverPage Race sub-tab overtakes statcard
 
 **Pending:**
 - Constructor DNS + DSQ columns:
   - Schema: `ALTER TABLE season_constructor_stats ADD COLUMN IF NOT EXISTS dns_count integer; ALTER TABLE season_constructor_stats ADD COLUMN IF NOT EXISTS dsq_count integer;`
   - Pipeline: add to `_new_team_state()`, accumulate, emit
   - Re-run `--season-stats 2026`, add columns to `ConstructorStatsTable`
-- Driver DNS column (frontend only): `dns_count` exists in DB — add to `DriverStatsTable` in `SeasonPage.jsx`
 - Pit stop `stop_duration` coverage: OpenF1 only has stationary time for Shanghai in 2026; re-check after backfill
 
 ---

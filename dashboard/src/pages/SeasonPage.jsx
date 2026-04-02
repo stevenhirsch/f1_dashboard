@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import InfoTooltip from '../components/InfoTooltip'
 import { useSeasonSummary } from '../hooks/useSeasonSummary'
 import DriverPointsTrendChart from '../plots/DriverPointsTrendChart'
 import ConstructorPointsTrendChart from '../plots/ConstructorPointsTrendChart'
@@ -116,7 +117,15 @@ function Td({ children, isMobile, right, style }) {
 function DriverStatsTable({ driverRows, isMobile }) {
   if (!driverRows?.length) return <p style={{ color: THEME.muted }}>No data.</p>
 
-  const headers = ['Pos', 'Driver', 'Team', 'Pts', 'Race Pts', 'Sprint Pts', '% of Team', 'Wins', 'Podiums', 'FL', 'DNF', 'DSQ', 'W vs TM', 'W% vs TM', 'Laps Led', 'Led %', 'Laps', 'Distance']
+  const totalSeasonLaps = Math.max(...driverRows.map(r => r.laps_completed ?? 0))
+
+  const teamH2HTotal = {}
+  for (const row of driverRows) {
+    const team = row.meta?.team_name
+    if (team) teamH2HTotal[team] = (teamH2HTotal[team] ?? 0) + (row.wins_over_teammate ?? 0)
+  }
+
+  const headers = ['Pos', 'Driver', 'Team', 'Pts', 'Race Pts', 'Sprint Pts', '% of Team', 'Wins', 'Podiums', 'FL', 'DNF', 'DNS', 'DSQ', 'W vs TM', 'W% vs TM', 'Laps Led', 'Led %', 'Pos Gained', 'Pos Lost', 'Laps', 'Distance']
 
   return (
     <TableWrapper>
@@ -162,11 +171,14 @@ function DriverStatsTable({ driverRows, isMobile }) {
                 <Td isMobile={isMobile} right>{fmtInt(row.podiums)}</Td>
                 <Td isMobile={isMobile} right>{fmtInt(row.fastest_laps)}</Td>
                 <Td isMobile={isMobile} right style={{ color: row.dnf_count > 0 ? '#ef4444' : THEME.text }}>{fmtInt(row.dnf_count)}</Td>
+                <Td isMobile={isMobile} right style={{ color: row.dns_count > 0 ? '#ef4444' : THEME.text }}>{fmtInt(row.dns_count)}</Td>
                 <Td isMobile={isMobile} right style={{ color: row.dsq_count > 0 ? '#ef4444' : THEME.text }}>{fmtInt(row.dsq_count)}</Td>
                 <Td isMobile={isMobile} right>{fmtInt(row.wins_over_teammate)}</Td>
-                <Td isMobile={isMobile} right>{fmtWPct(row.wins_over_teammate, row.races_entered)}</Td>
+                <Td isMobile={isMobile} right>{fmtWPct(row.wins_over_teammate, teamH2HTotal[meta.team_name])}</Td>
                 <Td isMobile={isMobile} right>{fmtInt(row.laps_led)}</Td>
-                <Td isMobile={isMobile} right>{fmtWPct(row.laps_led, row.laps_completed)}</Td>
+                <Td isMobile={isMobile} right>{fmtWPct(row.laps_led, totalSeasonLaps)}</Td>
+                <Td isMobile={isMobile} right>{fmtInt(row.total_overtakes_made)}</Td>
+                <Td isMobile={isMobile} right>{fmtInt(row.total_overtakes_suffered)}</Td>
                 <Td isMobile={isMobile} right>{fmtInt(row.laps_completed)}</Td>
                 <Td isMobile={isMobile} right>{fmtDist(row.distance_km)}</Td>
               </tr>
@@ -178,10 +190,10 @@ function DriverStatsTable({ driverRows, isMobile }) {
   )
 }
 
-function ConstructorStatsTable({ constructorRows, constructorColour, isMobile }) {
+function ConstructorStatsTable({ constructorRows, constructorColour, totalSeasonLaps, isMobile }) {
   if (!constructorRows?.length) return <p style={{ color: THEME.muted }}>No data.</p>
 
-  const headers = ['Pos', 'Constructor', 'Pts', 'Race Pts', 'Sprint Pts', 'Wins', 'Podiums', 'DNF', 'Laps Led', 'Led %', 'Laps', 'Distance']
+  const headers = ['Pos', 'Constructor', 'Pts', 'Race Pts', 'Sprint Pts', 'Wins', 'Podiums', 'DNF', 'Laps Led', 'Led %', 'Total Laps', 'Distance']
 
   return (
     <TableWrapper>
@@ -224,7 +236,7 @@ function ConstructorStatsTable({ constructorRows, constructorColour, isMobile })
                 <Td isMobile={isMobile} right>{fmtInt(row.podiums)}</Td>
                 <Td isMobile={isMobile} right style={{ color: row.dnf_count > 0 ? '#ef4444' : THEME.text }}>{fmtInt(row.dnf_count)}</Td>
                 <Td isMobile={isMobile} right>{fmtInt(row.laps_led)}</Td>
-                <Td isMobile={isMobile} right>{fmtWPct(row.laps_led, row.laps_completed)}</Td>
+                <Td isMobile={isMobile} right>{fmtWPct(row.laps_led, totalSeasonLaps)}</Td>
                 <Td isMobile={isMobile} right>{fmtInt(row.laps_completed)}</Td>
                 <Td isMobile={isMobile} right>{fmtDist(row.distance_km)}</Td>
               </tr>
@@ -306,6 +318,8 @@ export default function SeasonPage({ year, isMobile }) {
     pitStopsByTeam,
   } = data
 
+  const totalSeasonLaps = Math.max(...(driverRows ?? []).map(r => r.laps_completed ?? 0))
+
   return (
     <div>
       <SubTabBar
@@ -317,7 +331,17 @@ export default function SeasonPage({ year, isMobile }) {
 
       {activeSubTab === 'Drivers' && (
         <div>
-          <SectionHeader>Driver Standings</SectionHeader>
+          <SectionHeader>
+            Driver Standings
+            <InfoTooltip placement="bottom" width={280} content={
+              <div>
+                <div style={{ fontWeight: 'bold', marginBottom: 6 }}>Pos Gained / Pos Lost</div>
+                <div style={{ marginBottom: 8 }}>Counts every position change per race, including those caused by pit stops. OpenF1 notes this data may be incomplete, so treat these as approximate figures.</div>
+                <div style={{ fontWeight: 'bold', marginBottom: 6 }}>W% vs Teammate</div>
+                Only includes races where both teammates finished and were classified. DNS, DSQ, and unclassified DNFs are excluded from both the numerator and denominator.
+              </div>
+            } />
+          </SectionHeader>
           <DriverStatsTable driverRows={driverRows} isMobile={isMobile} />
 
           <SectionHeader>Points Progression</SectionHeader>
@@ -335,6 +359,7 @@ export default function SeasonPage({ year, isMobile }) {
           <ConstructorStatsTable
             constructorRows={constructorRows}
             constructorColour={constructorColour}
+            totalSeasonLaps={totalSeasonLaps}
             isMobile={isMobile}
           />
 

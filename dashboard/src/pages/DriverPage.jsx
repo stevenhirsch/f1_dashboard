@@ -208,7 +208,22 @@ function RaceSummaryCard({ result, laps, pitStops, driver, overtakes, driverNumb
       {result?.points != null && (
         <StatCard label="Points" value={result.points} />
       )}
-      <StatCard label="Overtakes" value={overtakesMade} sub={overtakesSuffered > 0 ? `Lost ${overtakesSuffered}` : null} />
+      <StatCard
+        label={
+          <span style={{ display: 'inline-flex', alignItems: 'center' }}>
+            Pos Gained
+            <InfoTooltip placement="bottom" width={260} content={
+              <div>
+                <div style={{ fontWeight: 'bold', marginBottom: 6 }}>Pos Gained / Pos Lost</div>
+                Counts every position change per race, including those caused by pit stops.
+                OpenF1 notes this data may be incomplete, so treat these as approximate figures.
+              </div>
+            } />
+          </span>
+        }
+        value={overtakesMade}
+        sub={overtakesSuffered > 0 ? `Lost ${overtakesSuffered}` : null}
+      />
       {fastestLapSpeed != null && (
         <StatCard label="FL Speed" value={`${fastestLapSpeed} km/h`} sub="fastest lap" />
       )}

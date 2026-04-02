@@ -22,16 +22,21 @@ export default function DriverPointsTrendChart({ driverSeries, roundLabels, isMo
   const tickVals = Array.from({ length: maxRound }, (_, i) => i + 1)
   const tickText = tickVals.map(r => roundLabels[r] ?? `R${r}`)
 
-  const traces = sorted.map(s => ({
-    type: 'scatter',
-    mode: 'lines+markers',
-    name: s.name_acronym || s.full_name,
-    x: [0, ...s.rounds],
-    y: [0, ...s.points],
-    line: { color: s.team_colour, width: 2 },
-    marker: { color: s.team_colour, size: isMobile ? 4 : 5 },
-    hovertemplate: `<b>%{fullData.name}</b><br>Round %{x}: %{y} pts<extra></extra>`,
-  }))
+  const seenColours = new Set()
+  const traces = sorted.map(s => {
+    const dashed = seenColours.has(s.team_colour)
+    seenColours.add(s.team_colour)
+    return {
+      type: 'scatter',
+      mode: 'lines+markers',
+      name: s.name_acronym || s.full_name,
+      x: [0, ...s.rounds],
+      y: [0, ...s.points],
+      line: { color: s.team_colour, width: 2, dash: dashed ? 'dash' : 'solid' },
+      marker: { color: s.team_colour, size: isMobile ? 4 : 5 },
+      hovertemplate: `<b>%{fullData.name}</b><br>Round %{x}: %{y} pts<extra></extra>`,
+    }
+  })
 
   const layout = {
     paper_bgcolor: THEME.bg,
