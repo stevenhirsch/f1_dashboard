@@ -5,6 +5,7 @@ import RacePage from './pages/RacePage'
 import QualifyingPage from './pages/QualifyingPage'
 import DriverPage from './pages/DriverPage'
 import SeasonPage from './pages/SeasonPage'
+import ChatPage from './pages/ChatPage'
 
 const THEME = {
   bg: '#09090b',
@@ -244,12 +245,7 @@ export default function App() {
       )}
 
       {activeMode === 'Chat' && (
-        <div style={{ padding: '3rem 1.5rem', textAlign: 'center', color: THEME.muted }}>
-          <p style={{ fontSize: '1rem' }}>Chat — coming soon</p>
-          <p style={{ fontSize: '0.85rem', marginTop: '0.5rem' }}>
-            Ask questions about F1 data across any race, season, or driver.
-          </p>
-        </div>
+        <ChatPage isMobile={isMobile} />
       )}
 
       <Footer />

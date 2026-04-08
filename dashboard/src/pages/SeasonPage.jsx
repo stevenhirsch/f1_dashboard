@@ -193,7 +193,7 @@ function DriverStatsTable({ driverRows, isMobile }) {
 function ConstructorStatsTable({ constructorRows, constructorColour, totalSeasonLaps, isMobile }) {
   if (!constructorRows?.length) return <p style={{ color: THEME.muted }}>No data.</p>
 
-  const headers = ['Pos', 'Constructor', 'Pts', 'Race Pts', 'Sprint Pts', 'Wins', 'Podiums', 'DNF', 'Laps Led', 'Led %', 'Total Laps', 'Distance']
+  const headers = ['Pos', 'Constructor', 'Pts', 'Race Pts', 'Sprint Pts', 'Wins', 'Podiums', 'DNF', 'DNS', 'DSQ', 'Laps Led', 'Led %', 'Total Laps', 'Distance']
 
   return (
     <TableWrapper>
@@ -235,6 +235,8 @@ function ConstructorStatsTable({ constructorRows, constructorColour, totalSeason
                 <Td isMobile={isMobile} right>{fmtInt(row.wins)}</Td>
                 <Td isMobile={isMobile} right>{fmtInt(row.podiums)}</Td>
                 <Td isMobile={isMobile} right style={{ color: row.dnf_count > 0 ? '#ef4444' : THEME.text }}>{fmtInt(row.dnf_count)}</Td>
+                <Td isMobile={isMobile} right style={{ color: row.dns_count > 0 ? '#ef4444' : THEME.text }}>{fmtInt(row.dns_count)}</Td>
+                <Td isMobile={isMobile} right style={{ color: row.dsq_count > 0 ? '#ef4444' : THEME.text }}>{fmtInt(row.dsq_count)}</Td>
                 <Td isMobile={isMobile} right>{fmtInt(row.laps_led)}</Td>
                 <Td isMobile={isMobile} right>{fmtWPct(row.laps_led, totalSeasonLaps)}</Td>
                 <Td isMobile={isMobile} right>{fmtInt(row.laps_completed)}</Td>

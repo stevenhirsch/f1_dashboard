@@ -652,6 +652,12 @@ create table if not exists season_constructor_stats (
     dnf_count       integer,
     race_dnf_count  integer,
     sprint_dnf_count integer,
+    dns_count       integer,
+    race_dns_count  integer,
+    sprint_dns_count integer,
+    dsq_count       integer,
+    race_dsq_count  integer,
+    sprint_dsq_count integer,
     laps_completed  integer,
     total_pit_stops integer,
     primary key (year, round_number, team_name)

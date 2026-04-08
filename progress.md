@@ -1,7 +1,7 @@
 # F1 Dashboard — Progress Log
 
 ## Current Status
-**Phase 5 (Derived Metrics Pipeline) complete. Season Tab UI polished: laps led accuracy fixed (position-table fallback + Supabase pagination), DNS column, renamed overtakes columns, corrected Led %  and W% vs Teammate denominators, dashed teammate lines in points chart. 380 tests passing. Next: Phase 6 (Driver Tab, Part B) — surface derived metrics in the frontend. Backfill ingestion ongoing in background.**
+**Chat tab MVP complete (2026-04-08): BYOK chat interface using Claude Sonnet, context bundle from Supabase, streaming responses. Requires Cloudflare Worker proxy for production — local dev uses Vite proxy. Constructor DNS/DSQ columns added to pipeline + frontend. Next: Phase 6 (Driver Tab, Part B) + Cloudflare Worker for production chat.**
 
 ---
 
@@ -377,3 +377,45 @@ Always fetch the broadest useful time window in a single call and segment client
 **Backfill:**
 - Run `python pipeline/ingest.py --year 2025` then 2024, 2023
 - Car data metrics computed for all history; raw 3.7 Hz telemetry not stored
+
+---
+
+### Season Tab — Constructor DNS/DSQ — Complete (2026-04-08)
+
+**Pipeline (`ingest.py`):**
+- `_new_team_state()` — added `dns_count`, `dsq_count`, `race_dns_count`, `race_dsq_count`, `sprint_dns_count`, `sprint_dsq_count`
+- Accumulation loop — mirrors the driver-level dns/dsq pattern (dns → dsq → dnf, mutually exclusive)
+- Row emission — all 6 new fields included in the upsert dict
+
+**Schema (`supabase/schema.sql`):**
+- 6 new columns added to `season_constructor_stats` definition
+- Run migration manually: `ALTER TABLE season_constructor_stats ADD COLUMN IF NOT EXISTS dns_count integer` (×6 variants)
+- Re-run `python pipeline/ingest.py --season-stats 2026` after migration
+
+**Frontend (`SeasonPage.jsx`):**
+- `ConstructorStatsTable` — DNS and DSQ columns added after DNF, with red highlight when > 0
+
+---
+
+### Chat Tab MVP — Complete (2026-04-08)
+
+**New files:**
+- `dashboard/src/hooks/useChatContext.js` — fetches 6 Supabase tables (races, sessions, drivers, season_driver_stats, season_constructor_stats, race_results, qualifying_results, session_sector_bests), serializes into a structured text system prompt with metric definitions, calendar, standings, per-race results, qualifying results, and sector bests
+- `dashboard/src/pages/ChatPage.jsx` — full chat UI: BYOK API key (localStorage, masked input), year selector, streaming responses via SSE, basic markdown rendering, example questions on empty state, clear conversation, error handling for 401/429
+
+**Architecture:**
+- User provides their own Anthropic API key — stored in `localStorage`, sent directly to Anthropic, never touches any server we control
+- Model: `claude-sonnet-4-6`
+- Context bundle: full season data serialized as structured text in the system prompt; multi-turn conversation history passed as messages array
+- Streaming: raw `fetch()` with SSE parsing (`content_block_delta` events), text rendered token-by-token
+
+**CORS/proxy:**
+- Anthropic API blocks direct browser requests (returns 400 on OPTIONS preflight; requires `Origin` header to be absent for server-to-server auth)
+- Dev: Vite proxy (`/anthropic/*` → `api.anthropic.com`) with `configure` hook that re-forwards `x-api-key` + `anthropic-version` and strips `Origin`/`Referer` headers
+- Production: **TODO — requires Cloudflare Worker** (see below)
+
+**Production TODO — Cloudflare Worker:**
+- Write a ~15-line Worker that handles CORS preflight (OPTIONS → 200 with Allow-Origin/Headers) and forwards POST to Anthropic without `Origin`/`Referer` headers
+- Deploy via `wrangler deploy` (free Cloudflare account, 100k req/day free tier)
+- Add `VITE_ANTHROPIC_PROXY_URL=https://your-worker.workers.dev` to `.github/workflows/deploy.yml` env block
+- ChatPage already reads `import.meta.env.VITE_ANTHROPIC_PROXY_URL` with `/anthropic` as dev fallback — no code changes needed once Worker is deployed

@@ -469,10 +469,7 @@ When a formula changes, run `ingest.py --recompute --session <session_key>` to r
 - `InfoTooltip` label changed from `?` to `i` globally; info bubble added to Driver Standings header (explains Pos Gained/Lost and W% vs Teammate); info bubble added to DriverPage Race sub-tab overtakes statcard
 
 **Pending:**
-- Constructor DNS + DSQ columns:
-  - Schema: `ALTER TABLE season_constructor_stats ADD COLUMN IF NOT EXISTS dns_count integer; ALTER TABLE season_constructor_stats ADD COLUMN IF NOT EXISTS dsq_count integer;`
-  - Pipeline: add to `_new_team_state()`, accumulate, emit
-  - Re-run `--season-stats 2026`, add columns to `ConstructorStatsTable`
+- ~~Constructor DNS + DSQ columns~~ — **Complete (2026-04-08)**
 - Pit stop `stop_duration` coverage: OpenF1 only has stationary time for Shanghai in 2026; re-check after backfill
 
 ---
@@ -511,6 +508,61 @@ When a formula changes, run `ingest.py --recompute --session <session_key>` to r
 **Driver-level composites**
 - Race Load model — latent composite of G-load indices, overtake count, temperature, stint length
 - Cross-driver style clustering — group drivers by Phase 5 feature similarity across a season
+
+---
+
+### Chat Tab — MVP Complete (2026-04-08)
+*BYOK chat interface over the season data context bundle.*
+
+**Architecture**
+- User provides their own Anthropic API key (stored in `localStorage`, never sent to any server we control)
+- Model: `claude-sonnet-4-6`
+- Context strategy: full season data serialized as structured text and passed as the system prompt on every request. Multi-turn conversation history maintained in React state for the session duration.
+- Streaming: raw `fetch()` → SSE parsing (`content_block_delta` events) → token-by-token rendering
+
+**Context bundle (fetched from Supabase on tab open)**
+- Calendar, driver/constructor standings, race & sprint results (with G-force metrics), qualifying results, session sector bests
+- Metric definitions included in system prompt for correct interpretation
+
+**CORS proxy**
+- Anthropic API requires requests to originate server-side (strips `Origin` header, else returns auth error)
+- Dev: Vite proxy (`/anthropic/*` → `api.anthropic.com`), configured to strip `Origin`/`Referer` and re-forward `x-api-key`
+- Production: requires a Cloudflare Worker (see below)
+
+**Production — Cloudflare Worker (TODO)**
+
+```javascript
+// Handle CORS preflight
+if (request.method === 'OPTIONS') {
+  return new Response(null, { headers: {
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Methods': 'POST, OPTIONS',
+    'Access-Control-Allow-Headers': 'content-type, x-api-key, anthropic-version',
+  }})
+}
+// Forward to Anthropic without Origin header
+const upstream = await fetch(`https://api.anthropic.com${new URL(request.url).pathname}`, {
+  method: 'POST',
+  headers: {
+    'content-type': 'application/json',
+    'x-api-key': request.headers.get('x-api-key'),
+    'anthropic-version': request.headers.get('anthropic-version'),
+  },
+  body: request.body,
+})
+return new Response(upstream.body, {
+  status: upstream.status,
+  headers: { ...Object.fromEntries(upstream.headers), 'Access-Control-Allow-Origin': '*' },
+})
+```
+
+Deploy: `wrangler deploy`. Then add `VITE_ANTHROPIC_PROXY_URL=https://your-worker.workers.dev` to `.github/workflows/deploy.yml` — no code changes needed.
+
+**Future Chat improvements**
+- Tool-call / text-to-SQL query model: instead of (or in addition to) the static context bundle, give the model tools that query Supabase directly for deeper questions (lap-level data, stint details, etc.)
+- Model selector in UI (Haiku / Sonnet / Opus)
+- Persist conversation history across page reloads (localStorage)
+- Year selector state synced with Dashboard year
 
 ---
 

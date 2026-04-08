@@ -1365,15 +1365,15 @@ def ingest_season_constructor_stats(client: Client, year: int) -> None:
         return {
             # Combined
             'wins': 0, 'podiums': 0, 'poles': 0, 'fastest_laps': 0,
-            'races_entered': 0, 'dnf_count': 0, 'laps_completed': 0,
-            'laps_led': 0, 'distance_km': 0.0,
+            'races_entered': 0, 'dnf_count': 0, 'dns_count': 0, 'dsq_count': 0,
+            'laps_completed': 0, 'laps_led': 0, 'distance_km': 0.0,
             'total_pit_stops': 0,
             # Race-specific
             'race_entries': 0, 'race_wins': 0, 'race_podiums': 0, 'race_poles': 0,
-            'race_dnf_count': 0, 'race_points': 0.0,
+            'race_dnf_count': 0, 'race_dns_count': 0, 'race_dsq_count': 0, 'race_points': 0.0,
             # Sprint-specific
             'sprint_entries': 0, 'sprint_wins': 0, 'sprint_podiums': 0, 'sprint_poles': 0,
-            'sprint_dnf_count': 0, 'sprint_points': 0.0,
+            'sprint_dnf_count': 0, 'sprint_dns_count': 0, 'sprint_dsq_count': 0, 'sprint_points': 0.0,
         }
 
     state: dict[str, dict] = {t: _new_team_state() for t in all_teams}
@@ -1403,7 +1403,13 @@ def ingest_season_constructor_stats(client: Client, year: int) -> None:
                 else:
                     c['race_entries'] += 1
                     c['race_points'] += pts_earned
-                if rr.get('dnf') and not rr.get('dns') and not rr.get('dsq'):
+                if rr.get('dns'):
+                    c['dns_count'] += 1
+                    c['sprint_dns_count' if is_sprint else 'race_dns_count'] += 1
+                elif rr.get('dsq'):
+                    c['dsq_count'] += 1
+                    c['sprint_dsq_count' if is_sprint else 'race_dsq_count'] += 1
+                elif rr.get('dnf'):
                     c['dnf_count'] += 1
                     c['sprint_dnf_count' if is_sprint else 'race_dnf_count'] += 1
                 laps_in_session = rr.get('number_of_laps') or 0
@@ -1476,6 +1482,12 @@ def ingest_season_constructor_stats(client: Client, year: int) -> None:
                 'dnf_count':         c['dnf_count'],
                 'race_dnf_count':    c['race_dnf_count'],
                 'sprint_dnf_count':  c['sprint_dnf_count'],
+                'dns_count':         c['dns_count'],
+                'race_dns_count':    c['race_dns_count'],
+                'sprint_dns_count':  c['sprint_dns_count'],
+                'dsq_count':         c['dsq_count'],
+                'race_dsq_count':    c['race_dsq_count'],
+                'sprint_dsq_count':  c['sprint_dsq_count'],
                 'laps_completed':    c['laps_completed'],
                 'laps_led':          c['laps_led'],
                 'distance_km':       round(c['distance_km'], 3) if c['distance_km'] else None,
