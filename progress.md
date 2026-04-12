@@ -1,7 +1,7 @@
 # F1 Dashboard — Progress Log
 
 ## Current Status
-**Chat tab MVP complete (2026-04-08): BYOK chat interface using Claude Sonnet, context bundle from Supabase, streaming responses. Requires Cloudflare Worker proxy for production — local dev uses Vite proxy. Constructor DNS/DSQ columns added to pipeline + frontend. Next: Phase 6 (Driver Tab, Part B) + Cloudflare Worker for production chat.**
+**Chat tab shipped with Gemini (2026-04-12): dual-provider chat with aggregate_metric tool use fully working. 25 Vitest unit tests cover tool definitions/format layer. Anthropic hidden from UI until Cloudflare Worker proxy is deployed. Next: Phase 6 (Driver Tab, Part B) or more chat tools.**
 
 ---
 

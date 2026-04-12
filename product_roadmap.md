@@ -511,25 +511,31 @@ When a formula changes, run `ingest.py --recompute --session <session_key>` to r
 
 ---
 
-### Chat Tab — MVP Complete (2026-04-08)
+### Chat Tab — MVP Complete (2026-04-08); Dual-Provider (2026-04-12)
 *BYOK chat interface over the season data context bundle.*
 
 **Architecture**
-- User provides their own Anthropic API key (stored in `localStorage`, never sent to any server we control)
-- Model: `claude-sonnet-4-6`
+- User provides their own API key (stored in `localStorage`, never sent to any server we control)
+- Provider choice persisted in `localStorage` (`f1_chat_provider`); defaults to Gemini
+- Providers:
+  - **Google Gemini** (`gemini-2.0-flash`) — free tier, direct browser call, no proxy needed
+  - **Anthropic Claude** (`claude-sonnet-4-6`) — requires CORS proxy (see below)
 - Context strategy: full season data serialized as structured text and passed as the system prompt on every request. Multi-turn conversation history maintained in React state for the session duration.
-- Streaming: raw `fetch()` → SSE parsing (`content_block_delta` events) → token-by-token rendering
+- Streaming: raw `fetch()` → SSE parsing → token-by-token rendering
+  - Anthropic: `content_block_delta` events
+  - Gemini: `streamGenerateContent?alt=sse`, `candidates[0].content.parts[0].text` chunks
 
 **Context bundle (fetched from Supabase on tab open)**
 - Calendar, driver/constructor standings, race & sprint results (with G-force metrics), qualifying results, session sector bests
 - Metric definitions included in system prompt for correct interpretation
 
-**CORS proxy**
-- Anthropic API requires requests to originate server-side (strips `Origin` header, else returns auth error)
-- Dev: Vite proxy (`/anthropic/*` → `api.anthropic.com`), configured to strip `Origin`/`Referer` and re-forward `x-api-key`
-- Production: requires a Cloudflare Worker (see below)
+**CORS situation**
+- **Gemini**: `generativelanguage.googleapis.com` returns `Access-Control-Allow-Origin` for GitHub Pages — direct browser calls work in both dev and production. No proxy needed.
+- **Anthropic**: strips `Origin` header → blocks browser requests. Needs a server-side proxy.
+  - Dev: Vite proxy (`/anthropic/*` → `api.anthropic.com`), configured to strip `Origin`/`Referer` and re-forward `x-api-key`
+  - Production: requires a Cloudflare Worker (see below)
 
-**Production — Cloudflare Worker (TODO)**
+**Production — Cloudflare Worker for Anthropic (TODO)**
 
 ```javascript
 // Handle CORS preflight
@@ -556,11 +562,11 @@ return new Response(upstream.body, {
 })
 ```
 
-Deploy: `wrangler deploy`. Then add `VITE_ANTHROPIC_PROXY_URL=https://your-worker.workers.dev` to `.github/workflows/deploy.yml` — no code changes needed.
+Deploy: `wrangler deploy`. Then add `VITE_ANTHROPIC_PROXY_URL=https://your-worker.workers.dev` to `.github/workflows/deploy.yml` — no code changes needed. **Not needed if users only use Gemini.**
 
 **Future Chat improvements**
 - Tool-call / text-to-SQL query model: instead of (or in addition to) the static context bundle, give the model tools that query Supabase directly for deeper questions (lap-level data, stint details, etc.)
-- Model selector in UI (Haiku / Sonnet / Opus)
+- Model selector in UI (e.g. gemini-2.0-flash-lite for speed, gemini-1.5-pro for depth)
 - Persist conversation history across page reloads (localStorage)
 - Year selector state synced with Dashboard year
 

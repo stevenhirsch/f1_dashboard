@@ -79,6 +79,7 @@ async function buildContext(year) {
     { data: raceResults },
     { data: qualResults },
     { data: sectorBests },
+    { data: lapSpeedRaw },
   ] = await Promise.all([
     supabase
       .from('drivers')
@@ -89,7 +90,7 @@ async function buildContext(year) {
     raceSk.length
       ? supabase
           .from('race_results')
-          .select('session_key, driver_number, position, points, gap_to_leader, dnf, dns, dsq, fastest_lap_flag, mean_peak_decel_g_abs_clean, mean_peak_accel_g_clean, number_of_laps')
+          .select('session_key, driver_number, position, points, gap_to_leader, duration, pit_count, dnf, dns, dsq, fastest_lap_flag, mean_peak_decel_g_abs_clean, mean_peak_accel_g_clean, number_of_laps')
           .in('session_key', raceSk)
           .order('position')
       : Promise.resolve({ data: [] }),
@@ -101,6 +102,13 @@ async function buildContext(year) {
           .order('position')
       : Promise.resolve({ data: [] }),
     supabase.from('session_sector_bests').select('*').in('session_key', allSk),
+    raceSk.length
+      ? supabase
+          .from('lap_metrics')
+          .select('session_key, driver_number, max_speed_kph_lap')
+          .in('session_key', raceSk)
+          .not('max_speed_kph_lap', 'is', null)
+      : Promise.resolve({ data: [] }),
   ])
 
   // Driver meta: latest session entry per driver_number
@@ -116,6 +124,15 @@ async function buildContext(year) {
     }
   }
 
+  // Aggregate max speed per (session_key, driver_number)
+  const maxSpeedBySk = {}
+  for (const row of (lapSpeedRaw ?? [])) {
+    const key = `${row.session_key}:${row.driver_number}`
+    if (maxSpeedBySk[key] == null || row.max_speed_kph_lap > maxSpeedBySk[key]) {
+      maxSpeedBySk[key] = row.max_speed_kph_lap
+    }
+  }
+
   return buildPrompt(year, {
     races, meetingByKey, sessionByKey, driverMeta,
     driverStats:      driverStats      ?? [],
@@ -123,12 +140,13 @@ async function buildContext(year) {
     raceResults:      raceResults      ?? [],
     qualResults:      qualResults      ?? [],
     sectorBests:      sectorBests      ?? [],
+    maxSpeedBySk,
   })
 }
 
 function buildPrompt(year, d) {
   const { races, meetingByKey, sessionByKey, driverMeta,
-          driverStats, constructorStats, raceResults, qualResults, sectorBests } = d
+          driverStats, constructorStats, raceResults, qualResults, sectorBests, maxSpeedBySk } = d
   const L = []
 
   L.push(`You are an F1 analytics assistant with access to data from the ${year} Formula 1 season. Answer questions accurately and concisely using only the data provided below. If a question cannot be answered from this data, say so clearly — do not invent or guess values.`)
@@ -136,6 +154,7 @@ function buildPrompt(year, d) {
   L.push('## Metric Definitions')
   L.push('- mean_peak_decel_g: average peak braking G-force per lap (filtered car data, windowed to braking zones; higher = harder braking)')
   L.push('- mean_peak_accel_g: average peak acceleration G-force per lap (windowed to throttle application zones)')
+  L.push('- top_speed: highest recorded speed (kph) across all laps in the session, from car telemetry')
   L.push('- laps_led: race laps spent in P1')
   L.push('- qualifying_supertimes: average qualifying gap to teammate across all rounds (seconds; negative = faster than teammate)')
   L.push('- coasting_ratio: proportion of lap time coasting (throttle < 1%, brake = 0); in 2026 also a battery regeneration proxy')
@@ -168,9 +187,12 @@ function buildPrompt(year, d) {
       L.push(
         `${i + 1}. ${acr} (${m.full_name ?? acr}, ${m.team ?? '?'}) — ` +
         `${r.points_scored ?? 0}pts | Race: ${r.race_points ?? 0} | Sprint: ${r.sprint_points ?? 0} | ` +
-        `Wins: ${r.wins ?? 0} | Podiums: ${r.podiums ?? 0} | Poles: ${r.poles ?? 0} | ` +
-        `DNF: ${r.dnf_count ?? 0} | DNS: ${r.dns_count ?? 0} | ` +
+        `Races: ${r.races_entered ?? 0} | Classified: ${r.races_classified ?? 0} | ` +
+        `Wins: ${r.wins ?? 0} | Podiums: ${r.podiums ?? 0} | Poles: ${r.poles ?? 0} | Fastest Laps: ${r.fastest_laps ?? 0} | ` +
+        `DNF: ${r.dnf_count ?? 0} | DNS: ${r.dns_count ?? 0} | DSQ: ${r.dsq_count ?? 0} | ` +
+        `Wins vs TM: ${r.wins_over_teammate ?? 0} | % of Team Pts: ${r.percent_of_team_points != null ? fmt(r.percent_of_team_points, 1) + '%' : '—'} | ` +
         `Laps Led: ${r.laps_led ?? 0} | Dist: ${r.distance_km ? Math.round(r.distance_km) + 'km' : '—'} | ` +
+        `Overtakes Made: ${r.total_overtakes_made ?? 0} | Overtakes Suffered: ${r.total_overtakes_suffered ?? 0} | Pit Stops: ${r.total_pit_stops ?? 0} | ` +
         `Qual gap vs TM: ${qs}`
       )
     })
@@ -225,12 +247,15 @@ function buildPrompt(year, d) {
         } else if (rr.dns) {
           L.push(`  DNS: ${acr} (${m.team ?? '?'})`)
         } else {
-          const gap    = rr.position === 1 ? 'WINNER' : (rr.gap_to_leader ? `+${rr.gap_to_leader}` : '—')
-          const fl     = rr.fastest_lap_flag ? ' [FL]' : ''
-          const dnfTag = rr.dnf ? ` [DNF @ lap ${rr.number_of_laps ?? '?'}]` : ''
-          const decel  = rr.mean_peak_decel_g_abs_clean != null ? ` | Decel: ${fmt(rr.mean_peak_decel_g_abs_clean)}g` : ''
-          const accel  = rr.mean_peak_accel_g_clean != null ? ` | Accel: ${fmt(rr.mean_peak_accel_g_clean)}g` : ''
-          L.push(`  ${rr.position ?? '—'}. ${acr} (${m.team ?? '?'}) — ${rr.points ?? 0}pts | ${gap}${fl}${dnfTag}${decel}${accel}`)
+          const gap      = rr.position === 1 ? 'WINNER' : (rr.gap_to_leader ? `+${rr.gap_to_leader}` : '—')
+          const fl       = rr.fastest_lap_flag ? ' [FL]' : ''
+          const dnfTag   = rr.dnf ? ` [DNF @ lap ${rr.number_of_laps ?? '?'}]` : ''
+          const decel    = rr.mean_peak_decel_g_abs_clean != null ? ` | Decel: ${fmt(rr.mean_peak_decel_g_abs_clean)}g` : ''
+          const accel    = rr.mean_peak_accel_g_clean != null ? ` | Accel: ${fmt(rr.mean_peak_accel_g_clean)}g` : ''
+          const pits     = rr.pit_count != null ? ` | Pits: ${rr.pit_count}` : ''
+          const topSpd   = maxSpeedBySk?.[`${rr.session_key}:${rr.driver_number}`]
+          const topSpeed = topSpd != null ? ` | Top Speed: ${Math.round(topSpd)}kph` : ''
+          L.push(`  ${rr.position ?? '—'}. ${acr} (${m.team ?? '?'}) — ${rr.points ?? 0}pts | ${gap}${fl}${dnfTag}${decel}${accel}${pits}${topSpeed}`)
         }
       }
       L.push('')

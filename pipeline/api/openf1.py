@@ -45,7 +45,7 @@ def current_rate() -> float:
 
 def _get(endpoint: str, params) -> list[dict]:
     """
-    Make a GET request to the OpenF1 API with caching and 429 backoff.
+    Make a GET request to the OpenF1 API with caching and 429/422 backoff.
 
     params can be a dict or a list of (key, value) tuples.
     List-of-tuples allows OpenF1 range operators like ('date>', ...).
@@ -70,13 +70,13 @@ def _get(endpoint: str, params) -> list[dict]:
         if resp.status_code == 404:
             _cache[key] = []
             return []
-        if resp.status_code != 429:
+        if resp.status_code not in (429, 422):
             resp.raise_for_status()
             break
         _stats["rate_limit_waits"] += 1
         wait = 2 ** attempt
-        print(f"  [rate limit] 429 on /{endpoint}, waiting {wait}s "
-              f"(total waits this session: {_stats['rate_limit_waits']})")
+        print(f"  [transient {resp.status_code}] on /{endpoint}, waiting {wait}s "
+              f"(attempt {attempt + 1}/6)")
         time.sleep(wait)
     else:
         resp.raise_for_status()
