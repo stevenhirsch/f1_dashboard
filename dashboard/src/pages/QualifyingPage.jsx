@@ -66,28 +66,53 @@ function QualifyingResultsTable({ results, driverPhaseMap, topSpeedByDriver }) {
     ...extra,
   })
 
+  const phaseRank = { Q3: 3, Q2: 2, Q1: 1 }
+  const resolvePhase = (row) => {
+    if (row.q3_time != null) return 'Q3'
+    if (row.q2_time != null) return 'Q2'
+    return driverPhaseMap[row.driver_number] ?? 'Q1'
+  }
+
+  // Detect DSQ drivers: any driver whose phase rank is higher than the minimum
+  // phase rank seen so far in the sorted list. This catches drivers (e.g. HAD)
+  // who set Q2/Q3 times but were sorted to the back due to a post-session DSQ.
+  const dsqDrivers = new Set()
+  let minPhaseRankSeen = Infinity
+  for (const r of results) {
+    const rank = phaseRank[resolvePhase(r)] ?? 1
+    if (rank < minPhaseRankSeen) {
+      minPhaseRankSeen = rank
+    } else if (rank > minPhaseRankSeen) {
+      dsqDrivers.add(r.driver_number)
+    }
+  }
+
   const rows = []
+  let normalPos = 0
   results.forEach((r, i) => {
-    const pos = i + 1
+    const isDsq = dsqDrivers.has(r.driver_number)
     const driver = r.driver ?? {}
     const rawColour = driver.team_colour ?? '888888'
     const colour = `#${rawColour.replace('#', '')}`
-
     const totalDriverLaps = (r.q1_laps ?? 0) + (r.q2_laps ?? 0) + (r.q3_laps ?? 0)
 
-    // Dynamic separator: show when this driver reached a lower phase than the previous one.
-    // Prefer DB q_times; fall back to client-side phase detection from laps.
-    const phaseRank = { Q3: 3, Q2: 2, Q1: 1 }
-    const resolvePhase = (row) => {
-      if (row.q3_time != null) return 'Q3'
-      if (row.q2_time != null) return 'Q2'
-      return driverPhaseMap[row.driver_number] ?? 'Q1'
-    }
+    if (!isDsq) normalPos++
+
+    // Separator logic: phase drop = elimination separator; phase rise = DSQ separator.
     if (i > 0) {
-      const prevPhase = resolvePhase(results[i - 1])
+      const prevR = results[i - 1]
+      const prevDsq = dsqDrivers.has(prevR.driver_number)
+      const prevPhase = resolvePhase(prevR)
       const curPhase = resolvePhase(r)
-      if (prevPhase !== curPhase) {
-        const label = prevPhase === 'Q3' ? 'eliminated after Q2' : 'eliminated after Q1'
+
+      let sepLabel = null
+      if (!prevDsq && !isDsq && prevPhase !== curPhase) {
+        sepLabel = prevPhase === 'Q3' ? 'eliminated after Q2' : 'eliminated after Q1'
+      } else if (!prevDsq && isDsq) {
+        sepLabel = 'disqualified'
+      }
+
+      if (sepLabel) {
         rows.push(
           <tr key={`sep-${i}`} style={{ borderTop: `1px solid ${THEME.separator}` }}>
             <td
@@ -95,12 +120,12 @@ function QualifyingResultsTable({ results, driverPhaseMap, topSpeedByDriver }) {
               style={{
                 padding: '0.2rem 0.6rem',
                 fontSize: '0.65rem',
-                color: THEME.separator,
+                color: isDsq ? THEME.red : THEME.separator,
                 textTransform: 'uppercase',
                 letterSpacing: '0.08em',
               }}
             >
-              {label}
+              {sepLabel}
             </td>
           </tr>
         )
@@ -113,9 +138,12 @@ function QualifyingResultsTable({ results, driverPhaseMap, topSpeedByDriver }) {
         style={{
           borderBottom: `1px solid ${THEME.border}`,
           background: i % 2 === 0 ? 'transparent' : THEME.tableAlt,
+          opacity: isDsq ? 0.6 : 1,
         }}
       >
-        <td style={tdStyle({ color: THEME.muted, fontWeight: 'bold' })}>{pos}</td>
+        <td style={tdStyle({ color: isDsq ? THEME.red : THEME.muted, fontWeight: 'bold' })}>
+          {isDsq ? 'DSQ' : normalPos}
+        </td>
         <td style={tdStyle({ color: colour, fontWeight: 'bold' })}>
           {driver.name_acronym ?? r.driver_number}
         </td>

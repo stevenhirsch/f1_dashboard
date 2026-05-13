@@ -774,6 +774,24 @@ class TestAssignQualifyingPhases(unittest.TestCase):
         self.assertEqual(result[1]["_phase"], "Q2")
         self.assertEqual(result[2]["_phase"], "Q3")
 
+    def test_lap_before_q2_when_q1_event_missing_gets_none(self):
+        """Miami 2026 pattern: OpenF1 omits the Q1 phase marker entirely.
+        Only Q2 and Q3 events are present. Laps before the Q2 event must get
+        _phase=None rather than being mis-attributed to Q2."""
+        laps = [
+            self._lap("2024-03-01T09:30:00"),  # before Q2 event → None
+            self._lap("2024-03-01T10:45:00"),  # after Q2 event → Q2
+            self._lap("2024-03-01T11:15:00"),  # after Q3 event → Q3
+        ]
+        rc = [
+            self._rc("Q2", "2024-03-01T10:30:00"),
+            self._rc("Q3", "2024-03-01T11:00:00"),
+        ]
+        result = _assign_qualifying_phases(laps, rc)
+        self.assertIsNone(result[0]["_phase"])
+        self.assertEqual(result[1]["_phase"], "Q2")
+        self.assertEqual(result[2]["_phase"], "Q3")
+
 
 # ===========================================================================
 # _get_compound_for_lap
@@ -857,37 +875,47 @@ class TestIngestQualifyingResults(unittest.TestCase):
         self.assertAlmostEqual(upserted[0]["best_lap_time"], 88.5)
         self.assertEqual(upserted[0]["best_lap_number"], 2)
 
-    def test_zero_duration_excluded(self):
+    def test_zero_duration_driver_appears_with_null_time(self):
+        # Driver who participated but only has a zero-duration lap should still
+        # appear in qualifying_results (with null times) rather than be omitted.
         client = _mock_client()
         laps = [self._lap(44, 1, 0)]
 
         ingest_qualifying_results(client, 9000, laps)
 
-        client.table.assert_not_called()
+        upserted = client.table.return_value.upsert.call_args.args[0]
+        self.assertEqual(len(upserted), 1)
+        self.assertIsNone(upserted[0]['best_lap_time'])
 
-    def test_none_duration_excluded(self):
+    def test_none_duration_driver_appears_with_null_time(self):
         client = _mock_client()
         laps = [self._lap(44, 1, None)]
 
         ingest_qualifying_results(client, 9000, laps)
 
-        client.table.assert_not_called()
+        upserted = client.table.return_value.upsert.call_args.args[0]
+        self.assertEqual(len(upserted), 1)
+        self.assertIsNone(upserted[0]['best_lap_time'])
 
-    def test_non_numeric_duration_excluded(self):
+    def test_non_numeric_duration_driver_appears_with_null_time(self):
         client = _mock_client()
         laps = [self._lap(44, 1, "INVALID")]
 
         ingest_qualifying_results(client, 9000, laps)
 
-        client.table.assert_not_called()
+        upserted = client.table.return_value.upsert.call_args.args[0]
+        self.assertEqual(len(upserted), 1)
+        self.assertIsNone(upserted[0]['best_lap_time'])
 
-    def test_negative_duration_excluded(self):
+    def test_negative_duration_driver_appears_with_null_time(self):
         client = _mock_client()
         laps = [self._lap(44, 1, -1.0)]
 
         ingest_qualifying_results(client, 9000, laps)
 
-        client.table.assert_not_called()
+        upserted = client.table.return_value.upsert.call_args.args[0]
+        self.assertEqual(len(upserted), 1)
+        self.assertIsNone(upserted[0]['best_lap_time'])
 
     def test_empty_laps_list_produces_no_rows(self):
         client = _mock_client()
@@ -1044,6 +1072,33 @@ class TestIngestQualifyingResults(unittest.TestCase):
         row = upserted[0]
         self.assertIsNone(row["q1_time"])
         self.assertEqual(row["q1_laps"], 2)
+
+    def test_driver_with_all_unphased_laps_still_appears_with_null_times(self):
+        """Drivers whose laps all precede the first phase event (e.g. Miami 2026
+        where OpenF1 omitted the Q1 marker) still appear in qualifying_results
+        with null times rather than being absent entirely."""
+        client = _mock_client()
+        laps = [
+            # These laps precede the Q2 event — no Q1 event exists, so they
+            # get _phase=None and won't produce any phase-based time.
+            self._lap(44, 1, 88.0, "2024-03-01T09:30:00"),
+            self._lap(44, 2, 89.0, "2024-03-01T09:50:00"),
+        ]
+        rc = [
+            # Q1 event is missing — first event is Q2 (Miami 2026 pattern)
+            self._rc("Q2", "2024-03-01T10:30:00"),
+            self._rc("Q3", "2024-03-01T11:00:00"),
+        ]
+
+        ingest_qualifying_results(client, 9000, laps, rc, [])
+
+        upserted = client.table.return_value.upsert.call_args.args[0]
+        self.assertEqual(len(upserted), 1)
+        row = upserted[0]
+        self.assertEqual(row["driver_number"], 44)
+        self.assertIsNone(row["q1_time"])
+        self.assertIsNone(row["q2_time"])
+        self.assertIsNone(row["best_lap_time"])
 
 
 # ===========================================================================
@@ -4507,31 +4562,18 @@ class TestIngestSeasonDriverStats(unittest.TestCase):
 
     # ----- tests -------------------------------------------------------------
 
-    @patch('ingest.openf1.get_meetings', return_value=[])
-    def test_no_meetings_no_upsert(self, _):
-        client = self._make_client(meetings=[], sessions=[], race_results=[])
-        ingest_season_driver_stats(client, 2026)
-        # No upsert to season_driver_stats should occur
-        for c in client.table.call_args_list:
-            if c.args[0] == 'season_driver_stats':
-                tbl = client.table('season_driver_stats')
-                tbl.upsert.assert_not_called()
+    def test_no_meetings_no_upsert(self):
+        rows = self._run_and_capture(meetings=[], sessions=[], race_results=[])
+        self.assertEqual(rows, [])
 
-    @patch('ingest.openf1.get_meetings')
-    def test_no_race_sessions_no_upsert(self, mock_get_meetings):
-        """Only qualifying sessions → no race data → early return."""
-        meetings = [self._meeting()]
-        mock_get_meetings.return_value = meetings
-        client = self._make_client(
-            meetings=meetings,
+    def test_no_race_sessions_no_upsert(self):
+        """Only qualifying sessions → no race data → no rows upserted."""
+        rows = self._run_and_capture(
+            meetings=[self._meeting()],
             sessions=[self._session(sk=2001, session_type='Qualifying')],
             race_results=[],
         )
-        ingest_season_driver_stats(client, 2026)
-        for c in client.table.call_args_list:
-            if c.args[0] == 'season_driver_stats':
-                tbl = client.table('season_driver_stats')
-                tbl.upsert.assert_not_called()
+        self.assertEqual(rows, [])
 
     def test_win_counted(self):
         """A P1 finish should increment wins to 1."""
@@ -4815,6 +4857,84 @@ class TestIngestSeasonDriverStats(unittest.TestCase):
         self.assertEqual(rows[0]['year'], 2026)
         self.assertEqual(rows[0]['round_number'], 1)
 
+    def test_round_numbers_are_sequential_from_ingested_meetings(self):
+        """Round numbers must reflect the 1-indexed order of ingested meetings,
+        not their position in the full F1 calendar. If only 4 of 24 calendar
+        races are ingested, those 4 should be rounds 1-4, not e.g. 1,2,3,6."""
+        rows = self._run_and_capture(
+            meetings=[
+                self._meeting(key=101, date='2026-03-01'),
+                self._meeting(key=102, date='2026-03-15'),
+                self._meeting(key=103, date='2026-03-29'),
+                self._meeting(key=104, date='2026-05-04'),  # 4th ingested, not R6
+            ],
+            sessions=[
+                self._session(sk=1001, meeting_key=101, session_type='Race'),
+                self._session(sk=1002, meeting_key=102, session_type='Race'),
+                self._session(sk=1003, meeting_key=103, session_type='Race'),
+                self._session(sk=1004, meeting_key=104, session_type='Race'),
+            ],
+            race_results=[
+                self._rr(sk=1001, dn=44, position=1),
+                self._rr(sk=1002, dn=44, position=2),
+                self._rr(sk=1003, dn=44, position=1),
+                self._rr(sk=1004, dn=44, position=3),
+            ],
+            champ_drv=[
+                self._cd(sk=1001, dn=44, pts=25.0),
+                self._cd(sk=1002, dn=44, pts=43.0),
+                self._cd(sk=1003, dn=44, pts=68.0),
+                self._cd(sk=1004, dn=44, pts=83.0),
+            ],
+            drivers=[self._driver(sk=sk, dn=44) for sk in (1001, 1002, 1003, 1004)],
+        )
+        round_numbers = sorted({r['round_number'] for r in rows})
+        self.assertEqual(round_numbers, [1, 2, 3, 4])
+
+    def test_stale_rows_deleted_before_upsert(self):
+        """ingest_season_driver_stats must delete existing rows for the year
+        before upserting so that stale round numbers from prior runs don't linger."""
+        deleted_years = []
+
+        table_data = {
+            'races':                [self._meeting()],
+            'sessions':             [self._session()],
+            'race_results':         [self._rr(dn=44, position=1)],
+            'championship_drivers': [self._cd(dn=44, pts=25.0)],
+            'championship_teams':   [],
+            'overtakes': [], 'pit_stops': [], 'starting_grid': [],
+            'qualifying_results': [], 'drivers': [self._driver(dn=44)],
+            'season_driver_stats': [],
+        }
+
+        def table_side(name):
+            data = table_data.get(name, [])
+            m = MagicMock()
+            m.select.return_value.eq.return_value.execute.return_value.data = data
+            m.select.return_value.in_.return_value.execute.return_value.data = data
+            m.select.return_value.in_.return_value.range.return_value.execute.return_value.data = data
+            if name == 'season_driver_stats':
+                def capture_delete():
+                    dm = MagicMock()
+                    def capture_eq(col, val):
+                        if col == 'year':
+                            deleted_years.append(val)
+                        em = MagicMock()
+                        em.execute.return_value = MagicMock()
+                        return em
+                    dm.eq.side_effect = capture_eq
+                    return dm
+                m.delete.side_effect = capture_delete
+            m.upsert.return_value.execute.return_value = MagicMock()
+            return m
+
+        client = MagicMock()
+        client.table.side_effect = table_side
+        with patch('ingest.openf1.get_meetings', return_value=[self._meeting()]):
+            ingest_season_driver_stats(client, 2026)
+
+        self.assertIn(2026, deleted_years)
+
 
 # ===========================================================================
 # ingest_season_constructor_stats
@@ -5003,6 +5123,78 @@ class TestIngestSeasonConstructorStats(unittest.TestCase):
         self.assertIn('round_number', rows[0])
         self.assertIn('team_name', rows[0])
         self.assertEqual(rows[0]['year'], 2026)
+
+    def test_round_numbers_are_sequential_from_ingested_meetings(self):
+        rows = self._run_and_capture(
+            meetings=[
+                self._meeting(key=101, date='2026-03-01'),
+                self._meeting(key=102, date='2026-03-15'),
+                self._meeting(key=103, date='2026-03-29'),
+                self._meeting(key=104, date='2026-05-04'),
+            ],
+            sessions=[
+                self._session(sk=1001, meeting_key=101, session_type='Race'),
+                self._session(sk=1002, meeting_key=102, session_type='Race'),
+                self._session(sk=1003, meeting_key=103, session_type='Race'),
+                self._session(sk=1004, meeting_key=104, session_type='Race'),
+            ],
+            race_results=[
+                self._rr(sk=1001, dn=44, position=1),
+                self._rr(sk=1002, dn=44, position=2),
+                self._rr(sk=1003, dn=44, position=1),
+                self._rr(sk=1004, dn=44, position=3),
+            ],
+            champ_teams=[
+                self._ct(sk=1001, pts=25.0),
+                self._ct(sk=1002, pts=43.0),
+                self._ct(sk=1003, pts=68.0),
+                self._ct(sk=1004, pts=83.0),
+            ],
+            drivers=[self._driver(sk=sk, dn=44) for sk in (1001, 1002, 1003, 1004)],
+        )
+        round_numbers = sorted({r['round_number'] for r in rows})
+        self.assertEqual(round_numbers, [1, 2, 3, 4])
+
+    def test_stale_rows_deleted_before_upsert(self):
+        deleted_years = []
+
+        table_data = {
+            'races':                    [self._meeting()],
+            'sessions':                 [self._session()],
+            'race_results':             [self._rr(dn=44, position=1)],
+            'championship_teams':       [self._ct()],
+            'pit_stops': [], 'starting_grid': [],
+            'drivers':                  [self._driver(dn=44)],
+            'season_constructor_stats': [],
+        }
+
+        def table_side(name):
+            data = table_data.get(name, [])
+            m = MagicMock()
+            m.select.return_value.eq.return_value.execute.return_value.data = data
+            m.select.return_value.in_.return_value.execute.return_value.data = data
+            m.select.return_value.in_.return_value.range.return_value.execute.return_value.data = data
+            if name == 'season_constructor_stats':
+                def capture_delete():
+                    dm = MagicMock()
+                    def capture_eq(col, val):
+                        if col == 'year':
+                            deleted_years.append(val)
+                        em = MagicMock()
+                        em.execute.return_value = MagicMock()
+                        return em
+                    dm.eq.side_effect = capture_eq
+                    return dm
+                m.delete.side_effect = capture_delete
+            m.upsert.return_value.execute.return_value = MagicMock()
+            return m
+
+        client = MagicMock()
+        client.table.side_effect = table_side
+        with patch('ingest.openf1.get_meetings', return_value=[self._meeting()]):
+            ingest_season_constructor_stats(client, 2026)
+
+        self.assertIn(2026, deleted_years)
 
 
 class TestQueryInAll(unittest.TestCase):

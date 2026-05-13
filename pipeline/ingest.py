@@ -404,8 +404,9 @@ def _assign_qualifying_phases(laps: list[dict], race_control: list[dict]) -> lis
     Inject a ``_phase`` key into each lap based on qualifying_phase events from race_control.
 
     Each lap's ``_phase`` is set to the most recent qualifying_phase event whose
-    ``date`` is <= the lap's ``date_start``.  Returns None for laps with no
-    ``date_start`` or laps that precede all phase events.
+    ``date`` is <= the lap's ``date_start``.  Laps that precede all phase events
+    are assigned to the first phase (Q1) rather than None — this handles drivers
+    whose flying lap starts fractionally before the race_control Q1 marker fires.
 
     Handles both integer (1/2/3) and string ("Q1"/"Q2"/"Q3") qualifying_phase
     values returned by the OpenF1 API.
@@ -414,12 +415,15 @@ def _assign_qualifying_phases(laps: list[dict], race_control: list[dict]) -> lis
         [r for r in race_control if _normalize_phase(r.get("qualifying_phase")) and r.get("date")],
         key=lambda r: r["date"],
     )
+    # Laps before the first phase event get None — we don't infer a phase the
+    # API didn't emit (e.g. OpenF1 sometimes omits the Q1 marker entirely).
+    first_phase = None
     for lap in laps:
         date_start = lap.get("date_start")
         if date_start is None:
             lap["_phase"] = None
             continue
-        current_phase = None
+        current_phase = first_phase
         for event in phase_events:
             if event["date"] <= date_start:
                 current_phase = _normalize_phase(event["qualifying_phase"])
@@ -522,7 +526,14 @@ def ingest_qualifying_results(
 
     best_per_phase = _compute_qualifying_best_per_phase(laps)
 
-    all_drivers = set(best_per_phase.keys()) | set(laps_per_phase.keys())
+    # Include every driver who appeared in any lap, so drivers eliminated in Q1
+    # with no phase-assigned laps still show up (with null times) rather than
+    # being omitted from qualifying_results entirely.
+    all_drivers = (
+        set(best_per_phase.keys())
+        | set(laps_per_phase.keys())
+        | {lap["driver_number"] for lap in laps if lap.get("driver_number") is not None}
+    )
     rows = []
     for dn in all_drivers:
         phases    = best_per_phase.get(dn, {})
@@ -897,24 +908,22 @@ def _compute_laps_led_by_sk(
 
 def ingest_season_driver_stats(client: Client, year: int) -> None:
     """Compute and upsert cumulative per-driver season stats, one row per (year, round, driver)."""
-    # 1. Build canonical round order from the full F1 calendar (OpenF1), then restrict
-    #    to meetings that have already been ingested into Supabase.
-    all_year_meetings = [
-        m for m in openf1.get_meetings(year)
-        if "pre-season" not in (m.get("meeting_name") or "").lower()
-        and "testing" not in (m.get("meeting_name") or "").lower()
-    ]
-    all_year_meetings.sort(key=lambda m: m.get("date_start") or "")
-    meeting_order = {m["meeting_key"]: i + 1 for i, m in enumerate(all_year_meetings)}
-
+    # 1. Round order is derived from ingested meetings only (sorted by date).
+    #    Using the full F1 calendar would assign calendar-position round numbers,
+    #    causing gaps (e.g. R6 for Miami when R4/R5 aren't ingested yet).
     races_resp = client.table('races').select('meeting_key,date_start,circuit_length_km').eq('year', year).execute()
     meetings = sorted(races_resp.data or [], key=lambda m: m.get('date_start') or '')
     if not meetings:
         return
     meeting_keys = [m['meeting_key'] for m in meetings]
+    meeting_order = {m['meeting_key']: i + 1 for i, m in enumerate(meetings)}
     circuit_len_by_mk: dict[int, float | None] = {
         m['meeting_key']: m.get('circuit_length_km') for m in meetings
     }
+
+    # Purge existing rows for this year so stale round numbers from prior runs
+    # (when using full-calendar ordering) don't linger in the DB.
+    client.table('season_driver_stats').delete().eq('year', year).execute()
 
     # 2. Sessions for these meetings.
     sessions_resp = (
@@ -1231,24 +1240,22 @@ def ingest_season_driver_stats(client: Client, year: int) -> None:
 
 def ingest_season_constructor_stats(client: Client, year: int) -> None:
     """Compute and upsert cumulative per-constructor season stats, one row per (year, round, team)."""
-    # 1. Build canonical round order from the full F1 calendar (OpenF1), then restrict
-    #    to meetings that have already been ingested into Supabase.
-    all_year_meetings = [
-        m for m in openf1.get_meetings(year)
-        if "pre-season" not in (m.get("meeting_name") or "").lower()
-        and "testing" not in (m.get("meeting_name") or "").lower()
-    ]
-    all_year_meetings.sort(key=lambda m: m.get("date_start") or "")
-    meeting_order = {m["meeting_key"]: i + 1 for i, m in enumerate(all_year_meetings)}
-
+    # 1. Round order is derived from ingested meetings only (sorted by date).
+    #    Using the full F1 calendar would assign calendar-position round numbers,
+    #    causing gaps (e.g. R6 for Miami when R4/R5 aren't ingested yet).
     races_resp = client.table('races').select('meeting_key,date_start,circuit_length_km').eq('year', year).execute()
     meetings = sorted(races_resp.data or [], key=lambda m: m.get('date_start') or '')
     if not meetings:
         return
     meeting_keys = [m['meeting_key'] for m in meetings]
+    meeting_order = {m['meeting_key']: i + 1 for i, m in enumerate(meetings)}
     circuit_len_by_mk: dict[int, float | None] = {
         m['meeting_key']: m.get('circuit_length_km') for m in meetings
     }
+
+    # Purge existing rows for this year so stale round numbers from prior runs
+    # (when using full-calendar ordering) don't linger in the DB.
+    client.table('season_constructor_stats').delete().eq('year', year).execute()
 
     # 2. Sessions for these meetings.
     sessions_resp = (
