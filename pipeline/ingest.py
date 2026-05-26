@@ -265,6 +265,16 @@ def ingest_laps(client: Client, session_key: int) -> list[dict]:
 def ingest_stints(client: Client, session_key: int) -> list[dict]:
     """Upsert stint data into `stints`."""
     stints = openf1.get_stints(session_key)
+
+    # OpenF1 sometimes emits a malformed starting stint where lap_end=0, which
+    # happens when a driver starts on a different compound (e.g. intermediates
+    # before a dry-weather stint on lap 1) and the stint hasn't been closed yet.
+    # Normalize lap_end=0 to lap_start so the stint covers exactly one lap and
+    # doesn't break range lookups in _get_compound_for_lap.
+    for s in stints:
+        if s.get("lap_end") == 0 and s.get("lap_start") is not None:
+            s["lap_end"] = s["lap_start"]
+
     rows = [
         {
             "session_key":        s.get("session_key"),
@@ -443,6 +453,7 @@ def _get_compound_for_lap(driver_number: int, lap_number: int, stints: list[dict
     Returns the compound uppercased, ``"UNKNOWN"`` if the compound field is None,
     or ``None`` if no matching stint is found.
     """
+    best: dict | None = None
     for stint in stints:
         if stint.get("driver_number") != driver_number:
             continue
@@ -451,11 +462,13 @@ def _get_compound_for_lap(driver_number: int, lap_number: int, stints: list[dict
         if lap_start is None:
             continue
         if lap_number >= lap_start and (lap_end is None or lap_number <= lap_end):
-            compound = stint.get("compound")
-            if compound is None:
-                return "UNKNOWN"
-            return compound.upper()
-    return None
+            # Prefer the earlier stint when overlapping ranges match the same lap.
+            if best is None or (stint.get("stint_number") or 0) < (best.get("stint_number") or 0):
+                best = stint
+    if best is None:
+        return None
+    compound = best.get("compound")
+    return compound.upper() if compound is not None else "UNKNOWN"
 
 
 def _compute_qualifying_best_per_phase(

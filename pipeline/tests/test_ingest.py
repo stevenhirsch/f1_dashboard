@@ -831,6 +831,77 @@ class TestGetCompoundForLap(unittest.TestCase):
         stints = [self._stint(44, 1, 5, None)]
         self.assertEqual(_get_compound_for_lap(44, 3, stints), "UNKNOWN")
 
+    def test_overlapping_stints_prefers_lower_stint_number(self):
+        # Reproduces the OpenF1 Canadian GP 2026 Piastri case: lap_end=0 is
+        # normalised to lap_start=1, leaving two stints that both cover lap 1.
+        # The earlier stint (lower stint_number) should win.
+        stints = [
+            {**self._stint(81, 1, 1, "INTERMEDIATE"), "stint_number": 1},
+            {**self._stint(81, 1, 11, "MEDIUM"),       "stint_number": 2},
+        ]
+        self.assertEqual(_get_compound_for_lap(81, 1, stints), "INTERMEDIATE")
+
+    def test_overlapping_stints_later_stint_used_from_lap_2(self):
+        stints = [
+            {**self._stint(81, 1, 1, "INTERMEDIATE"), "stint_number": 1},
+            {**self._stint(81, 1, 11, "MEDIUM"),       "stint_number": 2},
+        ]
+        self.assertEqual(_get_compound_for_lap(81, 2, stints), "MEDIUM")
+
+
+# ===========================================================================
+# TestIngestStints
+# ===========================================================================
+
+class TestIngestStints(unittest.TestCase):
+
+    def _raw_stint(self, driver_number, stint_number, lap_start, lap_end, compound):
+        return {
+            "session_key": 11291,
+            "driver_number": driver_number,
+            "stint_number": stint_number,
+            "lap_start": lap_start,
+            "lap_end": lap_end,
+            "compound": compound,
+            "tyre_age_at_start": 0,
+        }
+
+    def test_lap_end_zero_normalised_to_lap_start(self):
+        # Reproduces the OpenF1 Canadian GP 2026 Piastri case where a starting
+        # intermediate stint arrives with lap_end=0 instead of lap_end=1.
+        client = MagicMock()
+        client.table.return_value.upsert.return_value.execute.return_value = MagicMock()
+        raw = [
+            self._raw_stint(81, 1, 1, 0,  "INTERMEDIATE"),
+            self._raw_stint(81, 2, 1, 11, "MEDIUM"),
+        ]
+        with patch("ingest.openf1.get_stints", return_value=raw):
+            result = ingest_stints(client, 11291)
+
+        self.assertEqual(result[0]["lap_end"], 1)
+
+    def test_lap_end_zero_upserted_as_lap_start(self):
+        client = MagicMock()
+        upsert_mock = client.table.return_value.upsert
+        upsert_mock.return_value.execute.return_value = MagicMock()
+        raw = [self._raw_stint(81, 1, 3, 0, "INTERMEDIATE")]
+        with patch("ingest.openf1.get_stints", return_value=raw):
+            ingest_stints(client, 11291)
+
+        upserted_rows = upsert_mock.call_args[0][0]
+        self.assertEqual(upserted_rows[0]["lap_end"], 3)
+
+    def test_normal_stints_unaffected(self):
+        client = MagicMock()
+        client.table.return_value.upsert.return_value.execute.return_value = MagicMock()
+        raw = [self._raw_stint(1, 1, 1, 1, "INTERMEDIATE"),
+               self._raw_stint(1, 2, 2, 20, "MEDIUM")]
+        with patch("ingest.openf1.get_stints", return_value=raw):
+            result = ingest_stints(client, 11291)
+
+        self.assertEqual(result[0]["lap_end"], 1)
+        self.assertEqual(result[1]["lap_end"], 20)
+
 
 # ===========================================================================
 # ingest_qualifying_results

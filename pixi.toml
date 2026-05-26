@@ -7,6 +7,7 @@ version = "0.1.0"
 
 [tasks]
 notebook = "marimo edit dashboard.py"
+get-race-ids = "pixi run python pipeline/latest_race.py"
 
 [feature.pipeline.tasks]
 test = "pytest pipeline/tests/ -v"
