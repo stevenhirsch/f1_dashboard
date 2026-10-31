@@ -988,6 +988,78 @@ class TestIngestQualifyingResults(unittest.TestCase):
         self.assertEqual(len(upserted), 1)
         self.assertIsNone(upserted[0]['best_lap_time'])
 
+    def test_official_classification_stored_not_grid_order(self):
+        # Driver 55 qualified P9 but took a grid penalty; the table must store
+        # the qualifying position from session_result, not the grid slot.
+        client = _mock_client()
+        laps = [self._lap(55, 1, 104.566), self._lap(43, 1, 104.963)]
+        rc = [self._rc("Q3", "2024-03-01T09:00:00")]
+        session_results = [
+            {"driver_number": 55, "position": 9, "dsq": False},
+            {"driver_number": 43, "position": 10, "dsq": False},
+        ]
+
+        ingest_qualifying_results(client, 9000, laps, rc, [], session_results)
+
+        rows = {r["driver_number"]: r for r in client.table.return_value.upsert.call_args.args[0]}
+        self.assertEqual(rows[55]["position"], 9)
+        self.assertEqual(rows[43]["position"], 10)
+        self.assertFalse(rows[55]["dsq"])
+
+    def test_dsq_flag_and_non_numeric_position(self):
+        client = _mock_client()
+        laps = [self._lap(44, 1, 90.0)]
+        session_results = [
+            {"driver_number": 44, "position": 20, "dsq": True},
+            {"driver_number": 6, "position": "RT", "dsq": False},  # no laps
+        ]
+
+        ingest_qualifying_results(client, 9000, laps, [], [], session_results)
+
+        rows = {r["driver_number"]: r for r in client.table.return_value.upsert.call_args.args[0]}
+        self.assertTrue(rows[44]["dsq"])
+        # Classified-only driver still gets a row; non-numeric position → None
+        self.assertIn(6, rows)
+        self.assertIsNone(rows[6]["position"])
+
+    def test_official_times_replace_deleted_lap(self):
+        # Lap 2 (107.147) was deleted; official Q1 time is lap 3 (108.290).
+        client = _mock_client()
+        laps = [
+            self._lap(77, 2, 107.147, "2024-03-01T10:00:00"),
+            self._lap(77, 3, 108.290, "2024-03-01T10:03:00"),
+        ]
+        rc = [self._rc("Q1", "2024-03-01T09:00:00")]
+        stints = [self._stint(77, 1, 2, "SOFT"), self._stint(77, 3, 3, "MEDIUM")]
+        session_results = [{"driver_number": 77, "position": 22, "dsq": False,
+                            "duration": [108.29, None, None]}]
+
+        best = ingest_qualifying_results(client, 9000, laps, rc, stints, session_results)
+
+        row = client.table.return_value.upsert.call_args.args[0][0]
+        self.assertAlmostEqual(row["q1_time"], 108.29)
+        self.assertAlmostEqual(row["best_lap_time"], 108.29)
+        self.assertEqual(row["best_lap_number"], 3)
+        self.assertEqual(row["q1_compound"], "MEDIUM")
+        # Returned map points downstream peak-G at the official lap
+        self.assertEqual(best[77]["Q1"], (108.29, 3))
+
+    def test_official_time_without_matching_lap_has_null_lap(self):
+        client = _mock_client()
+        laps = [self._lap(44, 1, 90.0)]
+        rc = [self._rc("Q1", "2024-03-01T09:00:00")]
+        session_results = [{"driver_number": 44, "position": 1,
+                            "duration": [89.5, 88.9, None]}]
+
+        best = ingest_qualifying_results(client, 9000, laps, rc, [], session_results)
+
+        row = client.table.return_value.upsert.call_args.args[0][0]
+        self.assertAlmostEqual(row["q1_time"], 89.5)
+        self.assertAlmostEqual(row["q2_time"], 88.9)
+        self.assertIsNone(row["q3_time"])
+        self.assertIsNone(row["q1_compound"])
+        self.assertEqual(best[44]["Q2"], (88.9, None))
+
     def test_empty_laps_list_produces_no_rows(self):
         client = _mock_client()
 
@@ -1545,6 +1617,15 @@ def _patch_all_ingest_functions(test_fn):
     return wrapper
 
 
+class _NoSessionResultFetch:
+    """Stub openf1.get_session_result so qualifying-type process_session tests stay offline."""
+
+    def setUp(self):
+        p = patch("ingest.openf1.get_session_result", return_value=[])
+        self.mock_get_session_result = p.start()
+        self.addCleanup(p.stop)
+
+
 class TestProcessSessionRace(unittest.TestCase):
     """process_session with a Race session type."""
 
@@ -1653,7 +1734,7 @@ class TestProcessSessionRace(unittest.TestCase):
         mock_race_control.assert_called_once_with(client, 9000)
 
 
-class TestProcessSessionQualifying(unittest.TestCase):
+class TestProcessSessionQualifying(_NoSessionResultFetch, unittest.TestCase):
     """process_session with a Qualifying session type."""
 
     @patch("ingest.openf1.reset_stats")
@@ -1800,7 +1881,7 @@ class TestProcessSessionSprint(unittest.TestCase):
         mock_starting_grid.assert_not_called()
 
 
-class TestProcessSessionSprintQualifying(unittest.TestCase):
+class TestProcessSessionSprintQualifying(_NoSessionResultFetch, unittest.TestCase):
     """process_session with Sprint Qualifying — should route like Qualifying."""
 
     @patch("ingest.openf1.reset_stats")
@@ -1837,7 +1918,7 @@ class TestProcessSessionSprintQualifying(unittest.TestCase):
         mock_overtakes.assert_not_called()
 
 
-class TestProcessSessionSprintShootout(unittest.TestCase):
+class TestProcessSessionSprintShootout(_NoSessionResultFetch, unittest.TestCase):
     """process_session with Sprint Shootout — should route like Qualifying."""
 
     @patch("ingest.openf1.reset_stats")
@@ -1874,7 +1955,7 @@ class TestProcessSessionSprintShootout(unittest.TestCase):
         mock_overtakes.assert_not_called()
 
 
-class TestProcessSessionEarlyReturn(unittest.TestCase):
+class TestProcessSessionEarlyReturn(_NoSessionResultFetch, unittest.TestCase):
     """process_session should return early without error for unknown session_key."""
 
     @patch("ingest.openf1.reset_stats")
@@ -2332,7 +2413,7 @@ class TestComputeLapMetrics(unittest.TestCase):
 # process_session — recompute flag
 # ===========================================================================
 
-class TestProcessSessionRecompute(unittest.TestCase):
+class TestProcessSessionRecompute(_NoSessionResultFetch, unittest.TestCase):
     """process_session recompute=True triggers recompute_lap_metrics."""
 
     _COMMON_PATCHES = [

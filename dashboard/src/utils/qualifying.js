@@ -36,6 +36,29 @@ export function assignPhases(laps, phaseEvents) {
 }
 
 /**
+ * Sort qualifying_results rows into classification order.
+ *
+ * Uses the official `position` when present. Otherwise falls back to the F1
+ * knockout rule: drivers who reached Q3 ranked by Q3 time, then Q2 by Q2 time,
+ * then Q1 by Q1 time. Disqualified drivers go last.
+ */
+export function sortQualifyingResults(results) {
+  const key = r => {
+    if (r.dsq) return [1, 0, 0, r.best_lap_time ?? Infinity]
+    if (r.position != null) return [0, 0, r.position, 0]
+    // No official position: knockout order (lower tier = later phase reached)
+    if (r.q3_time != null) return [0, 1, 0, r.q3_time]
+    if (r.q2_time != null) return [0, 1, 1, r.q2_time]
+    return [0, 1, 2, r.q1_time ?? Infinity]
+  }
+  return [...results].sort((a, b) => {
+    const ka = key(a), kb = key(b)
+    for (let i = 0; i < ka.length; i++) if (ka[i] !== kb[i]) return ka[i] - kb[i]
+    return 0
+  })
+}
+
+/**
  * Format a lap time in seconds as m:ss.mmm.
  * Returns '—' for null/undefined.
  */

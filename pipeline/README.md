@@ -25,33 +25,33 @@ Use the helper script to look up the meeting key, then ingest:
 pixi run python pipeline/latest_race.py
 
 # Ingest a specific meeting (all sessions: FP1/2/3, Quali, Race)
-pixi run python pipeline/ingest.py --meeting <MEETING_KEY>
+pixi run -e pipeline python pipeline/ingest.py --meeting <MEETING_KEY>
 ```
 
 ### Ingest a full season
 ```bash
-pixi run python pipeline/ingest.py --year 2026
+pixi run -e pipeline python pipeline/ingest.py --year 2026
 ```
 
 ### Ingest a single session
 ```bash
-pixi run python pipeline/ingest.py --session <SESSION_KEY>
+pixi run -e pipeline python pipeline/ingest.py --session <SESSION_KEY>
 ```
 
 ### Recompute derived metrics (without re-fetching raw data)
 Useful after a pipeline logic change:
 ```bash
-pixi run python pipeline/ingest.py --session <SESSION_KEY> --recompute
+pixi run -e pipeline python pipeline/ingest.py --session <SESSION_KEY> --recompute
 ```
 
 ### Recompute season standings only
 ```bash
-pixi run python pipeline/ingest.py --season-stats 2026
+pixi run -e pipeline python pipeline/ingest.py --season-stats 2026
 ```
 
 ### Backfill circuit lengths
 ```bash
-pixi run python pipeline/ingest.py --backfill-circuit-lengths
+pixi run -e pipeline python pipeline/ingest.py --backfill-circuit-lengths
 ```
 
 ---

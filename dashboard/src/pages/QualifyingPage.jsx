@@ -15,6 +15,7 @@ const THEME = {
   red: '#e10600',
   tableAlt: '#1c1c1f',
   separator: 'rgba(161,161,170,0.25)',
+  penalty: '#f59e0b',
 }
 
 function CompoundBadge({ compound }) {
@@ -66,26 +67,15 @@ function QualifyingResultsTable({ results, driverPhaseMap, topSpeedByDriver }) {
     ...extra,
   })
 
-  const phaseRank = { Q3: 3, Q2: 2, Q1: 1 }
   const resolvePhase = (row) => {
     if (row.q3_time != null) return 'Q3'
     if (row.q2_time != null) return 'Q2'
     return driverPhaseMap[row.driver_number] ?? 'Q1'
   }
 
-  // Detect DSQ drivers: any driver whose phase rank is higher than the minimum
-  // phase rank seen so far in the sorted list. This catches drivers (e.g. HAD)
-  // who set Q2/Q3 times but were sorted to the back due to a post-session DSQ.
-  const dsqDrivers = new Set()
-  let minPhaseRankSeen = Infinity
-  for (const r of results) {
-    const rank = phaseRank[resolvePhase(r)] ?? 1
-    if (rank < minPhaseRankSeen) {
-      minPhaseRankSeen = rank
-    } else if (rank > minPhaseRankSeen) {
-      dsqDrivers.add(r.driver_number)
-    }
-  }
+  // Only the official session_result flag marks a DSQ. Inferring it from
+  // ordering misfires on grid penalties.
+  const dsqDrivers = new Set(results.filter(r => r.dsq).map(r => r.driver_number))
 
   const rows = []
   let normalPos = 0
@@ -146,6 +136,30 @@ function QualifyingResultsTable({ results, driverPhaseMap, topSpeedByDriver }) {
         </td>
         <td style={tdStyle({ color: colour, fontWeight: 'bold' })}>
           {driver.name_acronym ?? r.driver_number}
+          {(() => {
+            // Others' penalties only move a driver up, so starting further back
+            // than qualifying position means this driver took a grid penalty.
+            const qualPos = r.position ?? normalPos
+            if (isDsq || r.grid_position == null || r.grid_position <= qualPos) return null
+            return (
+              <span
+                title={`Qualified P${qualPos}, starts P${r.grid_position} after a grid penalty`}
+                style={{
+                  marginLeft: '0.5rem',
+                  padding: '0 4px',
+                  borderRadius: '3px',
+                  border: `1px solid ${THEME.penalty}`,
+                  color: THEME.penalty,
+                  fontSize: '0.65rem',
+                  fontWeight: 'normal',
+                  letterSpacing: '0.04em',
+                  verticalAlign: 'middle',
+                }}
+              >
+                GRID P{r.grid_position}
+              </span>
+            )
+          })()}
         </td>
         <td style={tdStyle({ color: THEME.muted })}>{driver.team_name ?? '—'}</td>
 

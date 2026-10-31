@@ -290,8 +290,14 @@ create table if not exists qualifying_results (
     q1_laps         integer,
     q2_laps         integer,
     q3_laps         integer,
+    -- Official qualifying classification from OpenF1 session_result
+    -- (not starting_grid, which includes grid penalties)
+    position        integer,
+    dsq             boolean default false,
     primary key (session_key, driver_number)
 );
+alter table qualifying_results add column if not exists position integer;
+alter table qualifying_results add column if not exists dsq boolean default false;
 
 alter table qualifying_results enable row level security;
 create policy "anon read" on qualifying_results for select to anon using (true);

@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react'
 import { supabase } from '../supabaseClient'
+import { sortQualifyingResults } from '../utils/qualifying'
 
 export function useQualifyingData(sessionKey) {
   const [data, setData] = useState(null)
@@ -48,9 +49,15 @@ export function useQualifyingData(sessionKey) {
       const drivers = driversRes.data ?? []
       const driverMap = Object.fromEntries(drivers.map(d => [d.driver_number, d]))
 
+      // Race grid slot, used only to flag grid penalties — not for ordering.
+      const gridMap = Object.fromEntries(
+        (gridRes.data ?? []).map(g => [g.driver_number, g.position])
+      )
+
       const results = (resultsRes.data ?? []).map(r => ({
         ...r,
         driver: driverMap[r.driver_number] ?? null,
+        grid_position: gridMap[r.driver_number] ?? null,
       }))
 
       const stintsByDriver = {}
@@ -59,16 +66,9 @@ export function useQualifyingData(sessionKey) {
         stintsByDriver[s.driver_number].push(s)
       }
 
-      const gridMap = Object.fromEntries(
-        (gridRes.data ?? []).map(g => [g.driver_number, g.position])
-      )
-
-      // Sort results by grid position; fall back to phase-based order for unpositioned drivers
-      const sorted = [...results].sort((a, b) => {
-        const pa = gridMap[a.driver_number] ?? 999
-        const pb = gridMap[b.driver_number] ?? 999
-        return pa - pb
-      })
+      // Order by the official qualifying classification. Never use starting_grid:
+      // it includes grid penalties, so it is not the qualifying order.
+      const sorted = sortQualifyingResults(results)
 
       setData({
         results: sorted,

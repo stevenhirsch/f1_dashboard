@@ -502,15 +502,82 @@ def _compute_qualifying_best_per_phase(
     return best
 
 
+def _apply_official_qualifying_times(
+    best_per_phase: dict[int, dict[str, tuple[float, int]]],
+    laps: list[dict],
+    session_results: list[dict],
+) -> dict[int, dict[str, tuple[float, int | None]]]:
+    """Replace lap-derived phase bests with the official times from ``session_result``.
+
+    Lap-derived bests can include laps later deleted (e.g. track limits). The
+    official ``duration`` list ``[q1, q2, q3]`` is authoritative. Each official
+    time is matched back to the lap that set it (same driver, duration within
+    a millisecond) so compound and peak-G lookups use the right lap; if no lap
+    matches, the lap number is ``None``.
+
+    Phases with no official time keep the lap-derived best only when the driver
+    has no session_result row at all (e.g. results not yet published).
+    """
+    if not session_results:
+        return best_per_phase
+
+    laps_by_driver: dict[int, list[dict]] = {}
+    for lap in laps:
+        dn = lap.get("driver_number")
+        if dn is not None:
+            laps_by_driver.setdefault(dn, []).append(lap)
+
+    def _match_lap(dn: int, phase: str, t: float) -> int | None:
+        candidates = []
+        for lap in laps_by_driver.get(dn, []):
+            try:
+                d = float(lap.get("lap_duration"))
+            except (TypeError, ValueError):
+                continue
+            if abs(d - t) < 0.0015:
+                candidates.append(lap)
+        # Prefer a lap in the same phase; fall back to any phase in case the
+        # race-control phase boundary assigned it to a neighbour.
+        same_phase = [l for l in candidates if l.get("_phase") == phase]
+        pick = (same_phase or candidates or [None])[0]
+        return pick.get("lap_number") if pick else None
+
+    out = {dn: dict(phases) for dn, phases in best_per_phase.items()}
+    for r in session_results:
+        dn = r.get("driver_number")
+        if dn is None:
+            continue
+        durations = r.get("duration")
+        if not isinstance(durations, list):
+            continue
+        official: dict[str, tuple[float, int | None]] = {}
+        for phase, t in zip(("Q1", "Q2", "Q3"), durations):
+            if t is None:
+                continue
+            try:
+                t = float(t)
+            except (TypeError, ValueError):
+                continue
+            official[phase] = (t, _match_lap(dn, phase, t))
+        out[dn] = official
+    return out
+
+
 def ingest_qualifying_results(
     client: Client,
     session_key: int,
     laps: list[dict],
     race_control: list[dict] | None = None,
     stints: list[dict] | None = None,
+    session_results: list[dict] | None = None,
 ) -> dict[int, dict[str, tuple[float, int]]]:
     """
     Upsert qualifying best times per phase into ``qualifying_results``.
+
+    ``session_results`` (OpenF1 ``session_result`` rows) supplies the official
+    classification (``position``, ``dsq``) and official Q1/Q2/Q3 times, which
+    replace lap-derived bests (those can include deleted laps). This is the qualifying order — it
+    differs from ``starting_grid``, which includes grid penalties.
 
     Assigns each lap to a qualifying phase (Q1/Q2/Q3) using race_control
     events, then computes per-phase best times, compounds, and lap counts.
@@ -523,6 +590,20 @@ def ingest_qualifying_results(
         race_control = []
     if stints is None:
         stints = []
+    if session_results is None:
+        session_results = []
+
+    # Official classification. Position may be non-numeric (e.g. "RT") or null.
+    classification: dict[int, dict] = {}
+    for r in session_results:
+        dn = r.get("driver_number")
+        if dn is None:
+            continue
+        pos = r.get("position")
+        classification[dn] = {
+            "position": pos if isinstance(pos, int) else None,
+            "dsq":      bool(r.get("dsq")),
+        }
 
     laps = _assign_qualifying_phases(laps, race_control)
 
@@ -537,7 +618,9 @@ def ingest_qualifying_results(
             laps_per_phase[dn] = {}
         laps_per_phase[dn][phase] = laps_per_phase[dn].get(phase, 0) + 1
 
-    best_per_phase = _compute_qualifying_best_per_phase(laps)
+    best_per_phase = _apply_official_qualifying_times(
+        _compute_qualifying_best_per_phase(laps), laps, session_results,
+    )
 
     # Include every driver who appeared in any lap, so drivers eliminated in Q1
     # with no phase-assigned laps still show up (with null times) rather than
@@ -546,6 +629,7 @@ def ingest_qualifying_results(
         set(best_per_phase.keys())
         | set(laps_per_phase.keys())
         | {lap["driver_number"] for lap in laps if lap.get("driver_number") is not None}
+        | set(classification.keys())
     )
     rows = []
     for dn in all_drivers:
@@ -584,6 +668,8 @@ def ingest_qualifying_results(
             "q1_laps":         lap_counts.get("Q1"),
             "q2_laps":         lap_counts.get("Q2"),
             "q3_laps":         lap_counts.get("Q3"),
+            "position":        classification.get(dn, {}).get("position"),
+            "dsq":             classification.get(dn, {}).get("dsq", False),
         })
 
     _upsert(client, "qualifying_results", rows)
@@ -2790,6 +2876,7 @@ def recompute_lap_metrics(
     stints_rows: list[dict] | None = None,
     intervals_rows: list[dict] | None = None,
     overtakes_rows: list[dict] | None = None,
+    session_results: list[dict] | None = None,
 ) -> None:
     """Regenerate derived metrics for a session without re-fetching raw data.
 
@@ -2820,7 +2907,10 @@ def recompute_lap_metrics(
         ingest_lap_flags(client, session_key, laps, stints_rows or [], rc_rows or [])
         ingest_session_sector_bests(client, session_key, laps)
         laps_with_phases = _assign_qualifying_phases(laps, rc_rows or [])
-        best_per_phase   = _compute_qualifying_best_per_phase(laps_with_phases)
+        best_per_phase   = _apply_official_qualifying_times(
+            _compute_qualifying_best_per_phase(laps_with_phases),
+            laps_with_phases, session_results or [],
+        )
         driver_lap_metrics = ingest_lap_metrics(client, session_key, laps_with_phases)
         ingest_qualifying_peak_g_summary(client, session_key, driver_lap_metrics, best_per_phase)
         ingest_brake_entry_speed_ranks(client, session_key, driver_lap_metrics)
@@ -2873,6 +2963,7 @@ def process_session(client: Client, session_key: int, recompute: bool = False) -
 
     intervals_rows: list[dict] = []
     overtakes_rows: list[dict] = []
+    session_results: list[dict] = []
 
     if session_type in ("race", "sprint"):
         ingest_race_results(client, session_key, pit)
@@ -2884,13 +2975,16 @@ def process_session(client: Client, session_key: int, recompute: bool = False) -
         ingest_championship_drivers(client, session_key)
         ingest_championship_teams(client, session_key)
     elif session_type in ("qualifying", "sprint qualifying", "sprint shootout"):
-        ingest_qualifying_results(client, session_key, laps, rc_rows, stints_rows)
+        session_results = openf1.get_session_result(session_key)
+        ingest_qualifying_results(client, session_key, laps, rc_rows, stints_rows,
+                                  session_results)
         ingest_starting_grid(client, session_key)
 
     if recompute:
         recompute_lap_metrics(client, session_key, laps, session_type,
                               rc_rows=rc_rows, stints_rows=stints_rows,
-                              intervals_rows=intervals_rows, overtakes_rows=overtakes_rows)
+                              intervals_rows=intervals_rows, overtakes_rows=overtakes_rows,
+                              session_results=session_results)
 
     elapsed = time.time() - t0
     stats = openf1.get_stats()
