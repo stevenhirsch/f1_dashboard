@@ -368,6 +368,54 @@ class TestIngestLaps(unittest.TestCase):
 
 class TestIngestRaceControl(unittest.TestCase):
 
+    def setUp(self):
+        patcher = patch("ingest.openf1.get_session", return_value=[{
+            "session_key": 9000,
+            "date_start": "2024-03-01T14:00:00+00:00",
+            "date_end":   "2024-03-01T16:00:00+00:00",
+        }])
+        self.mock_get_session = patcher.start()
+        self.addCleanup(patcher.stop)
+
+    @patch("ingest.openf1.get_race_control")
+    def test_message_from_another_day_dropped(self, mock_get_rc):
+        client = _mock_client()
+        mock_get_rc.return_value = [
+            self._api_rc(date="2024-02-29T10:32:52.408000+00:00", message="SESSION STARTED"),
+            self._api_rc(date="2024-03-01T14:05:00+00:00"),
+        ]
+
+        ingest_race_control(client, 9000)
+
+        upserted = client.table.return_value.upsert.call_args.args[0]
+        self.assertEqual(len(upserted), 1)
+        self.assertEqual(upserted[0]["message"], "YELLOW FLAG IN SECTOR 1")
+
+    @patch("ingest.openf1.get_race_control")
+    def test_messages_within_margin_kept(self, mock_get_rc):
+        """Pre-session notices and post-chequer messages are legitimate."""
+        client = _mock_client()
+        mock_get_rc.return_value = [
+            self._api_rc(date="2024-03-01T13:10:00+00:00", message="PIT EXIT OPEN"),
+            self._api_rc(date="2024-03-01T16:40:00+00:00", message="CAR 1 UNDER INVESTIGATION"),
+        ]
+
+        ingest_race_control(client, 9000)
+
+        upserted = client.table.return_value.upsert.call_args.args[0]
+        self.assertEqual(len(upserted), 2)
+
+    @patch("ingest.openf1.get_race_control")
+    def test_no_session_window_keeps_all_rows(self, mock_get_rc):
+        client = _mock_client()
+        self.mock_get_session.return_value = []
+        mock_get_rc.return_value = [self._api_rc(date="2020-01-01T00:00:00+00:00")]
+
+        ingest_race_control(client, 9000)
+
+        upserted = client.table.return_value.upsert.call_args.args[0]
+        self.assertEqual(len(upserted), 1)
+
     def _api_rc(self, **overrides):
         base = {
             "session_key": 9000,
@@ -421,6 +469,24 @@ class TestIngestRaceControl(unittest.TestCase):
         ingest_race_control(client, 9000)
 
         client.table.assert_not_called()
+
+    @patch("ingest.openf1.get_race_control")
+    def test_duplicate_pk_rows_collapsed_keeping_most_populated(self, mock_get_rc):
+        """OpenF1 can emit the same message twice (once without lap_number);
+        Postgres rejects an upsert batch with duplicate PKs."""
+        client = _mock_client()
+        mock_get_rc.return_value = [
+            self._api_rc(category="SessionStatus", message="SESSION STARTED",
+                         flag=None, scope=None, sector=None, lap_number=None),
+            self._api_rc(category="SessionStatus", message="SESSION STARTED",
+                         flag=None, scope=None, sector=None, lap_number=1),
+        ]
+
+        ingest_race_control(client, 9000)
+
+        upserted = client.table.return_value.upsert.call_args.args[0]
+        self.assertEqual(len(upserted), 1)
+        self.assertEqual(upserted[0]["lap_number"], 1)
 
     @patch("ingest.openf1.get_race_control")
     def test_two_different_messages_at_same_timestamp_both_survive(self, mock_get_rc):

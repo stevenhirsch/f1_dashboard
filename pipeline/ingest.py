@@ -333,6 +333,38 @@ def ingest_weather(client: Client, session_key: int) -> None:
     _upsert(client, "weather", rows)
 
 
+# Real race-control messages land within ~50 min of the scheduled window
+# (measured on 2026 sessions); 2h either side leaves headroom for long
+# red-flag delays while still catching messages leaked from other sessions.
+RACE_CONTROL_WINDOW_MARGIN = timedelta(hours=2)
+
+
+def _filter_to_session_window(rows: list[dict], session_key: int) -> list[dict]:
+    """Drop rows timestamped well outside the session's scheduled window.
+
+    OpenF1 occasionally attaches messages from another session (e.g. the 2026
+    Mexico City race feed contained FP3's SESSION STARTED from the day before).
+    If the session has no start/end times, rows are returned unchanged.
+    """
+    sessions = openf1.get_session(session_key)
+    if not sessions or not sessions[0].get("date_start") or not sessions[0].get("date_end"):
+        return rows
+    lo = datetime.fromisoformat(sessions[0]["date_start"]) - RACE_CONTROL_WINDOW_MARGIN
+    hi = datetime.fromisoformat(sessions[0]["date_end"]) + RACE_CONTROL_WINDOW_MARGIN
+
+    def _in_window(r: dict) -> bool:
+        d = datetime.fromisoformat(r["date"])
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=timezone.utc)
+        return lo <= d <= hi
+
+    kept = [r for r in rows if _in_window(r)]
+    if len(kept) < len(rows):
+        print(f"  [warn] dropped {len(rows) - len(kept)} race_control row(s) "
+              f"outside session {session_key} window")
+    return kept
+
+
 def ingest_race_control(client: Client, session_key: int) -> list[dict]:
     """Upsert race control messages into `race_control`."""
     rc = openf1.get_race_control(session_key)
@@ -356,6 +388,16 @@ def ingest_race_control(client: Client, session_key: int) -> list[dict]:
     # the same timestamp, which would cause Postgres to reject the upsert.
     # Filter to rows where category and message are non-null — required by the PK.
     rows = [r for r in rows if r.get("category") and r.get("message")]
+    rows = _filter_to_session_window(rows, session_key)
+    # Collapse rows sharing the PK (session_key, date, category, message),
+    # keeping the most populated one (e.g. one copy may carry lap_number).
+    deduped: dict[tuple, dict] = {}
+    for r in rows:
+        key = (r["session_key"], r["date"], r["category"], r["message"])
+        prev = deduped.get(key)
+        if prev is None or sum(v is not None for v in r.values()) > sum(v is not None for v in prev.values()):
+            deduped[key] = r
+    rows = list(deduped.values())
     _upsert(client, "race_control", rows)
     return rc
 
